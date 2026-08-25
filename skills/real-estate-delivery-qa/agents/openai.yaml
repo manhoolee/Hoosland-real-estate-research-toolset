@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产报告交付质检 v2.3"
+  short_description: "发布前核验内容数据格式与报告可用性"
+  default_prompt: "使用 $real-estate-delivery-qa 对这份地产报告做发布前内容、数据和格式验收。"

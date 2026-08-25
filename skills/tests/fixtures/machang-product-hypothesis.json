@@ -1,0 +1,93 @@
+{
+  "model_version": "2.3.0",
+  "project": "广州天河马场地块一期",
+  "scope_id": "machang-phase-1-residential",
+  "as_of_date": "2026-08-25",
+  "currency": "CNY",
+  "residential_gfa_sqm": 222740,
+  "saleable_ratio": 0.92,
+  "segments": [
+    {"name": "城市改善", "share": 0.30, "avg_unit_gfa": 200, "prices": {"conservative": 120000, "base": 130000, "optimistic": 145000}},
+    {"name": "核心大平层", "share": 0.45, "avg_unit_gfa": 280, "prices": {"conservative": 140000, "base": 155000, "optimistic": 165000}},
+    {"name": "城市顶豪", "share": 0.20, "avg_unit_gfa": 400, "prices": {"conservative": 170000, "base": 190000, "optimistic": 200000}},
+    {"name": "旗舰产品", "share": 0.05, "avg_unit_gfa": 550, "prices": {"conservative": 200000, "base": 220000, "optimistic": 240000}}
+  ],
+  "total_cost_yuan": null,
+  "recalculation_conditions": [
+    "一期住宅计容面积或可售率发生变化",
+    "任一产品段占比、平均户型面积或情景价格更新",
+    "取得新的竞品成交或客户支付证据"
+  ],
+  "input_basis": {
+    "residential_gfa_sqm": {
+      "type": "FACT-A",
+      "source_ids": ["FIXTURE-LAND-001"]
+    },
+    "saleable_ratio": {
+      "type": "HYPOTHESIS",
+      "source_ids": ["FIXTURE-HYP-SALEABLE-001"]
+    },
+    "segments": {
+      "城市改善": {
+        "share": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-MIX-001"]
+        },
+        "avg_unit_gfa": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-AREA-001"]
+        },
+        "prices": {
+          "conservative": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-LOW-001"]},
+          "base": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-BASE-001"]},
+          "optimistic": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-HIGH-001"]}
+        }
+      },
+      "核心大平层": {
+        "share": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-MIX-001"]
+        },
+        "avg_unit_gfa": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-AREA-001"]
+        },
+        "prices": {
+          "conservative": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-LOW-001"]},
+          "base": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-BASE-001"]},
+          "optimistic": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-HIGH-001"]}
+        }
+      },
+      "城市顶豪": {
+        "share": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-MIX-001"]
+        },
+        "avg_unit_gfa": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-AREA-001"]
+        },
+        "prices": {
+          "conservative": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-LOW-001"]},
+          "base": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-BASE-001"]},
+          "optimistic": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-HIGH-001"]}
+        }
+      },
+      "旗舰产品": {
+        "share": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-MIX-001"]
+        },
+        "avg_unit_gfa": {
+          "type": "HYPOTHESIS",
+          "source_ids": ["FIXTURE-COMP-001", "FIXTURE-HYP-AREA-001"]
+        },
+        "prices": {
+          "conservative": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-LOW-001"]},
+          "base": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-BASE-001"]},
+          "optimistic": {"type": "HYPOTHESIS", "source_ids": ["FIXTURE-COMP-PRICE-001", "FIXTURE-HYP-PRICE-HIGH-001"]}
+        }
+      }
+    }
+  }
+}

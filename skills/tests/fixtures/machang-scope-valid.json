@@ -1,0 +1,11 @@
+{
+  "parent": {"scope_id": "machang-phase-1-listed-gfa", "value": 566962},
+  "metrics": [
+    {"name": "AT111321商业商务", "value": 120000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
+    {"name": "AT111323商业商务", "value": 89000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
+    {"name": "AT111333住宅", "value": 110000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
+    {"name": "AT111337住宅", "value": 112740, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
+    {"name": "AT111338商业商务", "value": 128222, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
+    {"name": "地下商业", "value": 7000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"}
+  ]
+}

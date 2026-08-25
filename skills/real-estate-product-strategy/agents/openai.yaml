@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产产品与产策 v2.3"
+  short_description: "产品力户型价格货值与项目定位策略分析模块"
+  default_prompt: "帮我做地产项目的产品力、户型、价格和产策定位"

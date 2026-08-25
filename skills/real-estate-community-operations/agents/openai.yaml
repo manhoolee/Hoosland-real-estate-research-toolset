@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产社群运营 v2.3"
+  short_description: "业主社群老带新主理人机制与长期客户运营模块"
+  default_prompt: "帮我设计地产项目的社群运营和老带新体系"

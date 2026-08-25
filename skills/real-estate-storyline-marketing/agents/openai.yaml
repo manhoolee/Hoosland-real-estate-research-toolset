@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产品牌与营销 v2.3"
+  short_description: "品牌故事营销推广销售转化与内容策划模块"
+  default_prompt: "帮我做地产项目的品牌故事线和营销方案"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信资料转换 v2.3"
+  short_description: "微信公众号文章抓取转换与地产研究资料整理入口"
+  default_prompt: "帮我抓取并转换一篇微信文章"

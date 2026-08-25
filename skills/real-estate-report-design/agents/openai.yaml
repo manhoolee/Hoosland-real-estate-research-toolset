@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产报告视觉设计 v2.3"
+  short_description: "把报告内容设计成清晰可读的正式成品候选稿"
+  default_prompt: "使用 $real-estate-report-design 为这份地产报告形成视觉候选稿并移交最终质检。"

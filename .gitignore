@@ -1,0 +1,49 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+# Node / frontend
+node_modules/
+dist/
+.npm/
+
+# Runtime data and generated outputs
+backend/data/
+data/
+uploads/
+outputs/
+work/
+sessions/
+logs/
+*.jsonl
+.runtime-probe/
+
+# Release and diagnostic artifacts
+release-artifacts/
+release-staging/
+_diagnostics/
+.codex-audit/
+*.tgz
+*.tar.gz
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

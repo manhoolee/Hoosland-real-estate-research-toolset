@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产报告文案编辑 v2.3"
+  short_description: "把研判结果编辑成可信易读的管理层报告文案"
+  default_prompt: "使用 $real-estate-report-editorial 把这份地产研判整理成管理层可读的报告文案。"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hoosland PDF 技术质检 v2.3"
+  short_description: "将已审定 HTML 生成 PDF 并完成逐页技术质检"
+  default_prompt: "使用 $hoosland-pdf-output 将这份已审定 HTML 生成 PDF，完成逐页技术质检后移交最终交付质检。"

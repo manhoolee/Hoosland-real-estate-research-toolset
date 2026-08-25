@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+PDF_TOOL_ROOT="${HOOSLAND_PDF_TOOL_ROOT:-/opt/hoosland-agent-tools/pdf-tool}"
+PYTHON_BIN="${HOOSLAND_PDF_PYTHON_BIN:-/opt/hoosland-agent-tools/venv/bin/python}"
+exec "$PYTHON_BIN" "$PDF_TOOL_ROOT/inspect-pdf.py" "$@"

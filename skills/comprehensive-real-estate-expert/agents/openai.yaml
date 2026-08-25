@@ -1,0 +1,4 @@
+interface:
+  display_name: "综合地产研判策划专家 v2.3"
+  short_description: "以范围、证据和计算闸门引导地产研判、产策与管理层交付"
+  default_prompt: "帮我完成一个地产项目的综合研判与策划方案"

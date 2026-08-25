@@ -1,0 +1,4 @@
+interface:
+  display_name: "地产研判研究 v2.3"
+  short_description: "城市土地市场竞品客群与在售复盘的地产研究模块"
+  default_prompt: "帮我完成地产项目的市场、竞品、客群或土地研判"

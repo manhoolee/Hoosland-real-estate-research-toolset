@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hoosland PDF 运行时验收</title>
+    <style>
+      @page { size: A4; margin: 16mm; }
+      * { box-sizing: border-box; }
+      body { margin: 0; color: #1c2925; font: 14px/1.7 "Noto Sans CJK SC", sans-serif; }
+      h1 { margin: 0 0 8mm; font: 700 28px/1.25 "Noto Serif CJK SC", serif; }
+      .eyebrow { color: #167253; font-weight: 700; letter-spacing: .08em; }
+      .card { margin-top: 8mm; padding: 7mm; border: 1px solid #b9c7c1; border-radius: 3mm; }
+      table { width: 100%; border-collapse: collapse; margin-top: 7mm; }
+      th, td { border-bottom: 1px solid #dbe2df; padding: 3mm; text-align: left; }
+      th { color: #54645e; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <img src="http://127.0.0.1:9/blocked.png" alt="" hidden />
+    <img src="file:///etc/passwd" alt="" hidden />
+    <div class="eyebrow">RUNTIME ACCEPTANCE / 2026-08-24</div>
+    <h1>Hoosland 地产研究 PDF 直接输出</h1>
+    <p>本页用于验证中文字体、背景色、表格、分页尺寸与可提取文本。它不包含任何真实项目资料。</p>
+    <section class="card">
+      <strong>验收目标</strong>
+      <p>在任意隔离对话工作区内，无需再次安装依赖，即可从独立 HTML 生成正式 PDF，并渲染逐页 PNG 进行质检。</p>
+    </section>
+    <table>
+      <thead><tr><th>检查项</th><th>预期结果</th></tr></thead>
+      <tbody>
+        <tr><td>中文字体</td><td>无方框、无缺字</td></tr>
+        <tr><td>输出边界</td><td>最终文件只能进入 outputs</td></tr>
+        <tr><td>外部资源</td><td>渲染时阻止远程网络资源</td></tr>
+      </tbody>
+    </table>
+  </body>
+</html>

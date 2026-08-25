@@ -1,0 +1,7 @@
+interface:
+  display_name: "地产社交媒体宣传 v2.3"
+  short_description: "把审定母稿拆成多平台待发布审批内容包"
+  brand_color: "#1F5D50"
+  default_prompt: "使用 $real-estate-social-promotion 把这份审定母稿拆解成多平台待发布审批内容包。"
+policy:
+  allow_implicit_invocation: true

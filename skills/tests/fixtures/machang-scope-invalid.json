@@ -1,0 +1,8 @@
+{
+  "parent": {"scope_id": "machang-phase-1", "value": 566962},
+  "metrics": [
+    {"name": "片区商业商务", "value": 498000, "parent_scope_id": "machang-masterplan", "relation": "component"},
+    {"name": "片区住宅", "value": 220000, "parent_scope_id": "machang-masterplan", "relation": "component"},
+    {"name": "片区公服", "value": 33000, "parent_scope_id": "machang-masterplan", "relation": "component"}
+  ]
+}
