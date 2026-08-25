@@ -10,6 +10,10 @@ server {
     listen 443 ssl;
     server_name agent-tools.example.com;
 
+    # REQUIRED BEFORE INTERNET EXPOSURE: add the organization's SSO, OIDC,
+    # VPN, mTLS, Basic Auth, or equivalent access-control policy. The
+    # application itself is not a complete multi-user identity boundary.
+
     ssl_certificate /etc/letsencrypt/live/agent-tools.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/agent-tools.example.com/privkey.pem;
 

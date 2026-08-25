@@ -71,7 +71,7 @@ scripts/                 一键本地验证脚本
 
 ## 环境要求
 
-- Linux、macOS 或 WSL；生产基线为 Linux；
+- 完整 Agent runtime：Linux x64/arm64（glibc 2.28+）或 macOS 14+ Apple Silicon；Windows 使用 WSL2，原生 Windows 与 Intel Mac 当前不支持；
 - Python `3.11`；
 - Node.js `^20.19.0 || >=22.12.0`；
 - POSIX shell（运行 Skill smoke tests）；
@@ -133,7 +133,7 @@ curl http://127.0.0.1:8000/api/capabilities
 
 没有主模型密钥或 Harness runtime 时，`live` 可以正常而 `ready` 返回降级状态；这是预期的 fail-closed 行为。
 
-完整步骤见 [使用说明](docs/USAGE.md) 和 [配置参考](docs/CONFIGURATION.md)。
+完整步骤见 [安装指南](docs/INSTALLATION.md)、[使用说明](docs/USAGE.md) 和 [配置参考](docs/CONFIGURATION.md)。
 
 ## 11 个领域工具
 
@@ -196,10 +196,12 @@ bash ./tests/run_smoke_tests.sh
 - 可选 MCP 能力是否可用取决于各部署的 Provider 配置；
 - Office 深度抽取和 Word/PPT/Excel 交付依赖具体运行时或 Provider，不属于默认开箱能力；
 - PDF 安装脚本以 Linux 持久运行时为基线；
+- 原生 Windows、Intel Mac 与 Alpine / musl 当前没有匹配的 bundled Harness runtime wheel；
 - 尚未提供 Docker Compose 和自动数据迁移器。
 
 ## 文档
 
+- [安装指南](docs/INSTALLATION.md)
 - [使用说明](docs/USAGE.md)
 - [配置参考](docs/CONFIGURATION.md)
 - [架构说明](docs/ARCHITECTURE.md)

@@ -2,6 +2,16 @@
 
 本项目分别记录应用、System Prompt、Skill 套件和数据 Schema 版本；它们不会为了展示一致而同步跳号。
 
+## Unreleased
+
+### 安装与部署文档
+
+- 新增独立安装指南，明确本地开发、单进程演示、WSL2 和支持平台；
+- 把 Linux 基线补齐为从主机初始化到 release、配置、systemd、Nginx、验收、备份、升级和回滚的闭环；
+- 每个不可变 release 使用独立 `.venv`，源码、前端与 Python 依赖可以一起回滚；
+- 明确反向代理访问控制、`APP_API_TOKEN` 的 SPA 限制、`/mcp` 阻断和 PDF 系统依赖；
+- Docker、多副本和原生 Windows 后端继续标记为未完成真实运行时验收，不做超前承诺。
+
 ## App 0.2.0 / Skill 2.3.0 — 2026-08-25
 
 ### Agent 合成

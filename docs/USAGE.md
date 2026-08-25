@@ -13,6 +13,8 @@ Skill 是方法和质量规范，不替代法律、规划、工程、财务或�
 
 ## 2. 本地启动
 
+完整的平台范围、依赖安装、WSL2 与单进程演示方式见[安装指南](INSTALLATION.md)。当前完整 Harness runtime 不支持原生 Windows，Windows 用户应使用 WSL2。
+
 ### 首次安装
 
 ```bash

@@ -19,3 +19,6 @@ package. The service account must have read/execute access to
 `/opt/hoosland-agent-tools/pdf-tool` but must not own or modify it. Override
 the root or Python path with `HOOSLAND_PDF_TOOL_ROOT` and
 `HOOSLAND_PDF_PYTHON_BIN` when using a different immutable installation path.
+The default Python path is
+`/opt/hoosland-agent-tools/current/.venv/bin/python`, so each immutable
+application release carries the matching Python dependencies.

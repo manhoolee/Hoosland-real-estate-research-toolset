@@ -10,8 +10,9 @@ Group=hoosland-agent
 WorkingDirectory=/opt/hoosland-agent-tools/current/backend
 EnvironmentFile=/etc/hoosland-agent-tools/agent.env
 Environment=HOME=/srv/hoosland-agent-tools
-Environment=PATH=/opt/hoosland-agent-tools/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart=/opt/hoosland-agent-tools/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Environment=PATH=/opt/hoosland-agent-tools/current/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=HOOSLAND_PDF_PYTHON_BIN=/opt/hoosland-agent-tools/current/.venv/bin/python
+ExecStart=/opt/hoosland-agent-tools/current/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20

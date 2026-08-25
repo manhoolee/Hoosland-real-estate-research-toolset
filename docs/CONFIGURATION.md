@@ -55,6 +55,8 @@
 | `CAPABILITY_MCP_URL` | `http://127.0.0.1:{PORT}/mcp` | Harness 内部回连地址 |
 | `CAPABILITY_MCP_TOKEN` | 空 | 部署级 token；正常运行优先使用 conversation 临时 token |
 
+> 当前浏览器前端不会自动发送 `APP_API_TOKEN`。直接启用它会使 SPA 的普通 `/api/*` 请求返回 401；它只适合纯 API 客户端，或由可信反向代理安全注入 bearer header 的部署。浏览器部署应在 Nginx 前置组织级访问控制，详见[部署说明](DEPLOYMENT.md)。
+
 生成随机值示例：
 
 ```bash

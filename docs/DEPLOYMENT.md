@@ -1,138 +1,385 @@
 # 部署说明
 
-本说明提供脱敏的单机 Linux 基线，不代表现网拓扑。生产必须补充 TLS、访问控制、备份、配额、监控和组织自身的安全策略。
+本说明给出从空机开始的单机 Linux 基线：构建不可变 release，由单 worker Uvicorn 同时提供 API 与已构建 SPA，Nginx 负责 TLS、访问控制和 `/agent-tools` 子路径代理。
 
-## 1. 目录建议
+本项目目前是开发者预览。下面是可审计的参考基线，不代表已经完成组织级生产认证，也不代表任何现网拓扑。
+
+## 1. 部署边界
+
+- 支持 Linux `x86_64` / `arm64`，glibc `2.28+`；
+- Python 基线为 `3.11`；
+- 构建前端需要 Node.js `^20.19.0 || >=22.12.0`；
+- bundled Harness runtime 本身不要求服务器额外安装 Node.js；PDF runtime 仍需要 Node.js；
+- 只允许一个应用实例和 `--workers 1`；
+- 普通项目、对话和文件 API 当前不包含完整多用户身份系统，公网入口必须由 Nginx 前置组织自己的 SSO、OIDC、VPN、mTLS、Basic Auth 或等效访问控制；
+- 当前 SPA 不会自动发送 `APP_API_TOKEN`。直接设置该变量会让浏览器的普通 API 请求返回 401；它只适合纯 API 客户端或能够安全注入 header 的可信网关；
+- 对外代理必须阻断 `/mcp`，内部 Harness 只通过 `127.0.0.1` 回连。
+
+当前没有经过真实 Linux 容器验收的 Docker Compose、Kubernetes、多副本或滚动扩容方案，不能把它们列为已支持部署方式。
+
+## 2. 推荐目录
 
 ```text
 /opt/hoosland-agent-tools/
 ├── releases/{build-id}/
+│   ├── .venv/
+│   ├── backend/
+│   ├── frontend/dist/
+│   ├── skills/
+│   └── deploy/
 ├── current -> releases/{build-id}
-└── venv/
+└── pdf-tool/                    可选、root-owned 的持久 PDF runtime
 
-/srv/hoosland-agent-tools/data/
-/etc/hoosland-agent-tools/agent.env
+/srv/hoosland-agent-tools/
+└── data/                        业务状态与 Harness sessions
+
+/etc/hoosland-agent-tools/
+└── agent.env                    root:root 0600
 ```
 
-每个 release 不可变；`current` 只在验收通过后原子切换。
+每个 release 都有独立 `.venv`。这样切回 `current` 时，源码、前端和 Python 依赖一起回滚；不要多个 release 共用一个会被原地升级的 venv。
 
-## 2. 构建前端
+## 3. 主机与构建环境检查
+
+运行主机至少需要 Python 3.11、systemd、Nginx 和 Git。构建主机还需要 Node.js 与 npm：
 
 ```bash
-cd frontend
-npm ci
+python3.11 --version
+getconf GNU_LIBC_VERSION
+uname -m
+systemctl --version
+nginx -v
+git --version
+node --version
+npm --version
+```
+
+Node 可以只存在于可信构建机；如果直接在服务器构建，服务器也必须满足前端 Node 版本要求。发行版自带 Node 往往过旧，应使用组织批准的 Node 22 LTS 安装渠道并在构建前检查版本。
+
+## 4. 初始化服务用户与目录
+
+首次部署时创建无登录服务用户：
+
+```bash
+sudo useradd \
+  --system \
+  --home-dir /srv/hoosland-agent-tools \
+  --create-home \
+  --shell /usr/sbin/nologin \
+  hoosland-agent
+```
+
+如果用户已存在，不要重复执行。创建目录并明确权限：
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/hoosland-agent-tools/releases
+sudo install -d -o root -g root -m 0750 /etc/hoosland-agent-tools
+sudo install -d -o hoosland-agent -g hoosland-agent -m 0750 /srv/hoosland-agent-tools/data
+```
+
+release、配置模板和 PDF runtime 由 root 拥有且服务用户只读；只有 `/srv/hoosland-agent-tools` 属于服务运行状态并允许写入。
+
+## 5. 构建不可变 release
+
+先以普通部署账户克隆私有仓库，不要把 GitHub 凭证交给服务用户或写入 release：
+
+```bash
+git clone https://github.com/manhoolee/hoosland-agent-tools.git
+cd hoosland-agent-tools
+git status --short
+git rev-parse HEAD
+```
+
+运行回归并构建带 `/agent-tools` 前缀的前端：
+
+```bash
+python3.11 -m venv backend/.venv
+. backend/.venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r backend/requirements.txt
+npm --prefix frontend ci
+PYTHON=python bash ./scripts/test.sh
+
 VITE_API_BASE_URL=/agent-tools \
-VITE_DEPLOYMENT_SLOT=slot-b \
+VITE_DEPLOYMENT_SLOT=single-linux \
 VITE_APP_VERSION=demo_v0.2 \
-npm run build
+npm --prefix frontend run build
+
+test -s frontend/dist/index.html
 ```
 
-## 3. 安装后端
+部署前缀在前端构建时固定。更改 `/agent-tools` 必须同时修改：
+
+- `VITE_API_BASE_URL` 并重新构建前端；
+- Nginx `location`、message rate-limit map 与 `proxy_cookie_path`；
+- 对外健康检查和书签地址。
+
+生成 build ID，并把 Git 跟踪文件与前端构建复制到新 release：
 
 ```bash
-python3.11 -m venv /opt/hoosland-agent-tools/venv
-/opt/hoosland-agent-tools/venv/bin/pip install \
-  -r /opt/hoosland-agent-tools/current/backend/requirements.txt
+HOOSLAND_BUILD_ID="$(git rev-parse --short=12 HEAD)"
+HOOSLAND_RELEASE_DIR="/opt/hoosland-agent-tools/releases/${HOOSLAND_BUILD_ID}"
+
+sudo install -d -o root -g root -m 0755 "$HOOSLAND_RELEASE_DIR"
+git archive HEAD | sudo tar -x -C "$HOOSLAND_RELEASE_DIR"
+sudo install -d -o root -g root -m 0755 "$HOOSLAND_RELEASE_DIR/frontend/dist"
+sudo cp -a frontend/dist/. "$HOOSLAND_RELEASE_DIR/frontend/dist/"
+
+sudo python3.11 -m venv "$HOOSLAND_RELEASE_DIR/.venv"
+sudo "$HOOSLAND_RELEASE_DIR/.venv/bin/python" -m pip install --upgrade pip
+sudo "$HOOSLAND_RELEASE_DIR/.venv/bin/python" -m pip install \
+  -r "$HOOSLAND_RELEASE_DIR/backend/requirements.txt"
+
+sudo chown -R root:root "$HOOSLAND_RELEASE_DIR"
+sudo chmod -R go-w "$HOOSLAND_RELEASE_DIR"
+test -x "$HOOSLAND_RELEASE_DIR/.venv/bin/python"
+test -s "$HOOSLAND_RELEASE_DIR/frontend/dist/index.html"
 ```
 
-将 `backend/.env.example` 复制到 `/etc/hoosland-agent-tools/agent.env` 后修改路径和密钥。建议权限：
+`requirements.txt` 除 Harness 外仍包含范围依赖，因此发布记录应保存实际安装清单：
 
 ```bash
-chown root:root /etc/hoosland-agent-tools/agent.env
-chmod 0600 /etc/hoosland-agent-tools/agent.env
+sudo "$HOOSLAND_RELEASE_DIR/.venv/bin/python" -m pip freeze \
+  | sudo tee "$HOOSLAND_RELEASE_DIR/python-freeze.txt" >/dev/null
+sudo chmod 0444 "$HOOSLAND_RELEASE_DIR/python-freeze.txt"
+```
+
+首次部署建立 `current`：
+
+```bash
+sudo ln -s "$HOOSLAND_RELEASE_DIR" /opt/hoosland-agent-tools/current
+```
+
+已有 `current` 时不要执行上面的首次命令，使用本文件后面的原子升级流程。
+
+## 6. 配置生产环境
+
+首次安装配置模板：
+
+```bash
+sudo install \
+  -o root -g root -m 0600 \
+  /opt/hoosland-agent-tools/current/backend/.env.example \
+  /etc/hoosland-agent-tools/agent.env
+sudoedit /etc/hoosland-agent-tools/agent.env
 ```
 
 生产关键值示例：
 
 ```dotenv
 APP_ENV=production
-APP_SLOT=slot-b
-BUILD_ID=replace-with-immutable-build-id
+APP_SLOT=single-linux
+BUILD_ID=replace-with-current-git-build-id
 HOST=127.0.0.1
 PORT=8000
 DATA_DIR=/srv/hoosland-agent-tools/data
 FRONTEND_DIST=/opt/hoosland-agent-tools/current/frontend/dist
 HARNESS_CORDIS_PATH=/opt/hoosland-agent-tools/current/backend/cordis.yml
 HARNESS_SKILL_DIRS=/opt/hoosland-agent-tools/current/skills
+DEEPSEEK_API_KEY=
 CAPABILITY_MCP_URL=http://127.0.0.1:8000/mcp
+ADMIN_PASSWORD=
+ADMIN_SESSION_SECRET=
+CONFIG_ENCRYPTION_KEY=
 ADMIN_COOKIE_SECURE=true
 ```
 
-## 4. systemd
-
-复制 [systemd 示例](../deploy/systemd/hoosland-agent-tools.service.example)，按实际用户和目录调整：
+必须使用密码管理器或组织 secrets 系统填入真实值。`ADMIN_SESSION_SECRET` 建议至少 48 个随机字符；独立 `CONFIG_ENCRYPTION_KEY` 必须是 Fernet key。可以分别生成：
 
 ```bash
-systemctl daemon-reload
-systemctl enable --now hoosland-agent-tools.service
-systemctl status hoosland-agent-tools.service
+python3.11 -c "import secrets; print(secrets.token_urlsafe(48))"
+/opt/hoosland-agent-tools/current/.venv/bin/python -c \
+  "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-保持 `--workers 1`。两个槽位应使用不同服务用户、端口、`DATA_DIR`、EnvironmentFile 和 secret。
+这两个值一旦用于现有 `DATA_DIR` 就必须跨升级、重启和恢复保持一致。丢失或更换加密 key 会使已保存的 runtime 配置无法解密。
 
-## 5. Nginx
+`PORT`、Uvicorn `--port`、`CAPABILITY_MCP_URL` 和 Nginx upstream 必须一致。修改端口不能只改 `agent.env`，还要同步修改 systemd unit 和 Nginx。
 
-参考 [Nginx 示例](../deploy/nginx/hoosland-agent-tools.conf.example)。关键要求：
+## 7. 安装并启动 systemd 服务
 
-- TLS 终止；
-- 对公网 `/mcp` 及其子路径返回 404；
-- SSE 禁用代理缓冲；
-- 长任务设置足够的 read/send timeout；
-- 限制上传大小和消息请求频率；
-- 管理 Cookie path 与部署前缀一致。
-
-修改后：
+安装仓库中的强化 unit：
 
 ```bash
-nginx -t
-systemctl reload nginx
+sudo install \
+  -o root -g root -m 0644 \
+  /opt/hoosland-agent-tools/current/deploy/systemd/hoosland-agent-tools.service.example \
+  /etc/systemd/system/hoosland-agent-tools.service
+
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/hoosland-agent-tools.service
+sudo systemctl enable --now hoosland-agent-tools.service
+sudo systemctl status hoosland-agent-tools.service
 ```
 
-## 6. PDF runtime
+systemd manager 可以读取 root-only `EnvironmentFile`，服务用户不需要直接读取它。unit 必须继续使用 `current/.venv/bin/python`、`WorkingDirectory=current/backend` 和 `--workers 1`。
 
-PDF 不是默认格式。需要 PDF 时，在固定路径预装一次运行时：
+查看日志：
 
 ```bash
-sudo install -d -m 0755 /opt/hoosland-agent-tools/pdf-tool
-sudo cp -a deploy/pdf-tool/. /opt/hoosland-agent-tools/pdf-tool/
+sudo journalctl -u hoosland-agent-tools.service -n 200 --no-pager
+sudo journalctl -u hoosland-agent-tools.service -f
+```
+
+日志和截图中不得粘贴环境文件、请求正文、附件内容、Provider 响应或密钥。
+
+## 8. 配置 Nginx、TLS 与访问控制
+
+仓库示例假设外部地址为 `https://agent-tools.example.com/agent-tools/`，且 DNS 与 TLS 证书已经由运维系统准备。复制前必须：
+
+1. 替换域名和证书路径；
+2. 接入组织自己的 SSO、OIDC、VPN、mTLS、Basic Auth 或可信 IP 策略；
+3. 保留 `/mcp` 的精确 404 阻断；
+4. 保留 SSE 的 `proxy_buffering off`；
+5. 保留 `proxy_pass http://127.0.0.1:8000/` 尾部的 `/`，它负责剥离外部 `/agent-tools/` 前缀；
+6. 核对上传大小、速率限制、Cookie path 和超时。
+
+Debian / Ubuntu 的一种落盘方式：
+
+```bash
+sudo install \
+  -o root -g root -m 0644 \
+  /opt/hoosland-agent-tools/current/deploy/nginx/hoosland-agent-tools.conf.example \
+  /etc/nginx/sites-available/hoosland-agent-tools.conf
+sudo ln -s \
+  /etc/nginx/sites-available/hoosland-agent-tools.conf \
+  /etc/nginx/sites-enabled/hoosland-agent-tools.conf
+
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+其他发行版应把同一配置放到该发行版 `http` 上下文实际 include 的目录。示例中的 `map` 和 `limit_req_zone` 必须位于 Nginx `http` 上下文，不能放进 `server` 或 `location`。
+
+## 9. 可选 PDF runtime
+
+PDF 不是默认安装项，只在 Linux 上提供持久运行时基线。先安装 Poppler 与 Playwright Chromium 所需系统库。Debian / Ubuntu 可在组织批准的包源中安装 `poppler-utils`；Playwright 依赖必须按目标发行版安装。
+
+复制并安装固定的 root-owned runtime：
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/hoosland-agent-tools/pdf-tool
+sudo cp -a \
+  /opt/hoosland-agent-tools/current/deploy/pdf-tool/. \
+  /opt/hoosland-agent-tools/pdf-tool/
+
 sudo /opt/hoosland-agent-tools/pdf-tool/install-runtime.sh \
   /opt/hoosland-agent-tools/pdf-tool
+
+sudo /opt/hoosland-agent-tools/pdf-tool/node_modules/.bin/playwright \
+  install-deps chromium
 ```
 
-生产前确认以下命令在服务用户的 PATH 中：
+确认命令和依赖：
 
 ```bash
 command -v hoosland-pdf-render
 command -v hoosland-pdf-inspect
+command -v pdftoppm
 test -x /opt/hoosland-agent-tools/pdf-tool/render-html-to-pdf.mjs
 test -x /opt/hoosland-agent-tools/pdf-tool/inspect-pdf.py
 ```
 
-安装脚本以 Linux、Playwright Chromium 和 Poppler 为基线。不要允许 Agent 在 conversation 内临时执行 `pip install`、`npm install`、`npx playwright install` 或系统包安装。
+PDF wrapper 默认使用 `/opt/hoosland-agent-tools/current/.venv/bin/python`。服务用户只能读取 PDF runtime，不得拥有或修改它。不要允许 Agent 在 conversation 内临时执行 `pip install`、`npm install`、`npx playwright install` 或系统包安装。
 
-## 7. 放行检查
+安装完成后，必须通过应用生成一份含中文、分页、图片和链接的真实 HTML → PDF，并逐页渲染检查；仅有命令存在不等于 PDF 能力已验收。
+
+## 10. 放行检查
+
+先检查文件和本机入口：
 
 ```bash
+test -s /opt/hoosland-agent-tools/current/frontend/dist/index.html
 curl --fail http://127.0.0.1:8000/api/health/live
-curl --fail http://127.0.0.1:8000/api/health/ready
+curl --fail http://127.0.0.1:8000/api/health/ready \
+  | /opt/hoosland-agent-tools/current/.venv/bin/python -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["ready"] and value["frontend_built"]'
 curl --fail http://127.0.0.1:8000/api/capabilities
 ```
 
-此外必须完成：
+再从受访问控制保护的外部入口检查：
 
-1. 一个真实模型最小对话；
-2. 本次涉及的每个 Provider 真实调用；
-3. 上传、成果打开与下载；
-4. 刷新恢复、停止和失败重试；
-5. 正式 Markdown/HTML，按需 PDF 的实际生成与渲染；
-6. `/mcp` 公网阻断；
-7. 另一槽位的服务与数据未受影响。
+```bash
+curl --fail https://agent-tools.example.com/agent-tools/
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+  https://agent-tools.example.com/agent-tools/mcp)" = "404"
+```
 
-## 8. 回滚
+健康检查不能替代真实验收。正式放行还必须完成：
 
-1. 将入口切回前一稳定槽或移除新入口；
-2. 恢复前一 Nginx 配置并执行 `nginx -t`；
-3. 原子切回前一 `current` symlink 或启动前一槽；
-4. 复测 live、ready、最小对话和成果读取；
-5. 保留故障 release、日志和脱敏诊断用于复盘；
-6. 不删除或覆盖另一槽的数据。
+1. 浏览器加载首页与静态资源，API 请求路径正确；
+2. 一个真实模型最小对话，并确认总控与专项 Skill 实际执行；
+3. 本次涉及的每个 Provider 真实调用；
+4. 上传、成果打开与下载；
+5. 刷新恢复、停止、失败重试和幂等边界；
+6. Markdown 与独立 HTML 的实际生成和打开；
+7. 按需 PDF 的生成、文本提取和逐页渲染；
+8. 未授权访问被反向代理拒绝，公网 `/mcp` 返回 404；
+9. `journalctl`、磁盘、备份与告警入口可用。
+
+## 11. 数据备份与恢复
+
+`DATA_DIR` 包含 conversation、附件、成果、Harness sessions、operation logs 与加密 runtime 配置。备份必须同时保存数据和对应的 `ADMIN_SESSION_SECRET` / `CONFIG_ENCRYPTION_KEY`，但两者不应存放在同一低权限归档中。
+
+优先使用文件系统或云盘的一致性快照。小型单机环境可以在维护窗口停服务后归档：
+
+```bash
+sudo systemctl stop hoosland-agent-tools.service
+sudo tar --acls --xattrs \
+  -C /srv/hoosland-agent-tools \
+  -czf /secure-backup-location/hoosland-data-backup.tar.gz \
+  data
+sudo systemctl start hoosland-agent-tools.service
+```
+
+备份路径、保留期、加密、异地副本与恢复演练由组织策略决定。恢复必须在隔离环境验证数据、密钥、Schema 与 release 兼容后再切回入口。
+
+## 12. 原子升级
+
+1. 在普通部署账户的独立 checkout 获取目标 commit；
+2. 运行完整自动化测试和本次能力的真实验收；
+3. 按第 5 节创建新的独立 release 与 `.venv`；
+4. 核对 Schema、配置和数据兼容性并完成备份；
+5. 记录当前 `readlink -f /opt/hoosland-agent-tools/current`；
+6. 原子切换 symlink，重启服务并执行完整放行检查。
+
+切换命令示例：
+
+```bash
+HOOSLAND_NEW_RELEASE="/opt/hoosland-agent-tools/releases/replace-with-new-build-id"
+HOOSLAND_SWITCH_LINK="/opt/hoosland-agent-tools/current.replace-with-new-build-id"
+
+sudo ln -s "$HOOSLAND_NEW_RELEASE" "$HOOSLAND_SWITCH_LINK"
+sudo mv -Tf "$HOOSLAND_SWITCH_LINK" /opt/hoosland-agent-tools/current
+sudo systemctl restart hoosland-agent-tools.service
+sudo systemctl status hoosland-agent-tools.service
+```
+
+仅切换 symlink 不会更新已经运行的进程，必须显式 `systemctl restart`。不要修改在线 release；配置变化后也必须重启，让旧 runner 全部退出。
+
+真正无停机的 A/B 部署需要两个独立 service、端口、环境文件、`DATA_DIR`、secret 与 Nginx upstream。本仓库当前只提供单实例模板，不能把单实例步骤描述成已经完成 A/B。
+
+## 13. 回滚
+
+确认前一 release 与当前数据 Schema 仍兼容，然后原子切回并重启：
+
+```bash
+HOOSLAND_PREVIOUS_RELEASE="/opt/hoosland-agent-tools/releases/replace-with-previous-build-id"
+HOOSLAND_ROLLBACK_LINK="/opt/hoosland-agent-tools/rollback.$(date +%s)"
+
+sudo ln -s "$HOOSLAND_PREVIOUS_RELEASE" "$HOOSLAND_ROLLBACK_LINK"
+sudo mv -Tf "$HOOSLAND_ROLLBACK_LINK" /opt/hoosland-agent-tools/current
+sudo systemctl restart hoosland-agent-tools.service
+```
+
+回滚后重新检查 live、ready + `frontend_built`、外部页面、真实最小对话和成果读取。保留故障 release、日志与脱敏诊断用于复盘，不要为了回滚删除客户数据或覆盖另一份备份。
+
+## 14. 停用
+
+停用服务和入口：
+
+```bash
+sudo systemctl disable --now hoosland-agent-tools.service
+```
+
+随后由运维系统移除 Nginx 入口并执行 `nginx -t`。停用不等于删除；在明确备份、保留期、客户授权和恢复要求之前，不要删除 `/srv/hoosland-agent-tools/data`、secrets、release 或 PDF runtime。
