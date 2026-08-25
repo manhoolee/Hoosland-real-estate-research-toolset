@@ -1,8 +1,9 @@
 {
-  "parent": {"scope_id": "machang-phase-1", "value": 566962},
+  "_fixture_notice": "合成演示数据；本文件故意包含范围与加总错误，用于失败路径测试。",
+  "parent": {"scope_id": "demo-phase-1", "value": 600000},
   "metrics": [
-    {"name": "片区商业商务", "value": 498000, "parent_scope_id": "machang-masterplan", "relation": "component"},
-    {"name": "片区住宅", "value": 220000, "parent_scope_id": "machang-masterplan", "relation": "component"},
-    {"name": "片区公服", "value": 33000, "parent_scope_id": "machang-masterplan", "relation": "component"}
+    {"name": "演示片区商业商务", "value": 498000, "parent_scope_id": "demo-masterplan", "relation": "component"},
+    {"name": "演示片区住宅", "value": 220000, "parent_scope_id": "demo-masterplan", "relation": "component"},
+    {"name": "演示片区公服", "value": 33000, "parent_scope_id": "demo-masterplan", "relation": "component"}
   ]
 }

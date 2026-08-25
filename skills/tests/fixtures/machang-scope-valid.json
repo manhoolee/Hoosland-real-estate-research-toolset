@@ -1,11 +1,12 @@
 {
-  "parent": {"scope_id": "machang-phase-1-listed-gfa", "value": 566962},
+  "_fixture_notice": "合成演示数据；名称、编号与指标均为虚构，仅用于自动化测试。",
+  "parent": {"scope_id": "demo-phase-1-listed-gfa", "value": 600000},
   "metrics": [
-    {"name": "AT111321商业商务", "value": 120000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
-    {"name": "AT111323商业商务", "value": 89000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
-    {"name": "AT111333住宅", "value": 110000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
-    {"name": "AT111337住宅", "value": 112740, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
-    {"name": "AT111338商业商务", "value": 128222, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"},
-    {"name": "地下商业", "value": 7000, "parent_scope_id": "machang-phase-1-listed-gfa", "relation": "component"}
+    {"name": "DEMO-COM-01 商业商务", "value": 125000, "parent_scope_id": "demo-phase-1-listed-gfa", "relation": "component"},
+    {"name": "DEMO-COM-02 商业商务", "value": 95000, "parent_scope_id": "demo-phase-1-listed-gfa", "relation": "component"},
+    {"name": "DEMO-RES-01 住宅", "value": 105000, "parent_scope_id": "demo-phase-1-listed-gfa", "relation": "component"},
+    {"name": "DEMO-RES-02 住宅", "value": 115000, "parent_scope_id": "demo-phase-1-listed-gfa", "relation": "component"},
+    {"name": "DEMO-COM-03 商业商务", "value": 150000, "parent_scope_id": "demo-phase-1-listed-gfa", "relation": "component"},
+    {"name": "DEMO-UG-01 地下商业", "value": 10000, "parent_scope_id": "demo-phase-1-listed-gfa", "relation": "component"}
   ]
 }

@@ -1,6 +1,9 @@
 """
 微信文章抓取核心脚本 v5
-修复版：参考开源项目 wechat-article-exporter 的策略
+修复版：参考开源项目 wechat-article-exporter 的公开方法
+方法参考：https://github.com/wechat-article/wechat-article-exporter
+上游许可：MIT，Copyright (c) 2024 Jock
+本文件为独立维护的 Python 实现；导出内容的权利仍归原作者或发布方。
 - 保留完整 HTML 结构（<!DOCTYPE><html><head><body>）
 - 下载 CSS/图片到 assets/，用时间戳文件名
 - 替换所有资源 URL 为本地路径

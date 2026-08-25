@@ -10,4 +10,6 @@ Original documentation and report content are licensed under CC BY 4.0 as descri
 
 The repository contains links to public documentation, templates and open-source projects used as methodological references. Those projects remain the property of their respective authors and are not relicensed by this repository. The reference list is maintained in the `references/github-template-references.md` files.
 
+The WeChat article extraction workflow cites [wechat-article/wechat-article-exporter](https://github.com/wechat-article/wechat-article-exporter) as a methodological reference. That project is Copyright (c) 2024 Jock and is distributed under the MIT License. The Python implementation in this repository is maintained independently; exported article content remains subject to the rights of its original authors and publishers.
+
 Public-source links and project research materials may carry their own terms, database rights, image rights, trademark rights or other restrictions. A link or citation in this repository is not a transfer of those rights.

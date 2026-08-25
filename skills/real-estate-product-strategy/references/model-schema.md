@@ -7,7 +7,7 @@
   "scope_id": "phase-1-residential",
   "as_of_date": "2026-08-25",
   "currency": "CNY",
-  "residential_gfa_sqm": 222740,
+  "residential_gfa_sqm": 220000,
   "saleable_ratio": 0.92,
   "segments": [
     {

@@ -1,10 +1,11 @@
 {
+  "_fixture_notice": "合成演示数据；名称、指标、产品组合与价格均为虚构，仅用于自动化测试。",
   "model_version": "2.3.0",
-  "project": "广州天河马场地块一期",
-  "scope_id": "machang-phase-1-residential",
+  "project": "示例市云河新区演示地块 A 期",
+  "scope_id": "demo-phase-1-residential",
   "as_of_date": "2026-08-25",
   "currency": "CNY",
-  "residential_gfa_sqm": 222740,
+  "residential_gfa_sqm": 220000,
   "saleable_ratio": 0.92,
   "segments": [
     {"name": "城市改善", "share": 0.30, "avg_unit_gfa": 200, "prices": {"conservative": 120000, "base": 130000, "optimistic": 145000}},

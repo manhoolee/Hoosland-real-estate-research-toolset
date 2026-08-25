@@ -4,7 +4,11 @@
 
 Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策略与正式成果交付的可审计 Agent 工具链。LLM 提供推理能力，[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 与 Cordis 提供受控运行、会话、沙箱和工具调度，11 个 Skill 再把通用 Agent 约束为有范围、有证据、有计算规则、有交付闸门的领域工具。
 
-本仓库是 **V2 产品线的开发者预览版**。它包含完整应用源码和 Skill 套件，不包含模型密钥、客户数据、现网配置、历史发布包或生产凭证。
+本仓库包含 **V2 产品线**的完整应用源码和 Skill 套件，不包含模型密钥、客户数据、现网配置、历史发布包或生产凭证。
+
+> **项目阶段与兼容性声明**
+>
+> 本项目目前仍处于前期 Demo（开发者预览）阶段，主要用于验证架构、工作流与领域 Skill 的可行性，尚未形成稳定的公开接口或数据契约。后续版本可能包含不向后兼容的变更；升级前请阅读对应版本的 `CHANGELOG.md` 与迁移说明，并备份数据和配置。当前版本不承诺生产可用性或长期兼容性。
 
 ## 设计公式
 
@@ -23,7 +27,7 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 | 工作台应用 | `0.2.0` | FastAPI、React、API、文件、长任务恢复与管理配置 |
 | System Prompt | `real-estate-system-v0.2.0` | 全局身份、安全、证据、权限和交付规则 |
 | Skill 套件 | `2.3.0` | 1 个总控 + 10 个专项 Skill |
-| 项目状态 Schema | `2.1.0` | 兼容既有 case state；只有数据契约变化并提供迁移器时才升级 |
+| 项目状态 Schema | `2.1.0` | 仅在持久化数据契约变化时升级；Demo 阶段可能不兼容，迁移或重建路径见发布说明 |
 
 ## 核心能力
 
@@ -91,7 +95,7 @@ git clone https://github.com/manhoolee/Hoosland-real-estate-research-toolset.git
 cd Hoosland-real-estate-research-toolset
 ```
 
-仓库当前为私有可见性，克隆账户需要先取得访问权限。
+仓库为公开仓库，可直接克隆；模型及可选 Provider 的凭证仍需由部署者自行配置。
 
 ### 2. 启动后端
 
