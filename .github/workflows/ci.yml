@@ -17,6 +17,14 @@ jobs:
           python-version: '3.11'
           cache: pip
           cache-dependency-path: backend/requirements.txt
+      - name: Check canonical project naming
+        run: |
+          test -f deploy/systemd/hoosland-real-estate-research-toolset.service.example
+          test -f deploy/nginx/hoosland-real-estate-research-toolset.conf.example
+          test ! -e deploy/systemd/hoosland-agent-tools.service.example
+          test ! -e deploy/nginx/hoosland-agent-tools.conf.example
+          git grep -q 'Hoosland-real-estate-research-toolset' -- README.md
+          ! git grep -n -I -E 'Hoosland Agent Tools|real-estate-agent-frontend|Real Estate Expert Agent|real-estate-agent-backend' -- . ':!.github/workflows/ci.yml'
       - name: Install backend dependencies
         run: python -m pip install -r backend/requirements.txt
       - name: Run backend tests

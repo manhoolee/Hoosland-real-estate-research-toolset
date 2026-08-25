@@ -1,4 +1,4 @@
-"""Real-estate agent chat backend."""
+"""Backend for Hoosland-real-estate-research-toolset."""
 
 __all__ = ["__version__"]
 

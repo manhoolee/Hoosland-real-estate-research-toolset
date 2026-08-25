@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PDF_TOOL_ROOT="${1:-/opt/hoosland-agent-tools/pdf-tool}"
+PDF_TOOL_ROOT="${1:-/opt/hoosland-real-estate-research-toolset/pdf-tool}"
 case "$PDF_TOOL_ROOT" in
   /*) ;;
   *)

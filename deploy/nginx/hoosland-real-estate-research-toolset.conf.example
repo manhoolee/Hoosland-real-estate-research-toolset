@@ -1,35 +1,35 @@
 # Place map and limit_req_zone in the nginx http context.
 map "$request_method:$uri" $hoosland_agent_message_key {
     default "";
-    ~^POST:/agent-tools/api/conversations/[^/]+/messages$ $binary_remote_addr;
+    ~^POST:/hoosland-real-estate-research-toolset/api/conversations/[^/]+/messages$ $binary_remote_addr;
 }
 
 limit_req_zone $hoosland_agent_message_key zone=hoosland_agent_messages:10m rate=4r/m;
 
 server {
     listen 443 ssl;
-    server_name agent-tools.example.com;
+    server_name real-estate-research-toolset.example.com;
 
     # REQUIRED BEFORE INTERNET EXPOSURE: add the organization's SSO, OIDC,
     # VPN, mTLS, Basic Auth, or equivalent access-control policy. The
     # application itself is not a complete multi-user identity boundary.
 
-    ssl_certificate /etc/letsencrypt/live/agent-tools.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/agent-tools.example.com/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/real-estate-research-toolset.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/real-estate-research-toolset.example.com/privkey.pem;
 
-    location = /agent-tools {
-        return 308 /agent-tools/;
+    location = /hoosland-real-estate-research-toolset {
+        return 308 /hoosland-real-estate-research-toolset/;
     }
 
-    location = /agent-tools/mcp {
+    location = /hoosland-real-estate-research-toolset/mcp {
         return 404;
     }
 
-    location ^~ /agent-tools/mcp/ {
+    location ^~ /hoosland-real-estate-research-toolset/mcp/ {
         return 404;
     }
 
-    location /agent-tools/ {
+    location /hoosland-real-estate-research-toolset/ {
         client_max_body_size 30m;
         limit_req zone=hoosland_agent_messages burst=4 nodelay;
         limit_req_status 429;
@@ -40,7 +40,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Prefix /agent-tools;
+        proxy_set_header X-Forwarded-Prefix /hoosland-real-estate-research-toolset;
         proxy_set_header Connection "";
 
         proxy_read_timeout 3600s;
@@ -48,7 +48,7 @@ server {
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_cache off;
-        proxy_cookie_path /api/admin /agent-tools/api/admin;
+        proxy_cookie_path /api/admin /hoosland-real-estate-research-toolset/api/admin;
         proxy_redirect off;
 
         add_header X-Robots-Tag "noindex, nofollow" always;

@@ -541,7 +541,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             operation_log.close()
 
     app = FastAPI(
-        title="Real Estate Expert Agent",
+        title="Hoosland-real-estate-research-toolset",
         version=__version__,
         docs_url="/api/docs" if app_settings.environment != "production" else None,
         redoc_url=None,
@@ -2051,7 +2051,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def frontend_missing() -> JSONResponse:
             return JSONResponse(
                 {
-                    "service": "real-estate-agent-backend",
+                    "service": "hoosland-real-estate-research-toolset-backend",
                     "version": __version__,
                     "slot": app_settings.slot,
                     "build_id": app_settings.build_id,

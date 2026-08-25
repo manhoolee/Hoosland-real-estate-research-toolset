@@ -1,8 +1,8 @@
-# Hoosland Agent Tools V2
+# Hoosland-real-estate-research-toolset
 
 > **LLM + Harness = Agent；Agent + Skill = Tools。**
 
-Hoosland Agent Tools 是一套面向房地产研究、产品策略与正式成果交付的可审计 Agent 工具链。LLM 提供推理能力，[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 与 Cordis 提供受控运行、会话、沙箱和工具调度，11 个 Skill 再把通用 Agent 约束为有范围、有证据、有计算规则、有交付闸门的领域工具。
+Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策略与正式成果交付的可审计 Agent 工具链。LLM 提供推理能力，[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 与 Cordis 提供受控运行、会话、沙箱和工具调度，11 个 Skill 再把通用 Agent 约束为有范围、有证据、有计算规则、有交付闸门的领域工具。
 
 本仓库是 **V2 产品线的开发者预览版**。它包含完整应用源码和 Skill 套件，不包含模型密钥、客户数据、现网配置、历史发布包或生产凭证。
 
@@ -15,6 +15,8 @@ Hoosland Agent Tools 是一套面向房地产研究、产品策略与正式成�
 ## 版本矩阵
 
 “V2”是产品线名称，各层独立版本化：
+
+项目正式名称为 `Hoosland-real-estate-research-toolset`。既有 Skill suite ID `real-estate-expert-suite` 及 11 个 Skill ID 作为版本化运行协议继续保留，不随仓库改名。
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
@@ -85,8 +87,8 @@ DeepSeek Harness 仍处于快速迭代阶段，本仓库固定使用 `deepseek-h
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/manhoolee/hoosland-agent-tools.git
-cd hoosland-agent-tools
+git clone https://github.com/manhoolee/Hoosland-real-estate-research-toolset.git
+cd Hoosland-real-estate-research-toolset
 ```
 
 仓库当前为私有可见性，克隆账户需要先取得访问权限。

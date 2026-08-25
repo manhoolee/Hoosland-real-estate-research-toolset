@@ -21,4 +21,4 @@ PYTHON_BIN=${PYTHON:-python3}
   PYTHON="$PYTHON_BIN" bash ./tests/run_smoke_tests.sh
 )
 
-echo "All Hoosland Agent Tools checks passed"
+echo "All Hoosland-real-estate-research-toolset checks passed"

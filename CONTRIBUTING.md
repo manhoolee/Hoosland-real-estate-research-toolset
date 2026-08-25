@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢改进 Hoosland Agent Tools。提交前请先阅读 [架构说明](docs/ARCHITECTURE.md) 和 [迭代原则](docs/ITERATION-PRINCIPLES.md)。
+感谢改进 Hoosland-real-estate-research-toolset。提交前请先阅读 [架构说明](docs/ARCHITECTURE.md) 和 [迭代原则](docs/ITERATION-PRINCIPLES.md)。
 
 ## 修改边界
 

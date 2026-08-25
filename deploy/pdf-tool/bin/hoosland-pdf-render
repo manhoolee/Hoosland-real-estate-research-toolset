@@ -1,5 +1,5 @@
 #!/bin/sh
 set -eu
-PDF_TOOL_ROOT="${HOOSLAND_PDF_TOOL_ROOT:-/opt/hoosland-agent-tools/pdf-tool}"
+PDF_TOOL_ROOT="${HOOSLAND_PDF_TOOL_ROOT:-/opt/hoosland-real-estate-research-toolset/pdf-tool}"
 NODE_BIN="${HOOSLAND_PDF_NODE_BIN:-$(command -v node)}"
 exec "$NODE_BIN" "$PDF_TOOL_ROOT/render-html-to-pdf.mjs" "$@"

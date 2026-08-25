@@ -24,5 +24,5 @@ const inferredBaseUrl = inferPublicBaseUrl(window.location.pathname);
 export const API_BASE_URL = configuredBaseUrl || inferredBaseUrl;
 export const DEPLOYMENT_SLOT = clean(import.meta.env.VITE_DEPLOYMENT_SLOT) || inferSlot(API_BASE_URL);
 export const APP_VERSION = clean(import.meta.env.VITE_APP_VERSION) || "demo_v0.2";
-export const APP_TITLE = `Hoosland地产研究工作台/${APP_VERSION}`;
+export const APP_TITLE = `Hoosland-real-estate-research-toolset/${APP_VERSION}`;
 export const STORAGE_NAMESPACE = `real-estate-workbench:${DEPLOYMENT_SLOT}`;

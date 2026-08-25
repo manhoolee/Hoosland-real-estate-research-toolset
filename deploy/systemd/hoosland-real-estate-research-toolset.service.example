@@ -1,0 +1,38 @@
+[Unit]
+Description=Hoosland-real-estate-research-toolset web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hoosland-agent
+Group=hoosland-agent
+WorkingDirectory=/opt/hoosland-real-estate-research-toolset/current/backend
+EnvironmentFile=/etc/hoosland-real-estate-research-toolset/agent.env
+Environment=HOME=/srv/hoosland-real-estate-research-toolset
+Environment=PATH=/opt/hoosland-real-estate-research-toolset/current/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=HOOSLAND_PDF_PYTHON_BIN=/opt/hoosland-real-estate-research-toolset/current/.venv/bin/python
+ExecStart=/opt/hoosland-real-estate-research-toolset/current/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+ReadWritePaths=/srv/hoosland-real-estate-research-toolset
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

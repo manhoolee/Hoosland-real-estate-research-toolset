@@ -17,10 +17,12 @@
 
 当前没有经过真实 Linux 容器验收的 Docker Compose、Kubernetes、多副本或滚动扩容方案，不能把它们列为已支持部署方式。
 
+> 从旧 slug `hoosland-agent-tools` 迁移时，先停用旧 `hoosland-agent-tools.service`，再按备份、权限与验收流程迁移数据和入口。新旧 unit 不得同时监听 8000，也不得未经评估同时写同一 `DATA_DIR`。本仓库不会自动移动生产数据或 secrets。
+
 ## 2. 推荐目录
 
 ```text
-/opt/hoosland-agent-tools/
+/opt/hoosland-real-estate-research-toolset/
 ├── releases/{build-id}/
 │   ├── .venv/
 │   ├── backend/
@@ -30,10 +32,10 @@
 ├── current -> releases/{build-id}
 └── pdf-tool/                    可选、root-owned 的持久 PDF runtime
 
-/srv/hoosland-agent-tools/
+/srv/hoosland-real-estate-research-toolset/
 └── data/                        业务状态与 Harness sessions
 
-/etc/hoosland-agent-tools/
+/etc/hoosland-real-estate-research-toolset/
 └── agent.env                    root:root 0600
 ```
 
@@ -63,7 +65,7 @@ Node 可以只存在于可信构建机；如果直接在服务器构建，服务
 ```bash
 sudo useradd \
   --system \
-  --home-dir /srv/hoosland-agent-tools \
+  --home-dir /srv/hoosland-real-estate-research-toolset \
   --create-home \
   --shell /usr/sbin/nologin \
   hoosland-agent
@@ -72,20 +74,20 @@ sudo useradd \
 如果用户已存在，不要重复执行。创建目录并明确权限：
 
 ```bash
-sudo install -d -o root -g root -m 0755 /opt/hoosland-agent-tools/releases
-sudo install -d -o root -g root -m 0750 /etc/hoosland-agent-tools
-sudo install -d -o hoosland-agent -g hoosland-agent -m 0750 /srv/hoosland-agent-tools/data
+sudo install -d -o root -g root -m 0755 /opt/hoosland-real-estate-research-toolset/releases
+sudo install -d -o root -g root -m 0750 /etc/hoosland-real-estate-research-toolset
+sudo install -d -o hoosland-agent -g hoosland-agent -m 0750 /srv/hoosland-real-estate-research-toolset/data
 ```
 
-release、配置模板和 PDF runtime 由 root 拥有且服务用户只读；只有 `/srv/hoosland-agent-tools` 属于服务运行状态并允许写入。
+release、配置模板和 PDF runtime 由 root 拥有且服务用户只读；只有 `/srv/hoosland-real-estate-research-toolset` 属于服务运行状态并允许写入。`hoosland-agent` 是兼容保留的内部服务账户名，不是项目正式名称。
 
 ## 5. 构建不可变 release
 
 先以普通部署账户克隆私有仓库，不要把 GitHub 凭证交给服务用户或写入 release：
 
 ```bash
-git clone https://github.com/manhoolee/hoosland-agent-tools.git
-cd hoosland-agent-tools
+git clone https://github.com/manhoolee/Hoosland-real-estate-research-toolset.git
+cd Hoosland-real-estate-research-toolset
 git status --short
 git rev-parse HEAD
 ```
@@ -100,7 +102,7 @@ python -m pip install -r backend/requirements.txt
 npm --prefix frontend ci
 PYTHON=python bash ./scripts/test.sh
 
-VITE_API_BASE_URL=/agent-tools \
+VITE_API_BASE_URL=/hoosland-real-estate-research-toolset \
 VITE_DEPLOYMENT_SLOT=single-linux \
 VITE_APP_VERSION=demo_v0.2 \
 npm --prefix frontend run build
@@ -108,7 +110,7 @@ npm --prefix frontend run build
 test -s frontend/dist/index.html
 ```
 
-部署前缀在前端构建时固定。更改 `/agent-tools` 必须同时修改：
+部署前缀在前端构建时固定。更改 `/hoosland-real-estate-research-toolset` 必须同时修改：
 
 - `VITE_API_BASE_URL` 并重新构建前端；
 - Nginx `location`、message rate-limit map 与 `proxy_cookie_path`；
@@ -118,7 +120,7 @@ test -s frontend/dist/index.html
 
 ```bash
 HOOSLAND_BUILD_ID="$(git rev-parse --short=12 HEAD)"
-HOOSLAND_RELEASE_DIR="/opt/hoosland-agent-tools/releases/${HOOSLAND_BUILD_ID}"
+HOOSLAND_RELEASE_DIR="/opt/hoosland-real-estate-research-toolset/releases/${HOOSLAND_BUILD_ID}"
 
 sudo install -d -o root -g root -m 0755 "$HOOSLAND_RELEASE_DIR"
 git archive HEAD | sudo tar -x -C "$HOOSLAND_RELEASE_DIR"
@@ -147,7 +149,7 @@ sudo chmod 0444 "$HOOSLAND_RELEASE_DIR/python-freeze.txt"
 首次部署建立 `current`：
 
 ```bash
-sudo ln -s "$HOOSLAND_RELEASE_DIR" /opt/hoosland-agent-tools/current
+sudo ln -s "$HOOSLAND_RELEASE_DIR" /opt/hoosland-real-estate-research-toolset/current
 ```
 
 已有 `current` 时不要执行上面的首次命令，使用本文件后面的原子升级流程。
@@ -159,9 +161,9 @@ sudo ln -s "$HOOSLAND_RELEASE_DIR" /opt/hoosland-agent-tools/current
 ```bash
 sudo install \
   -o root -g root -m 0600 \
-  /opt/hoosland-agent-tools/current/backend/.env.example \
-  /etc/hoosland-agent-tools/agent.env
-sudoedit /etc/hoosland-agent-tools/agent.env
+  /opt/hoosland-real-estate-research-toolset/current/backend/.env.example \
+  /etc/hoosland-real-estate-research-toolset/agent.env
+sudoedit /etc/hoosland-real-estate-research-toolset/agent.env
 ```
 
 生产关键值示例：
@@ -172,10 +174,10 @@ APP_SLOT=single-linux
 BUILD_ID=replace-with-current-git-build-id
 HOST=127.0.0.1
 PORT=8000
-DATA_DIR=/srv/hoosland-agent-tools/data
-FRONTEND_DIST=/opt/hoosland-agent-tools/current/frontend/dist
-HARNESS_CORDIS_PATH=/opt/hoosland-agent-tools/current/backend/cordis.yml
-HARNESS_SKILL_DIRS=/opt/hoosland-agent-tools/current/skills
+DATA_DIR=/srv/hoosland-real-estate-research-toolset/data
+FRONTEND_DIST=/opt/hoosland-real-estate-research-toolset/current/frontend/dist
+HARNESS_CORDIS_PATH=/opt/hoosland-real-estate-research-toolset/current/backend/cordis.yml
+HARNESS_SKILL_DIRS=/opt/hoosland-real-estate-research-toolset/current/skills
 DEEPSEEK_API_KEY=
 CAPABILITY_MCP_URL=http://127.0.0.1:8000/mcp
 ADMIN_PASSWORD=
@@ -188,7 +190,7 @@ ADMIN_COOKIE_SECURE=true
 
 ```bash
 python3.11 -c "import secrets; print(secrets.token_urlsafe(48))"
-/opt/hoosland-agent-tools/current/.venv/bin/python -c \
+/opt/hoosland-real-estate-research-toolset/current/.venv/bin/python -c \
   "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
@@ -203,13 +205,13 @@ python3.11 -c "import secrets; print(secrets.token_urlsafe(48))"
 ```bash
 sudo install \
   -o root -g root -m 0644 \
-  /opt/hoosland-agent-tools/current/deploy/systemd/hoosland-agent-tools.service.example \
-  /etc/systemd/system/hoosland-agent-tools.service
+  /opt/hoosland-real-estate-research-toolset/current/deploy/systemd/hoosland-real-estate-research-toolset.service.example \
+  /etc/systemd/system/hoosland-real-estate-research-toolset.service
 
 sudo systemctl daemon-reload
-sudo systemd-analyze verify /etc/systemd/system/hoosland-agent-tools.service
-sudo systemctl enable --now hoosland-agent-tools.service
-sudo systemctl status hoosland-agent-tools.service
+sudo systemd-analyze verify /etc/systemd/system/hoosland-real-estate-research-toolset.service
+sudo systemctl enable --now hoosland-real-estate-research-toolset.service
+sudo systemctl status hoosland-real-estate-research-toolset.service
 ```
 
 systemd manager 可以读取 root-only `EnvironmentFile`，服务用户不需要直接读取它。unit 必须继续使用 `current/.venv/bin/python`、`WorkingDirectory=current/backend` 和 `--workers 1`。
@@ -217,21 +219,21 @@ systemd manager 可以读取 root-only `EnvironmentFile`，服务用户不需要
 查看日志：
 
 ```bash
-sudo journalctl -u hoosland-agent-tools.service -n 200 --no-pager
-sudo journalctl -u hoosland-agent-tools.service -f
+sudo journalctl -u hoosland-real-estate-research-toolset.service -n 200 --no-pager
+sudo journalctl -u hoosland-real-estate-research-toolset.service -f
 ```
 
 日志和截图中不得粘贴环境文件、请求正文、附件内容、Provider 响应或密钥。
 
 ## 8. 配置 Nginx、TLS 与访问控制
 
-仓库示例假设外部地址为 `https://agent-tools.example.com/agent-tools/`，且 DNS 与 TLS 证书已经由运维系统准备。复制前必须：
+仓库示例假设外部地址为 `https://real-estate-research-toolset.example.com/hoosland-real-estate-research-toolset/`，且 DNS 与 TLS 证书已经由运维系统准备。复制前必须：
 
 1. 替换域名和证书路径；
 2. 接入组织自己的 SSO、OIDC、VPN、mTLS、Basic Auth 或可信 IP 策略；
 3. 保留 `/mcp` 的精确 404 阻断；
 4. 保留 SSE 的 `proxy_buffering off`；
-5. 保留 `proxy_pass http://127.0.0.1:8000/` 尾部的 `/`，它负责剥离外部 `/agent-tools/` 前缀；
+5. 保留 `proxy_pass http://127.0.0.1:8000/` 尾部的 `/`，它负责剥离外部 `/hoosland-real-estate-research-toolset/` 前缀；
 6. 核对上传大小、速率限制、Cookie path 和超时。
 
 Debian / Ubuntu 的一种落盘方式：
@@ -239,11 +241,11 @@ Debian / Ubuntu 的一种落盘方式：
 ```bash
 sudo install \
   -o root -g root -m 0644 \
-  /opt/hoosland-agent-tools/current/deploy/nginx/hoosland-agent-tools.conf.example \
-  /etc/nginx/sites-available/hoosland-agent-tools.conf
+  /opt/hoosland-real-estate-research-toolset/current/deploy/nginx/hoosland-real-estate-research-toolset.conf.example \
+  /etc/nginx/sites-available/hoosland-real-estate-research-toolset.conf
 sudo ln -s \
-  /etc/nginx/sites-available/hoosland-agent-tools.conf \
-  /etc/nginx/sites-enabled/hoosland-agent-tools.conf
+  /etc/nginx/sites-available/hoosland-real-estate-research-toolset.conf \
+  /etc/nginx/sites-enabled/hoosland-real-estate-research-toolset.conf
 
 sudo nginx -t
 sudo systemctl reload nginx
@@ -258,15 +260,15 @@ PDF 不是默认安装项，只在 Linux 上提供持久运行时基线。先安
 复制并安装固定的 root-owned runtime：
 
 ```bash
-sudo install -d -o root -g root -m 0755 /opt/hoosland-agent-tools/pdf-tool
+sudo install -d -o root -g root -m 0755 /opt/hoosland-real-estate-research-toolset/pdf-tool
 sudo cp -a \
-  /opt/hoosland-agent-tools/current/deploy/pdf-tool/. \
-  /opt/hoosland-agent-tools/pdf-tool/
+  /opt/hoosland-real-estate-research-toolset/current/deploy/pdf-tool/. \
+  /opt/hoosland-real-estate-research-toolset/pdf-tool/
 
-sudo /opt/hoosland-agent-tools/pdf-tool/install-runtime.sh \
-  /opt/hoosland-agent-tools/pdf-tool
+sudo /opt/hoosland-real-estate-research-toolset/pdf-tool/install-runtime.sh \
+  /opt/hoosland-real-estate-research-toolset/pdf-tool
 
-sudo /opt/hoosland-agent-tools/pdf-tool/node_modules/.bin/playwright \
+sudo /opt/hoosland-real-estate-research-toolset/pdf-tool/node_modules/.bin/playwright \
   install-deps chromium
 ```
 
@@ -276,11 +278,11 @@ sudo /opt/hoosland-agent-tools/pdf-tool/node_modules/.bin/playwright \
 command -v hoosland-pdf-render
 command -v hoosland-pdf-inspect
 command -v pdftoppm
-test -x /opt/hoosland-agent-tools/pdf-tool/render-html-to-pdf.mjs
-test -x /opt/hoosland-agent-tools/pdf-tool/inspect-pdf.py
+test -x /opt/hoosland-real-estate-research-toolset/pdf-tool/render-html-to-pdf.mjs
+test -x /opt/hoosland-real-estate-research-toolset/pdf-tool/inspect-pdf.py
 ```
 
-PDF wrapper 默认使用 `/opt/hoosland-agent-tools/current/.venv/bin/python`。服务用户只能读取 PDF runtime，不得拥有或修改它。不要允许 Agent 在 conversation 内临时执行 `pip install`、`npm install`、`npx playwright install` 或系统包安装。
+PDF wrapper 默认使用 `/opt/hoosland-real-estate-research-toolset/current/.venv/bin/python`。服务用户只能读取 PDF runtime，不得拥有或修改它。不要允许 Agent 在 conversation 内临时执行 `pip install`、`npm install`、`npx playwright install` 或系统包安装。
 
 安装完成后，必须通过应用生成一份含中文、分页、图片和链接的真实 HTML → PDF，并逐页渲染检查；仅有命令存在不等于 PDF 能力已验收。
 
@@ -289,10 +291,10 @@ PDF wrapper 默认使用 `/opt/hoosland-agent-tools/current/.venv/bin/python`。
 先检查文件和本机入口：
 
 ```bash
-test -s /opt/hoosland-agent-tools/current/frontend/dist/index.html
+test -s /opt/hoosland-real-estate-research-toolset/current/frontend/dist/index.html
 curl --fail http://127.0.0.1:8000/api/health/live
 curl --fail http://127.0.0.1:8000/api/health/ready \
-  | /opt/hoosland-agent-tools/current/.venv/bin/python -c \
+  | /opt/hoosland-real-estate-research-toolset/current/.venv/bin/python -c \
     'import json,sys; value=json.load(sys.stdin); assert value["ready"] and value["frontend_built"]'
 curl --fail http://127.0.0.1:8000/api/capabilities
 ```
@@ -300,9 +302,9 @@ curl --fail http://127.0.0.1:8000/api/capabilities
 再从受访问控制保护的外部入口检查：
 
 ```bash
-curl --fail https://agent-tools.example.com/agent-tools/
+curl --fail https://real-estate-research-toolset.example.com/hoosland-real-estate-research-toolset/
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
-  https://agent-tools.example.com/agent-tools/mcp)" = "404"
+  https://real-estate-research-toolset.example.com/hoosland-real-estate-research-toolset/mcp)" = "404"
 ```
 
 健康检查不能替代真实验收。正式放行还必须完成：
@@ -324,12 +326,12 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' \
 优先使用文件系统或云盘的一致性快照。小型单机环境可以在维护窗口停服务后归档：
 
 ```bash
-sudo systemctl stop hoosland-agent-tools.service
+sudo systemctl stop hoosland-real-estate-research-toolset.service
 sudo tar --acls --xattrs \
-  -C /srv/hoosland-agent-tools \
+  -C /srv/hoosland-real-estate-research-toolset \
   -czf /secure-backup-location/hoosland-data-backup.tar.gz \
   data
-sudo systemctl start hoosland-agent-tools.service
+sudo systemctl start hoosland-real-estate-research-toolset.service
 ```
 
 备份路径、保留期、加密、异地副本与恢复演练由组织策略决定。恢复必须在隔离环境验证数据、密钥、Schema 与 release 兼容后再切回入口。
@@ -340,19 +342,19 @@ sudo systemctl start hoosland-agent-tools.service
 2. 运行完整自动化测试和本次能力的真实验收；
 3. 按第 5 节创建新的独立 release 与 `.venv`；
 4. 核对 Schema、配置和数据兼容性并完成备份；
-5. 记录当前 `readlink -f /opt/hoosland-agent-tools/current`；
+5. 记录当前 `readlink -f /opt/hoosland-real-estate-research-toolset/current`；
 6. 原子切换 symlink，重启服务并执行完整放行检查。
 
 切换命令示例：
 
 ```bash
-HOOSLAND_NEW_RELEASE="/opt/hoosland-agent-tools/releases/replace-with-new-build-id"
-HOOSLAND_SWITCH_LINK="/opt/hoosland-agent-tools/current.replace-with-new-build-id"
+HOOSLAND_NEW_RELEASE="/opt/hoosland-real-estate-research-toolset/releases/replace-with-new-build-id"
+HOOSLAND_SWITCH_LINK="/opt/hoosland-real-estate-research-toolset/current.replace-with-new-build-id"
 
 sudo ln -s "$HOOSLAND_NEW_RELEASE" "$HOOSLAND_SWITCH_LINK"
-sudo mv -Tf "$HOOSLAND_SWITCH_LINK" /opt/hoosland-agent-tools/current
-sudo systemctl restart hoosland-agent-tools.service
-sudo systemctl status hoosland-agent-tools.service
+sudo mv -Tf "$HOOSLAND_SWITCH_LINK" /opt/hoosland-real-estate-research-toolset/current
+sudo systemctl restart hoosland-real-estate-research-toolset.service
+sudo systemctl status hoosland-real-estate-research-toolset.service
 ```
 
 仅切换 symlink 不会更新已经运行的进程，必须显式 `systemctl restart`。不要修改在线 release；配置变化后也必须重启，让旧 runner 全部退出。
@@ -364,12 +366,12 @@ sudo systemctl status hoosland-agent-tools.service
 确认前一 release 与当前数据 Schema 仍兼容，然后原子切回并重启：
 
 ```bash
-HOOSLAND_PREVIOUS_RELEASE="/opt/hoosland-agent-tools/releases/replace-with-previous-build-id"
-HOOSLAND_ROLLBACK_LINK="/opt/hoosland-agent-tools/rollback.$(date +%s)"
+HOOSLAND_PREVIOUS_RELEASE="/opt/hoosland-real-estate-research-toolset/releases/replace-with-previous-build-id"
+HOOSLAND_ROLLBACK_LINK="/opt/hoosland-real-estate-research-toolset/rollback.$(date +%s)"
 
 sudo ln -s "$HOOSLAND_PREVIOUS_RELEASE" "$HOOSLAND_ROLLBACK_LINK"
-sudo mv -Tf "$HOOSLAND_ROLLBACK_LINK" /opt/hoosland-agent-tools/current
-sudo systemctl restart hoosland-agent-tools.service
+sudo mv -Tf "$HOOSLAND_ROLLBACK_LINK" /opt/hoosland-real-estate-research-toolset/current
+sudo systemctl restart hoosland-real-estate-research-toolset.service
 ```
 
 回滚后重新检查 live、ready + `frontend_built`、外部页面、真实最小对话和成果读取。保留故障 release、日志与脱敏诊断用于复盘，不要为了回滚删除客户数据或覆盖另一份备份。
@@ -379,7 +381,7 @@ sudo systemctl restart hoosland-agent-tools.service
 停用服务和入口：
 
 ```bash
-sudo systemctl disable --now hoosland-agent-tools.service
+sudo systemctl disable --now hoosland-real-estate-research-toolset.service
 ```
 
-随后由运维系统移除 Nginx 入口并执行 `nginx -t`。停用不等于删除；在明确备份、保留期、客户授权和恢复要求之前，不要删除 `/srv/hoosland-agent-tools/data`、secrets、release 或 PDF runtime。
+随后由运维系统移除 Nginx 入口并执行 `nginx -t`。停用不等于删除；在明确备份、保留期、客户授权和恢复要求之前，不要删除 `/srv/hoosland-real-estate-research-toolset/data`、secrets、release 或 PDF runtime。

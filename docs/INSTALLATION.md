@@ -1,6 +1,6 @@
 # 安装指南
 
-本指南说明如何从源码安装 Hoosland Agent Tools V2。它覆盖本地开发、单进程演示和 Windows + WSL2；面向服务器的 systemd、Nginx、升级与回滚步骤见[部署说明](DEPLOYMENT.md)。
+本指南说明如何从源码安装 Hoosland-real-estate-research-toolset V2 产品线。它覆盖本地开发、单进程演示和 Windows + WSL2；面向服务器的 systemd、Nginx、升级与回滚步骤见[部署说明](DEPLOYMENT.md)。
 
 ## 1. 选择安装方式
 
@@ -56,8 +56,8 @@ uname -m
 ## 4. 获取源码与安装依赖
 
 ```bash
-git clone https://github.com/manhoolee/hoosland-agent-tools.git
-cd hoosland-agent-tools
+git clone https://github.com/manhoolee/Hoosland-real-estate-research-toolset.git
+cd Hoosland-real-estate-research-toolset
 
 python3.11 -m venv backend/.venv
 . backend/.venv/bin/activate
@@ -153,7 +153,7 @@ wsl --install -d Ubuntu
 wsl -d Ubuntu
 ```
 
-随后在 WSL 终端执行本指南的 Linux 命令。建议把仓库放在 WSL 的 Linux 文件系统，例如 `~/hoosland-agent-tools`，不要放在 `/mnt/c/`，以避免文件监听、权限和大量小文件访问变慢。
+随后在 WSL 终端执行本指南的 Linux 命令。建议把仓库放在 WSL 的 Linux 文件系统，例如 `~/Hoosland-real-estate-research-toolset`，不要放在 `/mnt/c/`，以避免文件监听、权限和大量小文件访问变慢。
 
 服务在 WSL 内监听后，通常可以直接从 Windows 浏览器访问：
 

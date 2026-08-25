@@ -12,7 +12,7 @@ const MAX_PDF_BYTES = 100 * 1024 * 1024;
 const toolRoot = dirname(fileURLToPath(import.meta.url));
 const pythonBin =
   process.env.HOOSLAND_PDF_PYTHON_BIN ||
-  "/opt/hoosland-agent-tools/current/.venv/bin/python";
+  "/opt/hoosland-real-estate-research-toolset/current/.venv/bin/python";
 process.env.PLAYWRIGHT_BROWSERS_PATH ||= join(toolRoot, "browsers");
 
 const { chromium } = await import("playwright");

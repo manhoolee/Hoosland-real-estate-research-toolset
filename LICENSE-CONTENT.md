@@ -5,7 +5,7 @@
 使用、转载、改编或再发布时，请：
 
 1. 标注作者 `manhoolee`；
-2. 标明原项目名称 `Hoosland Agent Tools`；
+2. 标明原项目名称 `Hoosland-real-estate-research-toolset`；
 3. 提供原项目链接；
 4. 标明是否进行了修改；
 5. 不暗示原作者为改编内容或使用场景背书。

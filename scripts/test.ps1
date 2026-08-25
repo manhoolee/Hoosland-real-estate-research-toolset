@@ -45,4 +45,4 @@ finally {
     Pop-Location
 }
 
-Write-Host 'All Hoosland Agent Tools checks passed'
+Write-Host 'All Hoosland-real-estate-research-toolset checks passed'
