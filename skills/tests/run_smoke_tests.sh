@@ -8,8 +8,9 @@ $PYTHON -m py_compile "$ROOT"/*/scripts/*.py
 for skill in $EXPECTED_SKILLS; do
   test -s "$ROOT/$skill/SKILL.md"
   grep -Fq "## 专业角色与职责" "$ROOT/$skill/SKILL.md"
+  $PYTHON -c 'import json,sys; meta=json.load(open(sys.argv[1], encoding="utf-8")); manifest=json.load(open(sys.argv[2], encoding="utf-8")); assert meta["name"] == sys.argv[3]; assert meta["version"] == manifest["version"]; assert meta["suite"] == "real-estate-expert-suite-v" + manifest["version"]' "$ROOT/$skill/_meta.json" "$ROOT/manifest.json" "$skill"
 done
-$PYTHON -c 'import json,sys; data=json.load(sys.stdin); expected=sys.argv[1:]; assert data["version"] == "2.3.0"; assert data["skills"] == expected' $EXPECTED_SKILLS < "$ROOT/manifest.json"
+$PYTHON -c 'import json,sys; data=json.load(sys.stdin); expected=sys.argv[1:]; assert data["version"] == "2.3.1"; assert data["skills"] == expected' $EXPECTED_SKILLS < "$ROOT/manifest.json"
 
 ROUTER="$ROOT/comprehensive-real-estate-expert/SKILL.md"
 for skill in real-estate-research real-estate-product-strategy real-estate-storyline-marketing real-estate-community-operations wechat-article-exporter real-estate-report-editorial real-estate-report-design real-estate-delivery-qa real-estate-social-promotion hoosland-pdf-output; do
@@ -54,4 +55,4 @@ except ValueError:
 assert ok' "$ROOT/wechat-article-exporter/scripts/fetch_article.py"
 )
 $PYTHON "$ROOT/tests/smoke_wechat.py"
-echo "v2.3 smoke tests passed"
+echo "v2.3.1 bundle smoke tests passed"

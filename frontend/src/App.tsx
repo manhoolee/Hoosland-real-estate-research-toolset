@@ -8,6 +8,7 @@ import {
   Files,
   FolderPlus,
   GearSix,
+  GithubLogo,
   Plus,
   WarningCircle,
   X,
@@ -22,6 +23,7 @@ import {
   getCapabilities,
   getConversation,
   getConversationRun,
+  getReleaseIdentity,
   listFiles,
   listMessages,
   presentResearchAssistantCopy,
@@ -30,14 +32,21 @@ import {
   type ApiCapability,
   type CapabilityResponse,
   type ConversationRunState,
+  type ReleaseIdentity,
 } from "./api";
 import { Composer } from "./components/Composer";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { MessageList } from "./components/MessageList";
+import { ReleaseInfoDialog } from "./components/ReleaseInfoDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { WorkspacePanel } from "./components/WorkspacePanel";
 import { createClientId } from "./clientId";
-import { APP_TITLE, STORAGE_NAMESPACE } from "./deployment";
+import {
+  APP_TITLE,
+  APP_VERSION,
+  GITHUB_REPOSITORY_URL,
+  STORAGE_NAMESPACE,
+} from "./deployment";
 import type {
   AssistantProgress,
   CapabilityState,
@@ -416,6 +425,7 @@ export default function App() {
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityView[]>(createInitialCapabilities);
   const [serviceState, setServiceState] = useState<ServiceState>("checking");
+  const [releaseIdentity, setReleaseIdentity] = useState<ReleaseIdentity | null>(null);
   const [draft, setDraft] = useState("");
   const [isHydrating, setIsHydrating] = useState(Boolean(initialIdRef.current));
   const [isSending, setIsSending] = useState(false);
@@ -424,12 +434,14 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [releaseOpen, setReleaseOpen] = useState(false);
   const [isContextChanging, setIsContextChanging] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const panelTriggerRef = useRef<HTMLButtonElement>(null);
   const historyTriggerRef = useRef<HTMLButtonElement>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const releaseReturnFocusRef = useRef<HTMLElement | null>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
   const cancellationRequestsRef = useRef(new Map<AbortController, Promise<boolean>>());
   const pendingCancellationRef = useRef<{
@@ -459,6 +471,16 @@ export default function App() {
   const closeHistory = useCallback(() => {
     setHistoryOpen(false);
     window.requestAnimationFrame(() => historyTriggerRef.current?.focus());
+  }, []);
+
+  const openReleaseInfo = useCallback((trigger: HTMLElement) => {
+    releaseReturnFocusRef.current = trigger;
+    setReleaseOpen(true);
+  }, []);
+
+  const closeReleaseInfo = useCallback(() => {
+    setReleaseOpen(false);
+    window.requestAnimationFrame(() => releaseReturnFocusRef.current?.focus());
   }, []);
 
   const commitContextIds = useCallback((nextProjectId: string, nextConversationId: string) => {
@@ -505,6 +527,14 @@ export default function App() {
   useEffect(() => {
     void refreshCapabilities();
   }, [refreshCapabilities]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getReleaseIdentity(controller.signal)
+      .then(setReleaseIdentity)
+      .catch(() => setReleaseIdentity(null));
+    return () => controller.abort();
+  }, []);
 
   const beginDetachedRunRecovery = useCallback((
     nextProjectId: string,
@@ -1218,12 +1248,45 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <div className="brand-lockup">
-          <span className="brand-mark" aria-hidden="true">
-            <Buildings size={22} weight="regular" />
-          </span>
+          <button
+            className="brand-mark"
+            type="button"
+            onClick={(event) => openReleaseInfo(event.currentTarget)}
+            aria-label="查看版本与开源信息"
+            aria-controls="release-dialog"
+            aria-expanded={releaseOpen}
+            title="版本与开源信息"
+          >
+            <Buildings size={22} weight="regular" aria-hidden="true" />
+            <span className="brand-mark-version" aria-hidden="true">
+              V{APP_VERSION}
+            </span>
+          </button>
           <span className="brand-copy">
             <strong>{APP_TITLE}</strong>
-            <small>项目对话</small>
+            <small className="brand-meta">
+              <span className="brand-context">项目对话</span>
+              <button
+                className="version-chip"
+                type="button"
+                onClick={(event) => openReleaseInfo(event.currentTarget)}
+                aria-controls="release-dialog"
+                aria-expanded={releaseOpen}
+              >
+                V{APP_VERSION}
+              </button>
+              <a
+                className="brand-github-link"
+                href={GITHUB_REPOSITORY_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="在 GitHub 打开项目源码"
+                title="GitHub 源码"
+              >
+                <GithubLogo size={13} weight="regular" aria-hidden="true" />
+                <span>GitHub</span>
+              </a>
+            </small>
           </span>
         </div>
 
@@ -1379,6 +1442,10 @@ export default function App() {
           onClose={closeSettings}
           onSaved={() => void refreshCapabilities()}
         />
+      ) : null}
+
+      {releaseOpen ? (
+        <ReleaseInfoDialog identity={releaseIdentity} onClose={closeReleaseInfo} />
       ) : null}
 
       {historyOpen ? (

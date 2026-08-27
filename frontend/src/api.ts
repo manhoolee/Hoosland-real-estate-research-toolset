@@ -140,6 +140,12 @@ export interface CapabilityResponse {
   mcp?: Record<string, unknown>;
 }
 
+export interface ReleaseIdentity {
+  version: string;
+  slot: string;
+  buildId: string;
+}
+
 export interface StreamCallbacks {
   onReplace: (content: string) => void;
   onProgress: (progress: AssistantProgress) => void;
@@ -753,6 +759,24 @@ export async function getCapabilities(): Promise<CapabilityResponse> {
   const response = await fetch(apiUrl("/api/capabilities"), { credentials: "same-origin" });
   if (!response.ok) throw await parseError(response, "无法读取能力状态。");
   return (await response.json()) as CapabilityResponse;
+}
+
+export async function getReleaseIdentity(signal?: AbortSignal): Promise<ReleaseIdentity> {
+  const response = await fetch(apiUrl("/api/health/live"), {
+    credentials: "same-origin",
+    signal,
+  });
+  if (!response.ok) throw await parseError(response, "无法读取当前版本信息。");
+  const payload = (await response.json()) as {
+    version?: string;
+    slot?: string;
+    build_id?: string;
+  };
+  return {
+    version: payload.version?.trim() || "",
+    slot: payload.slot?.trim() || "",
+    buildId: payload.build_id?.trim() || "",
+  };
 }
 
 export function fileDownloadUrl(conversationId: string, file: WorkspaceFile): string {

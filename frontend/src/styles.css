@@ -147,11 +147,26 @@ a:active {
   flex: 0 0 38px;
   width: 38px;
   height: 38px;
+  padding: 0;
   place-items: center;
   border: 1px solid var(--accent-border);
   border-radius: var(--radius-control);
   background: var(--accent-soft);
   color: var(--accent);
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    color 160ms ease;
+}
+
+.brand-mark:hover {
+  border-color: var(--accent);
+  background: #dcebe4;
+  color: var(--accent-hover);
+}
+
+.brand-mark-version {
+  display: none;
 }
 
 .brand-copy {
@@ -171,10 +186,45 @@ a:active {
   white-space: nowrap;
 }
 
-.brand-copy small {
+.brand-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-top: 3px;
   color: var(--muted);
   font-size: 11px;
+}
+
+.version-chip,
+.brand-github-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.version-chip {
+  padding: 1px 5px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.brand-github-link {
+  gap: 3px;
+  padding: 1px 2px;
+}
+
+.version-chip:hover,
+.brand-github-link:hover {
+  color: var(--accent-hover);
 }
 
 .service-state {
@@ -267,6 +317,264 @@ a:active {
 
 .mobile-panel-button {
   display: none;
+}
+
+.release-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(17, 27, 22, 0.42);
+  backdrop-filter: blur(3px);
+}
+
+.release-dialog {
+  width: min(100%, 640px);
+  max-height: min(820px, calc(100dvh - 48px));
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  outline: 0;
+  background: var(--surface-strong);
+  box-shadow: 0 28px 80px rgba(24, 42, 33, 0.24);
+  animation: release-enter 190ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.release-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 26px 26px 22px;
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(135deg, rgba(229, 240, 235, 0.88), rgba(253, 254, 253, 0.2) 64%),
+    var(--surface-strong);
+}
+
+.release-header h2,
+.release-header p,
+.release-change-list h3,
+.release-change-list p {
+  margin: 0;
+}
+
+.release-eyebrow {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--accent);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+}
+
+.release-header h2 {
+  color: var(--text-strong);
+  font-size: clamp(20px, 3vw, 26px);
+  font-weight: 690;
+  letter-spacing: -0.025em;
+  line-height: 1.25;
+}
+
+.release-header p {
+  max-width: 520px;
+  margin-top: 10px;
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.release-close {
+  display: inline-grid;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: rgba(253, 254, 253, 0.82);
+  color: var(--muted-strong);
+}
+
+.release-close:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.release-identity {
+  display: grid;
+  grid-template-columns: 0.8fr 1fr 1.35fr;
+  border-bottom: 1px solid var(--border);
+}
+
+.release-identity > div {
+  min-width: 0;
+  padding: 15px 18px;
+  border-right: 1px solid var(--border);
+}
+
+.release-identity > div:last-child {
+  border-right: 0;
+}
+
+.release-identity span,
+.release-identity strong {
+  display: block;
+}
+
+.release-identity span {
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.release-identity strong {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.release-build {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin: 18px 24px 2px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.release-build svg {
+  color: var(--accent);
+}
+
+.release-build code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.release-version-warning {
+  margin: 10px 24px 0;
+  padding: 9px 11px;
+  border: 1px solid #e5d2aa;
+  border-radius: var(--radius-control);
+  background: #fbf5e9;
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.release-change-list {
+  margin: 0;
+  padding: 14px 24px 4px;
+  list-style: none;
+}
+
+.release-change-list li {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 13px;
+  padding: 15px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.release-change-list li:last-child {
+  border-bottom: 0;
+}
+
+.release-change-index {
+  padding-top: 2px;
+  color: var(--accent);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.release-change-list h3 {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.release-change-list p {
+  margin-top: 5px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.62;
+}
+
+.release-change-list li > svg {
+  margin-top: 1px;
+  color: var(--accent);
+}
+
+.release-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 24px 22px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-soft);
+}
+
+.release-github-button,
+.release-changelog-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  border-radius: var(--radius-control);
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.release-github-button {
+  padding: 0 13px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #f8fbf9;
+}
+
+.release-github-button:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+.release-changelog-link {
+  padding: 0 4px;
+  color: var(--accent);
+}
+
+@keyframes release-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 
 .workspace-layout {
@@ -1183,8 +1491,59 @@ a:active {
     height: 34px;
   }
 
-  .brand-copy small {
+  .brand-context,
+  .brand-github-link span {
     display: none;
+  }
+
+  .brand-meta {
+    gap: 4px;
+  }
+
+  .release-backdrop {
+    align-items: end;
+    padding: 10px;
+  }
+
+  .release-dialog {
+    width: 100%;
+    max-height: calc(100dvh - 20px);
+    border-radius: 16px;
+  }
+
+  .release-header {
+    padding: 21px 18px 18px;
+  }
+
+  .release-identity {
+    grid-template-columns: 0.75fr 1fr;
+  }
+
+  .release-identity > div {
+    padding: 13px 14px;
+  }
+
+  .release-identity > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .release-identity > div:last-child {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--border);
+  }
+
+  .release-build {
+    margin-right: 16px;
+    margin-left: 16px;
+  }
+
+  .release-change-list {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .release-footer {
+    padding: 15px 16px calc(16px + env(safe-area-inset-bottom));
   }
 
   .message-column {
@@ -1248,6 +1607,15 @@ a:active {
 
   .brand-copy strong {
     font-size: 13px;
+  }
+
+  .release-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .release-changelog-link {
+    min-height: 34px;
   }
 
   .starter-prompts button {
@@ -2727,7 +3095,39 @@ a:active {
 }
 
 @media (max-width: 420px) {
+  .brand-mark {
+    grid-template-rows: 20px 7px;
+    align-content: center;
+    row-gap: 1px;
+  }
+
+  .brand-mark-version {
+    display: block;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 8.5px;
+    font-weight: 750;
+    letter-spacing: -0.04em;
+    line-height: 1;
+  }
+
   .brand-copy {
     display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .app-header {
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+
+  .header-actions {
+    gap: 2px;
+  }
+
+  .header-button {
+    width: 40px;
+    height: 40px;
+    min-height: 40px;
   }
 }

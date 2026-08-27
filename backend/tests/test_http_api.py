@@ -193,13 +193,13 @@ class HttpApiTests(unittest.TestCase):
         self.assertNotIn('"harness"', ready.text.lower())
         self.assertNotIn("harness", capabilities.text.lower())
 
-    def test_health_responses_expose_v02_slot_and_build_identity(self) -> None:
+    def test_health_responses_expose_v021_slot_and_build_identity(self) -> None:
         live = self.client.get("/api/health/live")
         self.assertEqual(200, live.status_code)
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.0",
+                "version": "0.2.1",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -208,7 +208,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.0", ready.json()["version"])
+        self.assertEqual("0.2.1", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
