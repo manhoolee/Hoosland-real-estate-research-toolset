@@ -24,13 +24,13 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
-| 工作台应用 | `0.2.0` | FastAPI、React、API、文件、长任务恢复与管理配置 |
-| 当前 Build | `v0.2.0-controller-first-dual-output-20260825T081715Z` | 每次部署唯一；应用 SemVer 不替代 Build 身份 |
+| 工作台应用 | `0.2.1` | FastAPI、React、API、文件、长任务恢复与管理配置 |
+| 当前 Build | `v0.2.1-production-sync-version-info-20260827T062425Z` | 每次部署唯一；应用 SemVer 不替代 Build 身份 |
 | System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和交付规则 |
-| Skill 套件 | `2.3.0` | 1 个总控 + 10 个专项 Skill |
+| Skill 套件 | `2.3.1` | 1 个总控 + 10 个专项 Skill |
 | 项目状态 Schema | `2.1.0` | 仅在持久化数据契约变化时升级；Demo 阶段可能不兼容，迁移或重建路径见发布说明 |
 
-当前 Build 保留了 Application `0.2.0` 与 Skill `2.3.0`，但实际改变了应用编排/Ready/默认交付行为和 Skill 内容；这两项已登记为版本债务，下一 canonical release 应至少升级为 Application `0.2.1` / Skill `2.3.1`。
+V0.2.1 把已经在线验证的 controller-first、默认双格式和失败关闭行为正式归档到可重建源码，并关闭 Application `0.2.0` / Skill `2.3.0` 共用不同内容的版本债务。页面现可查看实时应用版本、Build ID、本次修改内容和 GitHub 源码。
 
 ## 核心能力
 
@@ -70,7 +70,7 @@ flowchart TD
 ```text
 backend/                 FastAPI、Harness SDK 编排、存储与 MCP 网关
 frontend/                React + TypeScript + Vite 工作台
-skills/                  v2.3.0 的 11 个领域 Skill、脚本和 smoke tests
+skills/                  v2.3.1 的 11 个领域 Skill、脚本和 smoke tests
 deploy/pdf-tool/         HTML → PDF 与逐页检查的持久运行时
 deploy/nginx/            脱敏 Nginx 示例
 deploy/systemd/          脱敏 systemd 示例
@@ -181,7 +181,7 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-本次 controller-first / dual-output 源码快照已通过 86 个后端单元测试、Python 编译和 Skill v2.3 smoke tests；未变更的前端沿用此前已通过的类型检查与生产构建。自动化测试不等同于真实模型、真实 Provider、浏览器和 PDF 的生产验收。
+V0.2.1 源码快照已通过 86 个后端单元/HTTP 测试、Python 编译、前端类型检查与生产构建，以及 Skill v2.3.1 smoke tests；版本界面另完成 1440、1024、375 和 320px 浏览器验收。自动化测试不等同于真实模型、真实 Provider 和 PDF 的生产验收。
 
 ## 数据与安全边界
 
@@ -216,15 +216,17 @@ bash ./tests/run_smoke_tests.sh
 - [配置参考](docs/CONFIGURATION.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [Skill 编排](docs/SKILL-ORCHESTRATION.md)
-- [独立知识提纯库开发文档](docs/KNOWLEDGE-REFINERY-CORE-DEVELOPMENT.md)
-- [独立知识提纯库开发步骤](docs/KNOWLEDGE-REFINERY-CORE-IMPLEMENTATION-PLAN.md)
-- [知识决策系统开发文档](docs/KNOWLEDGE-DECISION-SYSTEM-DEVELOPMENT.md)
-- [知识决策系统敏捷方案](docs/KNOWLEDGE-DECISION-SYSTEM-AGILE-IMPLEMENTATION-PLAN.md)
+- [独立知识提纯库开发文档（Draft）](docs/KNOWLEDGE-REFINERY-CORE-DEVELOPMENT.md)
+- [独立知识提纯库开发步骤（Draft）](docs/KNOWLEDGE-REFINERY-CORE-IMPLEMENTATION-PLAN.md)
+- [知识决策系统开发文档（Draft）](docs/KNOWLEDGE-DECISION-SYSTEM-DEVELOPMENT.md)
+- [知识决策系统敏捷方案（Draft）](docs/KNOWLEDGE-DECISION-SYSTEM-AGILE-IMPLEMENTATION-PLAN.md)
+- [项目语料采集工作步骤（Draft）](docs/PROJECT-CORPUS-ACQUISITION-WORKFLOW.md)
 - [版本与升级](docs/VERSIONING-AND-UPGRADES.md)
 - [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
-- [V0.2 发布说明](docs/releases/v0.2.0/RELEASE-NOTES.md)
+- [V0.2.1 发布说明](docs/releases/v0.2.1/RELEASE-NOTES.md)
+- [V0.2.0 发布说明](docs/releases/v0.2.0/RELEASE-NOTES.md)
 - [更新记录](CHANGELOG.md)
 - [贡献指南](CONTRIBUTING.md)
 

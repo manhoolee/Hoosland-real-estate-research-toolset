@@ -3,7 +3,7 @@
 文档状态：`Draft for Review`  
 文档版本：`0.1.0`  
 编写日期：`2026-08-27`  
-工作分支：`feat/project-corpus-distillation`  
+原始编写分支：`feat/project-corpus-distillation`（已随 V0.2.1 发布分支归档）
 上位设计：[知识决策系统开发文档](KNOWLEDGE-DECISION-SYSTEM-DEVELOPMENT.md)  
 上位计划：[知识决策系统敏捷实施计划](KNOWLEDGE-DECISION-SYSTEM-AGILE-IMPLEMENTATION-PLAN.md)  
 配套计划：[独立知识提纯库实施计划](KNOWLEDGE-REFINERY-CORE-IMPLEMENTATION-PLAN.md)
@@ -682,4 +682,3 @@ FUTURE_LEAKAGE
 6. 实现通用公开网页/PDF 的最小采集 adapter、缓存、限速和失败清单；
 7. 先完成 5 个 Smoke 项目并提交成本、失败和 Schema 修订报告；
 8. 评审通过后扩展至 10 个 Pilot，再决定 50/75/100 的执行节奏。
-

@@ -104,7 +104,7 @@ PYTHON=python bash ./scripts/test.sh
 
 VITE_API_BASE_URL=/hoosland-real-estate-research-toolset \
 VITE_DEPLOYMENT_SLOT=single-linux \
-VITE_APP_VERSION=demo_v0.2 \
+VITE_APP_VERSION=0.2.1 \
 npm --prefix frontend run build
 
 test -s frontend/dist/index.html

@@ -38,6 +38,8 @@ Build ID 必须能够关联构建清单、文件校验值和源代码修订。�
 
 V0.2 热修改变了应用运行编排、Ready 状态和用户可见默认交付行为，却仍沿用 Application `0.2.0`；Skill 内容也发生修订但 manifest 仍为 `2.3.0`。这两项都是已记录的发布事实与版本债务，不应成为后续惯例。下一次 canonical release 应至少升级 Application 到 `0.2.1`、Skill bundle 到 `2.3.1`。
 
+V0.2.1 canonical release 已按该决策把 Application 提升为 `0.2.1`、Skill bundle 提升为 `2.3.1`。System Prompt 与 Project state Schema 没有变化，继续分别使用 `real-estate-system-v0.2.1` 与 `2.1.0`；历史 V0.2.0 版本债务记录保留，不倒改旧发布事实。
+
 ## 兼容性规则
 
 - Application 或 Prompt 升级不得自动改写 Project state Schema。
@@ -79,4 +81,3 @@ V0.2 热修改变了应用运行编排、Ready 状态和用户可见默认交付
 - 应用与 Skill 的构建绑定；
 - 构建清单和 SHA-256；
 - 对应测试、E2E 与回滚入口。
-

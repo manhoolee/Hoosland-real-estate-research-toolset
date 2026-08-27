@@ -7,10 +7,10 @@
 | 版本轴 | 当前值 |
 |---|---|
 | 产品线 | V2 |
-| Application | `0.2.0` |
-| Build | `v0.2.0-controller-first-dual-output-20260825T081715Z` |
+| Application | `0.2.1` |
+| Build | `v0.2.1-production-sync-version-info-20260827T062425Z` |
 | System Prompt | `real-estate-system-v0.2.1` |
-| Skill bundle | `2.3.0` |
+| Skill bundle | `2.3.1` |
 | Project state Schema | `2.1.0` |
 
 当前核心行为契约：
@@ -34,13 +34,15 @@
 
 - [架构说明](ARCHITECTURE.md)：组件、单轮执行、数据布局、Skill 路由与安全边界。
 - [Skill 编排契约](SKILL-ORCHESTRATION.md)：总控入口、子 Skill 交接、审计证据与当前强制边界。
-- [独立知识提纯库开发文档](KNOWLEDGE-REFINERY-CORE-DEVELOPMENT.md)：零 Harness 依赖核心、领域模型、证据、提纯、审核、版本、快照和查询契约。
-- [独立知识提纯库开发步骤](KNOWLEDGE-REFINERY-CORE-IMPLEMENTATION-PLAN.md)：Sprint 0–8、质量门、验收标准、前 30 天任务和 Harness 灰度条件。
-- [知识决策系统开发文档](KNOWLEDGE-DECISION-SYSTEM-DEVELOPMENT.md)：知识图谱、Skill 消费、核验、反馈闭环及整体产品架构。
-- [知识决策系统敏捷方案](KNOWLEDGE-DECISION-SYSTEM-AGILE-IMPLEMENTATION-PLAN.md)：完整系统从 PoC 到生产试点的上位实施节奏。
+- [独立知识提纯库开发文档（Draft）](KNOWLEDGE-REFINERY-CORE-DEVELOPMENT.md)：零 Harness 依赖核心、领域模型、证据、提纯、审核、版本、快照和查询契约。
+- [独立知识提纯库开发步骤（Draft）](KNOWLEDGE-REFINERY-CORE-IMPLEMENTATION-PLAN.md)：Sprint 0–8、质量门、验收标准、前 30 天任务和 Harness 灰度条件。
+- [知识决策系统开发文档（Draft）](KNOWLEDGE-DECISION-SYSTEM-DEVELOPMENT.md)：知识图谱、Skill 消费、核验、反馈闭环及整体产品架构。
+- [知识决策系统敏捷方案（Draft）](KNOWLEDGE-DECISION-SYSTEM-AGILE-IMPLEMENTATION-PLAN.md)：完整系统从 PoC 到生产试点的上位实施节奏。
+- [项目语料采集工作步骤（Draft）](PROJECT-CORPUS-ACQUISITION-WORKFLOW.md)：50–100 个公开项目语料的分级、许可、时点冻结、采集、质检和移交流程。
 - [版本与升级指南](VERSIONING-AND-UPGRADES.md)：独立版本轴、升级要素、兼容性、迁移和回滚要求。
 - [迭代原则](ITERATION-PRINCIPLES.md)：长期不变量、发布分级和 Definition of Done。
 - [更新记录](../CHANGELOG.md)：按版本和 Build 记录已经发布与尚未发布的变化。
+- [V0.2.1 发布说明](releases/v0.2.1/RELEASE-NOTES.md)：生产源码归档、版本身份修复和页面版本信息的公开摘要。
 - [V0.2.0 发布说明](releases/v0.2.0/RELEASE-NOTES.md)：首次上线、刷新恢复与总控优先热修的公开摘要。
 - 架构决策：
   - [ADR-0001：独立版本轴](adr/0001-version-axes.md)
@@ -83,4 +85,3 @@
 - 能力支持范围、安全边界或已知限制。
 
 公开文档只保留脱敏结论和通用示例。精确部署证据应由受控的发布档案保存，并通过校验值与公开发布说明关联。
-

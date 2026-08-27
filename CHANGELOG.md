@@ -11,6 +11,30 @@
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
 
+## App 0.2.1 Build `v0.2.1-production-sync-version-info-20260827T062425Z` / Skill 2.3.1 — 2026-08-27
+
+### 生产基线与版本身份
+
+- 以当前服务器已验证行为为基线，将 controller-first、总控缺失失败关闭、默认 Markdown + HTML 和输出格式审计正式提交到 Git，使 GitHub 可以重建线上核心行为；
+- Application 从 `0.2.0` 升至 `0.2.1`，Skill bundle 从 `2.3.0` 升至 `2.3.1`，关闭上一热修使用旧 SemVer 承载新行为的版本债务；
+- System Prompt 保持 `real-estate-system-v0.2.1`，Project state Schema 保持 `2.1.0`，无数据迁移；
+- 修正发布闭环：新 Build 生成新的语义清单与 SHA-256，不复制或原地修补上一不可变 release 中已经过期的发布说明。
+
+### 页面版本档案
+
+- 品牌区增加可见版本号和 GitHub 源码按钮，桌面端直接展示，窄屏把版本号收进楼宇标识；
+- 点击版本号或楼宇标识可查看迭代名称、发布日期、兼容性、本次修改内容和完整更新记录；
+- 页面读取 `/api/health/live`，展示后端实时 Application 与精确 Build ID，避免只有前端硬编码版本；
+- 版本档案支持 Escape、点击遮罩关闭、焦点返回、键盘焦点环与减少动画偏好；外部链接使用新标签安全属性。
+
+### 验证
+
+- 后端单元与 HTTP 回归：86 项全部通过；
+- Python 编译、前端 TypeScript 检查与生产构建：通过；
+- Skill v2.3.1 manifest、11 个 `_meta.json` 与 smoke tests：通过；
+- 浏览器在 1440、1024、375 和 320px 验证无横向溢出，版本弹层完整，控制台无错误；
+- Python requirements、Node dependencies、Nginx、既有公开业务 API 与持久数据布局未变化。
+
 ## App 0.2.0 Build `v0.2.0-controller-first-dual-output-20260825T081715Z` / System Prompt v0.2.1 — 2026-08-25
 
 ### 发布身份与兼容性

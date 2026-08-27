@@ -122,7 +122,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```bash
 VITE_API_BASE_URL=/agent-tools \
 VITE_DEPLOYMENT_SLOT=slot-b \
-VITE_APP_VERSION=demo_v0.2 \
+VITE_APP_VERSION=0.2.1 \
 npm run build
 ```
 

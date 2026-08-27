@@ -7,10 +7,10 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.0` | 后端、前端和公开应用行为版本 |
-| Build ID | `v0.2.0-controller-first-dual-output-20260825T081715Z` | 每次不可变构建的唯一标识 |
+| Application SemVer | `0.2.1` | 后端、前端和公开应用行为版本 |
+| Build ID | `v0.2.1-production-sync-version-info-20260827T062425Z` | 每次不可变构建的唯一标识 |
 | System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和执行规则 |
-| Skill bundle SemVer | `2.3.0` | 总控与 10 个专项 Skill 的协议集合 |
+| Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
 | Project state Schema | `2.1.0` | 持久化项目状态的数据契约 |
 
 这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Schema；只有持久化数据契约变化时才升级 Schema。
@@ -48,7 +48,7 @@ Application 在每轮提交 Harness 前，以首行 slash command 确定性提�
 | Schema | 持久化字段、含义、约束或读取兼容性变化 | 迁移器或重建路径、备份、前向/回滚验证 |
 | Build ID | 每次构建和部署候选 | 唯一 ID、Git commit、manifest、SHA-256、前一回滚点 |
 
-当前 Build 对运行编排、Ready 状态和用户可见默认交付行为做了修订，但 Application 仍保持 `0.2.0`；同时 Skill 内容发生变化而 manifest 仍为 `2.3.0`。这两项均登记为版本债务。下一次 canonical release 应至少升级 Application 到 `0.2.1`，Skill bundle 至少升级到 `2.3.1`，避免不同应用/Skill 行为继续共享同一 SemVer。
+V0.2.1 已将 Application 升至 `0.2.1`、Skill bundle 升至 `2.3.1`，关闭上一热修中运行行为和 Skill 内容变化却继续沿用旧 SemVer 的版本债务。System Prompt 与 Project state Schema 本次没有语义变化，因此不跟随跳号。
 
 ## 4. 升级要素矩阵
 
@@ -105,13 +105,13 @@ Application 在每轮提交 Harness 前，以首行 slash command 确定性提�
 
 ## 8. 当前 Build 的升级摘要
 
-本次 controller-first / dual-output Build：
+V0.2.1 production-sync / version-info Build：
 
-- System Prompt 从 `real-estate-system-v0.2.0` 升级为 `real-estate-system-v0.2.1`；
-- 应用每轮确定性提交总控入口命令，缺少总控文件时 fail closed；会话首行证明命令已提交，operation/E2E 证明后续子链，当前没有独立的总控正文加载回执；
-- Prompt/Skill 契约规定子 Skill 由总控统一调用和去重，下游交接改为返回下一节点需求；
-- 默认主报告输出改为同轮 Markdown + HTML，并增加基于实际文件的格式审计；
-- 后端回归扩展为 86 项并全部通过；
-- Application SemVer、Skill manifest、Schema、既有公开 API 路径、前端和依赖均未变化；Ready/runtime 状态增加向后兼容的总控配置字段；
-- 没有数据迁移，旧 Build、Skill 和配置应作为回滚点保留。
-
+- 将现网已经验证的 controller-first、总控缺失失败关闭、子 Skill 交接和默认 Markdown + HTML 行为正式纳入 Git 基线；
+- Application 从 `0.2.0` 升至 `0.2.1`，Skill bundle 从 `2.3.0` 升至 `2.3.1`；
+- 页面品牌区新增 GitHub 源码入口与可见版本号，版本档案读取 `/api/health/live` 展示实时 Application 和 Build ID；
+- 版本档案公开展示发布日期、兼容性和三组修改摘要，完整内容链接到仓库 `CHANGELOG.md`；
+- System Prompt 继续为 `real-estate-system-v0.2.1`，Project state Schema 继续为 `2.1.0`，没有数据迁移；
+- Python 与 Node 依赖、既有公开业务 API 和持久数据布局不变；
+- 86 项后端测试、Python 编译、前端类型检查/生产构建、Skill v2.3.1 smoke 和四档响应式浏览器验收通过；
+- 发布使用新的不可变 Build 与成对 Skill 目录；前一应用、Skill 和配置仍保留为回滚点。
