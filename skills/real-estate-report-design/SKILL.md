@@ -93,8 +93,8 @@ description: v2.3 地产报告视觉设计 skill。用于把已编辑的地产�
 
 ## 下游交接与放行
 
-- HTML、PPT、Word、图片或其他视觉介质实际生成并渲染检查后，仍须调用 `real-estate-delivery-qa` 完成内容、证据、文件和发布放行。
-- 用户要求 PDF 时，本模块先形成并核对已审定的独立 HTML，再调用 `hoosland-pdf-output` 生成 PDF 和逐页技术质检，最后调用 `real-estate-delivery-qa`；不得由设计模块或 PDF 模块替代最终 QA。
+- HTML、PPT、Word、图片或其他视觉介质实际生成并渲染检查后，向已激活总控返回 `next_skill_requests: [real-estate-delivery-qa]`；本模块不直接调用任何 Skill。
+- 用户要求 PDF 时，本模块先形成并核对已审定的独立 HTML，再向总控返回依次执行 `hoosland-pdf-output`、`real-estate-delivery-qa` 的请求；不得由设计模块或 PDF 模块替代最终 QA。
 - 若只完成版式方向、组件或局部页面，准确标为“方向性设计”或“设计候选稿”，不得宣称正式交付完成。
 
 ## 输出

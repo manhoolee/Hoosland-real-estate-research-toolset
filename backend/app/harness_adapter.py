@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from .config import Settings
 from .capabilities import McpAccessRegistry
-from .runtime_config import RuntimeConfigStore
+from .runtime_config import DEFAULT_OUTPUT_FORMATS, RuntimeConfigStore
 from .storage import ConversationStore
 
 _RESEARCH_PROGRESS = {
@@ -40,6 +40,9 @@ _RESEARCH_PROGRESS = {
         "eta_label": "通常还需 1–5 分钟",
     },
 }
+
+SKILL_COMMAND = "/comprehensive-real-estate-expert"
+CONTROLLER_SKILL_ID = SKILL_COMMAND.lstrip("/")
 
 
 def research_progress_event(stage: str) -> dict[str, Any]:
@@ -74,13 +77,27 @@ def build_harness_prompt(
     *,
     conversation_history: list[dict[str, str]] | None = None,
 ) -> str:
-    sections: list[str] = []
+    # The controller is a runtime invariant, not a model routing preference.
+    # Keeping the slash command as the literal first line makes every fresh
+    # stateless Harness session load the same controller before it can choose
+    # any specialist skill.
+    sections: list[str] = [SKILL_COMMAND]
     sections.append(
         "[总控激活]\n"
         "- 当前阶段：意图识别与任务执行\n"
-        "- 路由模式：自动 Skill 路由\n"
-        "- 预选 Skill：无；由运行时根据当前请求和可用 Skill 描述按需选择\n"
+        "- 主控 Skill：comprehensive-real-estate-expert（已由服务端确定性激活）\n"
+        "- 路由模式：总控先行；由主控通过内置 skill tool 按需调用专项 Skill\n"
+        "- 调用约束：主控不得调用自身；同一子 Skill 本轮最多调用一次，明确失败后的重试除外\n"
         "- 本轮已有授权能力：无额外授权"
+    )
+
+    default_formats = " + ".join(format_name.upper() for format_name in DEFAULT_OUTPUT_FORMATS)
+    sections.append(
+        "[交付策略]\n"
+        f"- 默认格式：{default_formats}\n"
+        "- 当本轮主成果是地产研究、项目分析、策划方案或管理报告，且用户未明确指定最终格式或明确不要文件时，必须在 outputs/ 同时生成内容对应、非空、可打开的 Markdown（.md）与独立 HTML（.html）。\n"
+        "- 用户明确指定单一格式、其他格式或不要文件时，以用户要求为准；纯澄清、简短问答和不形成文件成果的局部解释不强制生成文件。微信资料转换/归档、社交平台素材、数据表或模型等已有专项输出契约的任务按对应子 Skill 执行，除非同时形成上述主报告。\n"
+        "- 主控在宣布完成前必须核对本轮要求的所有文件实际存在且可打开；默认不生成 PDF。"
     )
 
     if conversation_history:
@@ -110,7 +127,10 @@ def build_harness_prompt(
         attachment_rows.append("- 无")
     sections.append("\n".join(attachment_rows))
 
-    sections.append("[当前请求]\n" + content)
+    sections.append(
+        "[当前请求]\n"
+        + json.dumps({"content": content}, ensure_ascii=False, separators=(",", ":"))
+    )
     return "\n\n".join(sections)
 
 
@@ -351,12 +371,19 @@ class HarnessManager:
         enabled = self.settings.harness_enabled
         installed = self.sdk_installed()
         cordis_exists = self.settings.cordis_path.is_file()
+        controller_skill_exists = self._controller_skill_exists()
         main = self.runtime_config.main_agent() if self.runtime_config else {
             "api_key": self.settings.harness_api_key,
             "model": self.settings.harness_model,
         }
         credential_configured = bool(main.get("api_key"))
-        configured = enabled and installed and cordis_exists and credential_configured
+        configured = (
+            enabled
+            and installed
+            and cordis_exists
+            and controller_skill_exists
+            and credential_configured
+        )
         reasons: list[str] = []
         if not enabled:
             reasons.append("研究助手已被服务配置停用")
@@ -364,6 +391,8 @@ class HarnessManager:
             reasons.append("研究助手运行组件未安装")
         if not cordis_exists:
             reasons.append("研究助手运行配置缺失")
+        if not controller_skill_exists:
+            reasons.append("房地产综合研究总控 Skill 缺失")
         if not credential_configured:
             reasons.append("主模型 API 密钥尚未配置")
         return {
@@ -372,6 +401,7 @@ class HarnessManager:
             "status": "configured" if configured else "degraded",
             "runtime_installed": installed,
             "runtime_configured": cordis_exists,
+            "controller_skill_configured": controller_skill_exists,
             "credential_configured": credential_configured,
             "provider": self.settings.harness_provider,
             "model": main.get("model") or self.settings.harness_model,
@@ -397,6 +427,11 @@ class HarnessManager:
         if not self.settings.cordis_path.is_file():
             raise HarnessAdapterError(
                 "AGENT_CONFIG_MISSING", "研究助手运行配置缺失"
+            )
+        if not self._controller_skill_exists():
+            raise HarnessAdapterError(
+                "AGENT_CONTROLLER_SKILL_MISSING",
+                "房地产综合研究总控 Skill 缺失",
             )
 
         if isinstance(session_generation, bool) or session_generation < 0:
@@ -451,6 +486,13 @@ class HarnessManager:
         # accumulating per-session SDK state inside a long-lived runner.
         await self._discard_runner(conversation_id, runner, run_id)
         return response
+
+    def _controller_skill_exists(self) -> bool:
+        return any(
+            (root / CONTROLLER_SKILL_ID / "SKILL.md").is_file()
+            or (root / f"{CONTROLLER_SKILL_ID}.md").is_file()
+            for root in self.settings.harness_skill_dirs
+        )
 
     async def _runner_for(self, conversation_id: str, run_id: str) -> Any:
         async with self._cache_lock:

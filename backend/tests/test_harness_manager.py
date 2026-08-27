@@ -77,8 +77,15 @@ class HarnessManagerCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        skill_root = root / "skills"
+        controller = skill_root / "comprehensive-real-estate-expert" / "SKILL.md"
+        controller.parent.mkdir(parents=True)
+        controller.write_text("---\nname: comprehensive-real-estate-expert\n---\n")
         self.settings = Settings.from_env(
-            {"DATA_DIR": str(root / "data")},
+            {
+                "DATA_DIR": str(root / "data"),
+                "HARNESS_SKILL_DIRS": str(skill_root),
+            },
             root_dir=root,
         )
         self.store = ConversationStore(self.settings.conversation_root)
@@ -115,6 +122,26 @@ class HarnessManagerCancellationTests(unittest.IsolatedAsyncioTestCase):
             await creation
         self.assertEqual("AGENT_CANCELLED", caught.exception.code)
         self.assertTrue(runner.closed)
+        self.assertNotIn(self.conversation_id, self.manager._busy)
+
+    async def test_missing_controller_skill_fails_before_runtime_start(self) -> None:
+        controller = (
+            self.settings.harness_skill_dirs[0]
+            / "comprehensive-real-estate-expert"
+            / "SKILL.md"
+        )
+        controller.unlink()
+
+        self.assertFalse(self.manager.status()["controller_skill_configured"])
+        with self.assertRaises(HarnessAdapterError) as caught:
+            await self.manager.run(
+                self.conversation_id,
+                "研究项目",
+                lambda _notification: None,
+                run_id="run-missing-controller",
+            )
+
+        self.assertEqual("AGENT_CONTROLLER_SKILL_MISSING", caught.exception.code)
         self.assertNotIn(self.conversation_id, self.manager._busy)
 
     async def test_old_cleanup_cannot_release_new_generation(self) -> None:

@@ -17,6 +17,12 @@ for skill in real-estate-research real-estate-product-strategy real-estate-story
 done
 grep -Fq 'Harness 内置 `skill` tool' "$ROUTER"
 grep -Fq '**业务专项 → `real-estate-report-editorial` → `real-estate-report-design` → 按需 `hoosland-pdf-output` → `real-estate-delivery-qa`**' "$ROUTER"
+grep -Fq '每轮首个 Skill 确定性激活' "$ROUTER"
+grep -Fq '不得通过 Harness 内置 `skill` tool 再次调用 `comprehensive-real-estate-expert` 自身' "$ROUTER"
+grep -Fq 'Markdown 与独立 HTML 两个成品' "$ROUTER"
+for child in real-estate-report-editorial real-estate-report-design hoosland-pdf-output real-estate-social-promotion wechat-article-exporter; do
+  grep -Fq '不直接调用任何 Skill' "$ROOT/$child/SKILL.md"
+done
 
 if $PYTHON "$ROOT/real-estate-research/scripts/scope_check.py" "$ROOT/tests/fixtures/machang-scope-invalid.json" >/dev/null 2>&1; then
   echo "expected invalid scope fixture to fail" >&2

@@ -11,8 +11,12 @@ from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
 from app.config import Settings
-from app.harness_adapter import HarnessAdapterError, HarnessRunResult
-from app.main import _completed_conversation_history, create_app
+from app.harness_adapter import HarnessAdapterError, HarnessRunResult, SKILL_COMMAND
+from app.main import (
+    _completed_conversation_history,
+    _new_or_updated_output_formats,
+    create_app,
+)
 
 
 class HttpApiTests(unittest.TestCase):
@@ -37,6 +41,15 @@ class HttpApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
         self.temporary.cleanup()
+
+    def test_run_output_format_audit_ignores_unchanged_old_files(self) -> None:
+        baseline = {"report.html": (100, 1)}
+        current = {"report.html": (100, 1), "report.md": (200, 2)}
+
+        self.assertEqual(
+            ["md"],
+            _new_or_updated_output_formats(baseline, current),
+        )
 
     def test_admin_config_hides_keys_and_requires_same_origin(self) -> None:
         denied = self.client.post(
@@ -99,6 +112,14 @@ class HttpApiTests(unittest.TestCase):
                 item["event"] == "agent.run.accepted"
                 and item["conversation_id"] == conversation_id
                 and item["content_characters"] == len(message_marker)
+                for item in records
+            )
+        )
+        self.assertTrue(
+            any(
+                item["event"] == "agent.controller.injection.prepared"
+                and item["conversation_id"] == conversation_id
+                and item["skill_id"] == "comprehensive-real-estate-expert"
                 for item in records
             )
         )
@@ -366,6 +387,7 @@ class HttpApiTests(unittest.TestCase):
         private_marker = "PRIVATE-SEARCH-QUERY-4e6bb1"
         intermediate_marker = "PRIVATE-INTERMEDIATE-TEXT-9d207a"
         output_path = self.app.state.store.require(conversation_id).outputs / "report.md"
+        output_html_path = self.app.state.store.require(conversation_id).outputs / "report.html"
 
         async def fake_run(
             _conversation_id: str,
@@ -440,6 +462,10 @@ class HttpApiTests(unittest.TestCase):
                 }
             )
             output_path.write_text("# 项目成果", encoding="utf-8")
+            output_html_path.write_text(
+                "<!doctype html><html><body><h1>项目成果</h1></body></html>",
+                encoding="utf-8",
+            )
             on_notification(
                 {
                     "method": "session.event",
@@ -498,6 +524,14 @@ class HttpApiTests(unittest.TestCase):
         ]
         self.assertTrue(any(item.get("tool_name") == "web_search" for item in operations))
         self.assertTrue(any(item.get("tool_name") == "shell" for item in operations))
+        completed = [
+            item
+            for item in (json.loads(line) for line in raw_log.splitlines() if line)
+            if item["event"] == "agent.run.completed"
+            and item.get("conversation_id") == conversation_id
+        ]
+        self.assertEqual(["html", "md"], completed[-1]["run_output_formats"])
+        self.assertTrue(completed[-1]["default_output_pair_present_this_run"])
 
     def test_config_generation_swap_blocks_new_agent_runs(self) -> None:
         logged_in = self.client.post(
@@ -637,9 +671,9 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("续聊成功", continued.text)
         self.assertEqual([0, 1], [generation for generation, _prompt in calls])
         second_prompt = calls[1][1]
-        self.assertTrue(second_prompt.startswith("[总控激活]\n"))
-        self.assertNotRegex(second_prompt, r"(?m)^/[A-Za-z0-9_-]+")
-        self.assertIn("路由模式：自动 Skill 路由", second_prompt)
+        self.assertTrue(second_prompt.startswith(f"{SKILL_COMMAND}\n\n[总控激活]\n"))
+        self.assertIn("路由模式：总控先行", second_prompt)
+        self.assertIn("默认格式：MD + HTML", second_prompt)
         self.assertIn("先前已完成的问题", second_prompt)
         self.assertIn("先前已完成的结论", second_prompt)
         self.assertNotIn("这轮需要被取消", second_prompt)
@@ -652,7 +686,7 @@ class HttpApiTests(unittest.TestCase):
         final_metadata = self.app.state.store.read_meta(conversation_id)
         self.assertEqual(1, final_metadata["agent_session_seeded_generation"])
 
-    def test_restart_first_turn_uses_auto_routing_and_completed_history(self) -> None:
+    def test_restart_first_turn_uses_controller_and_completed_history(self) -> None:
         conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
         calls: list[tuple[str, int, str]] = []
 
@@ -680,8 +714,7 @@ class HttpApiTests(unittest.TestCase):
         )
         self.assertEqual(200, first.status_code)
         self.assertIn("第一轮结论", first.text)
-        self.assertTrue(calls[0][2].startswith("[总控激活]\n"))
-        self.assertNotRegex(calls[0][2], r"(?m)^/[A-Za-z0-9_-]+")
+        self.assertTrue(calls[0][2].startswith(f"{SKILL_COMMAND}\n\n[总控激活]\n"))
 
         # A second app over the same persistent data simulates a service
         # restart: it has no in-memory runner/cache state from the first app.
@@ -718,11 +751,10 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(1, len(restarted_calls))
         second_run_id, _generation, second_prompt = restarted_calls[0]
         self.assertNotEqual(calls[0][0], second_run_id)
-        self.assertTrue(second_prompt.startswith("[总控激活]\n"))
-        self.assertNotRegex(second_prompt, r"(?m)^/[A-Za-z0-9_-]+")
+        self.assertTrue(second_prompt.startswith(f"{SKILL_COMMAND}\n\n[总控激活]\n"))
         self.assertIn('"content":"第一轮问题"', second_prompt)
         self.assertIn('"content":"第一轮结论"', second_prompt)
-        self.assertTrue(second_prompt.endswith("重启后继续"))
+        self.assertTrue(second_prompt.endswith('{"content":"重启后继续"}'))
 
         public_messages = self.client.get(
             f"/api/conversations/{conversation_id}/messages"

@@ -26,6 +26,7 @@ from .admin_auth import AdminAuth
 from .capabilities import CapabilityGateway, McpAccessRegistry
 from .config import CAPABILITY_NAMES, Settings
 from .harness_adapter import (
+    CONTROLLER_SKILL_ID,
     HarnessAdapterError,
     HarnessManager,
     build_harness_prompt,
@@ -36,7 +37,7 @@ from .harness_adapter import (
 from .mcp_protocol import McpProtocol
 from .operation_log import OperationLog
 from .pdf_runtime import pdf_runtime_status
-from .runtime_config import RuntimeConfigError, RuntimeConfigStore
+from .runtime_config import DEFAULT_OUTPUT_FORMATS, RuntimeConfigError, RuntimeConfigStore
 from .storage import (
     ConversationNotFound,
     ConversationStore,
@@ -266,6 +267,19 @@ def _has_new_or_updated_output(
     return any(baseline.get(name) != metadata for name, metadata in current.items())
 
 
+def _new_or_updated_output_formats(
+    baseline: dict[str, tuple[int, int]],
+    current: dict[str, tuple[int, int]],
+) -> list[str]:
+    return sorted(
+        {
+            _file_type(name)
+            for name, metadata in current.items()
+            if baseline.get(name) != metadata
+        }
+    )
+
+
 def _public_run_error_message(code: str) -> str:
     if code == "AGENT_CANCELLED":
         return "本次研究已终止，可以继续发送消息"
@@ -273,6 +287,7 @@ def _public_run_error_message(code: str) -> str:
         "AGENT_DISABLED",
         "AGENT_RUNTIME_UNAVAILABLE",
         "AGENT_CONFIG_MISSING",
+        "AGENT_CONTROLLER_SKILL_MISSING",
     }:
         return "研究服务当前不可用，请联系管理员检查配置。"
     if code == "AGENT_BUSY":
@@ -1010,14 +1025,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/capabilities")
     async def capabilities() -> dict[str, Any]:
         skill_found = any(
-            (path / "comprehensive-real-estate-expert" / "SKILL.md").is_file()
-            or (path / "comprehensive-real-estate-expert.md").is_file()
+            (path / CONTROLLER_SKILL_ID / "SKILL.md").is_file()
+            or (path / f"{CONTROLLER_SKILL_ID}.md").is_file()
             for path in app_settings.harness_skill_dirs
         )
         items: list[dict[str, Any]] = [harness.status()]
         items.append(
             {
-                "name": "comprehensive-real-estate-expert",
+                "name": CONTROLLER_SKILL_ID,
                 "label": "房地产综合研究总控",
                 "configured": skill_found,
                 "status": "configured" if skill_found else "not_verified",
@@ -1313,9 +1328,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             active.project_id = project_id
             active.session_generation = session_generation
             # Web turns are deliberately stateless at the SDK-session layer.
-            # Each run receives bounded successful persisted history. The
-            # Harness runtime chooses among available skills from their
-            # descriptions, so the API must not preselect a slash command.
+            # Each run receives bounded successful persisted history. The API
+            # deterministically activates the comprehensive controller; that
+            # controller then routes to specialist skills for this request.
             conversation_history = _completed_conversation_history(
                 store.list_messages(conversation_id)
             )
@@ -1341,6 +1356,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 content,
                 attachments,
                 conversation_history=conversation_history,
+            )
+            operation_log.record(
+                "agent.controller.injection.prepared",
+                source="api",
+                request_id=request.state.request_id,
+                project_id=project_id,
+                conversation_id=conversation_id,
+                run_id=active.run_id,
+                session_generation=session_generation,
+                skill_id=CONTROLLER_SKILL_ID,
             )
             operation_log.record(
                 "agent.run.accepted",
@@ -1490,6 +1515,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     item for item in store.list_files(conversation_id)
                     if item.get("kind") == "output"
                 ]
+                run_output_formats = _new_or_updated_output_formats(
+                    output_baseline,
+                    _output_fingerprint(conversation_paths.outputs),
+                )
                 operation_log.record(
                     "agent.run.completed",
                     source="harness",
@@ -1509,6 +1538,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             for item in outputs
                         }
                     ),
+                    run_output_formats=run_output_formats,
+                    default_output_pair_present_this_run=set(
+                        DEFAULT_OUTPUT_FORMATS
+                    ).issubset(run_output_formats),
                 )
             except asyncio.CancelledError:
                 public_error = _public_run_error_message("AGENT_CANCELLED")

@@ -72,8 +72,8 @@ description: v2.3 地产报告文案编辑 skill。用于把研究、产品、�
 ## 交接与放行
 
 - 仅做局部润色或用户明确要求工作草稿时，准确标为“编辑草稿”，不暗示已完成正式交付。
-- 目标为正式文件时，编辑完成后必须调用 `real-estate-report-design`；若要求 PDF，再由设计稿调用 `hoosland-pdf-output` 完成生成与逐页渲染技术质检。
-- 所有正式介质最后必须调用 `real-estate-delivery-qa`；P0/P1 未关闭或尚未实际打开、渲染时，不得称为可提交、可发布、可归档或可决策。
+- 目标为正式文件时，编辑完成后向已激活总控返回 `next_skill_requests: [real-estate-report-design]`；若要求 PDF，同时声明设计完成后需要 `hoosland-pdf-output`。
+- 所有正式介质最后都需要 `real-estate-delivery-qa`；本模块只向总控返回该下一节点请求，不直接调用任何 Skill。P0/P1 未关闭或尚未实际打开、渲染时，不得称为可提交、可发布、可归档或可决策。
 
 ## 输出
 

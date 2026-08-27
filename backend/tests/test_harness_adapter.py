@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
 from app.harness_adapter import (
+    SKILL_COMMAND,
     build_harness_prompt,
     notification_to_operation_event,
     notification_to_stream_event,
@@ -17,34 +19,58 @@ class FakeNotification:
 
 
 class HarnessAdapterTests(unittest.TestCase):
-    def test_single_specialty_prompt_uses_implicit_skill_routing(self) -> None:
+    def test_single_specialty_prompt_deterministically_activates_controller(self) -> None:
         prompt = build_harness_prompt(
             "请只做这个项目的竞品市场研究",
             [{"workspace_path": "inputs/file_a--plan.pdf", "name": "plan.pdf"}],
         )
-        self.assertTrue(prompt.startswith("[总控激活]\n"))
-        self.assertNotRegex(prompt, r"(?m)^/[A-Za-z0-9_-]+")
-        self.assertNotIn("/comprehensive-real-estate-expert", prompt)
-        headers = ["[总控激活]", "[已完成历史]", "[附件清单]", "[当前请求]"]
+        self.assertTrue(prompt.startswith(f"{SKILL_COMMAND}\n\n[总控激活]\n"))
+        self.assertEqual(SKILL_COMMAND, prompt.splitlines()[0])
+        self.assertEqual(
+            [SKILL_COMMAND],
+            re.findall(r"(?m)^/[A-Za-z0-9_-]+$", prompt),
+        )
+        headers = [
+            "[总控激活]",
+            "[交付策略]",
+            "[已完成历史]",
+            "[附件清单]",
+            "[当前请求]",
+        ]
         self.assertEqual(headers, [line for line in prompt.splitlines() if line in headers])
         self.assertTrue(all(prompt.count(header) == 1 for header in headers))
         self.assertIn("当前阶段：意图识别与任务执行", prompt)
-        self.assertIn("路由模式：自动 Skill 路由", prompt)
-        self.assertIn("预选 Skill：无", prompt)
-        self.assertIn("根据当前请求和可用 Skill 描述按需选择", prompt)
+        self.assertIn("主控 Skill：comprehensive-real-estate-expert", prompt)
+        self.assertIn("路由模式：总控先行", prompt)
+        self.assertIn("主控不得调用自身", prompt)
+        self.assertIn("默认格式：MD + HTML", prompt)
+        self.assertIn("必须在 outputs/ 同时生成", prompt)
+        self.assertIn("用户明确指定单一格式、其他格式或不要文件时", prompt)
         self.assertIn("本轮已有授权能力：无额外授权", prompt)
         self.assertIn("inputs/file_a--plan.pdf", prompt)
         self.assertIn('"可用状态":"可用"', prompt)
         self.assertNotIn("专业联网搜索（Bocha）", prompt)
         self.assertNotIn("hoosland-pdf-render", prompt)
         self.assertNotIn("客户可见输出纪律", prompt)
-        self.assertTrue(prompt.endswith("请只做这个项目的竞品市场研究"))
+        self.assertTrue(prompt.endswith('{"content":"请只做这个项目的竞品市场研究"}'))
 
-    def test_later_prompt_also_has_no_forced_skill_command(self) -> None:
+    def test_later_prompt_also_forces_the_same_controller(self) -> None:
         prompt = build_harness_prompt("继续", [])
-        self.assertNotRegex(prompt, r"(?m)^/[A-Za-z0-9_-]+")
-        self.assertIn("预选 Skill：无", prompt)
-        self.assertTrue(prompt.endswith("继续"))
+        self.assertEqual(SKILL_COMMAND, prompt.splitlines()[0])
+        self.assertIn("路由模式：总控先行", prompt)
+        self.assertTrue(prompt.endswith('{"content":"继续"}'))
+
+    def test_user_slash_command_does_not_replace_service_controller(self) -> None:
+        prompt = build_harness_prompt(
+            "/real-estate-research\n只做竞品研究",
+            [],
+        )
+        self.assertEqual(SKILL_COMMAND, prompt.splitlines()[0])
+        self.assertNotRegex(prompt, r"(?m)^/real-estate-research$")
+        self.assertIn(
+            '"content":"/real-estate-research\\n只做竞品研究"',
+            prompt,
+        )
 
     def test_rotated_session_prompt_seeds_completed_history(self) -> None:
         prompt = build_harness_prompt(
@@ -55,16 +81,15 @@ class HarnessAdapterTests(unittest.TestCase):
                 {"role": "assistant", "content": "先前结论"},
             ],
         )
-        self.assertTrue(prompt.startswith("[总控激活]\n"))
-        self.assertNotRegex(prompt, r"(?m)^/[A-Za-z0-9_-]+")
+        self.assertTrue(prompt.startswith(f"{SKILL_COMMAND}\n\n[总控激活]\n"))
         self.assertIn('"content":"先前问题"', prompt)
         self.assertIn('"content":"先前结论"', prompt)
-        self.assertTrue(prompt.endswith("继续研究"))
+        self.assertTrue(prompt.endswith('{"content":"继续研究"}'))
 
     def test_main_system_prompt_has_one_versioned_source(self) -> None:
         cordis_path = Path(__file__).resolve().parents[1] / "cordis.yml"
         cordis = cordis_path.read_text(encoding="utf-8")
-        self.assertEqual(1, cordis.count("real-estate-system-v0.2.0"))
+        self.assertEqual(1, cordis.count("real-estate-system-v0.2.1"))
         self.assertEqual(
             1,
             cordis.count(
@@ -76,9 +101,13 @@ class HarnessAdapterTests(unittest.TestCase):
         self.assertIn("不原样回显个人信息、客户资料或秘密", cordis)
         self.assertIn("只保留完成任务所需的最小片段并脱敏", cordis)
         self.assertIn("才能声称“已完成”", cordis)
-        self.assertIn("根据当前请求和所有可用 Skill 的描述自动选择", cordis)
-        self.assertIn("单一专项任务不预先强制总控 Skill", cordis)
-        self.assertIn("无论本轮直接命中总控、编辑、设计、传播还是其他专项", cordis)
+        self.assertIn("每轮任务都必须先由服务端确定性激活", cordis)
+        self.assertIn("单一专项任务同样遵守“总控 → 专项”", cordis)
+        self.assertIn("不得绕过总控直达子 Skill", cordis)
+        self.assertIn("同一子 Skill 最多加载一次", cordis)
+        self.assertIn("默认必须在 outputs 同时生成内容对应的 Markdown", cordis)
+        self.assertIn("该规则是主报告交付契约", cordis)
+        self.assertIn("微信资料转换/归档、社交平台素材", cordis)
         self.assertIn("业务责任专项 → real-estate-report-editorial → real-estate-report-design", cordis)
         self.assertIn("最终 QA 放行前只能准确称为相应阶段的候选稿或待审批包", cordis)
 

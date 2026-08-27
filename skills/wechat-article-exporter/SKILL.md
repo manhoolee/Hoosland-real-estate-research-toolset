@@ -17,7 +17,7 @@ description: >-
 1. **研究归档模式**：被总控调用时，默认输出 Markdown + JSON，保留标题、作者、发布日期、原链接和抓取日期，然后将事实、观点、引用和待核验项交回研究链，不中断主任务询问格式。
 2. **独立导出模式**：用户明确要阅读或转换时，再询问需要 Markdown、HTML、文本、JSON 或 Excel；已有明确格式则直接执行。
 
-本 Skill 只负责把“已有微信公众号文章”作为输入抓取、转换或研究归档，不负责把地产报告创作成公众号发布稿。用户要求生成公众号文章、封面或多平台传播包时，已有审定母稿则调用 `real-estate-social-promotion`，尚无审定母稿则先调用 `real-estate-storyline-marketing`；实际视觉成品继续交给报告设计与最终 QA 链。
+本 Skill 只负责把“已有微信公众号文章”作为输入抓取、转换或研究归档，不负责把地产报告创作成公众号发布稿。用户要求生成公众号文章、封面或多平台传播包时，已有审定母稿则向已激活总控请求 `real-estate-social-promotion`，尚无审定母稿则请求 `real-estate-storyline-marketing`；实际视觉成品所需的报告设计与最终 QA 节点也只返回给总控统一调用，本模块不直接调用任何 Skill。
 
 执行前读取 [research-intake.md](references/research-intake.md)。
 
