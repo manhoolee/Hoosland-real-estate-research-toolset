@@ -4,6 +4,37 @@
 
 ## Unreleased
 
+### 文档与架构
+
+- 新增独立知识提纯库开发规格，明确知识核心零 Harness 依赖、Ports and Adapters、证据血缘、候选提纯、人工审核、不可变修订和知识快照。
+- 新增 Sprint 0–8 实施计划，规定先独立验证提纯质量，再建立查询服务，最后以只读 MCP Adapter 灰度接入 DeepSeek Harness 和专业 Skill。
+- 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
+- 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
+
+## App 0.2.0 Build `v0.2.0-controller-first-dual-output-20260825T081715Z` / System Prompt v0.2.1 — 2026-08-25
+
+### 发布身份与兼容性
+
+- 产品线与应用版本继续为 V2 / `0.2.0`，以唯一 Build ID 识别本次热修；由于运行编排、Ready 状态和默认交付行为已变化而未提升 patch，这也是需在下一 canonical release 升至至少 `0.2.1` 的版本债务；
+- System Prompt 从 `real-estate-system-v0.2.0` 升级为 `real-estate-system-v0.2.1`；
+- Skill manifest 仍为 `2.3.0`，但生产通过版本化 Skill 目录与 Build ID 绑定本次内容修订；下一次内容变更应正式升级到 `2.3.1` 或更高版本；
+- 项目状态 Schema 继续为 `2.1.0`，没有数据迁移；前端、Python requirements、Nginx 与既有公开 API 路径未变更，Ready/runtime 状态仅新增向后兼容的总控配置字段。
+
+### 总控路由与默认报告格式
+
+- System Prompt 升级为 `real-estate-system-v0.2.1`；
+- 应用每轮首行确定性提交 `comprehensive-real-estate-expert` 总控命令，再由总控按 Prompt/Skill 契约调用并去重子 Skill；缺少总控文件时 Ready 与运行均 fail closed；
+- 地产研究、项目分析、策划方案和管理报告在用户未指定格式时默认生成 Markdown 与独立 HTML，专项转换、归档、社交素材和数据模型保留各自输出契约；
+- operation log 新增总控注入准备事件，并按本轮文件变更记录实际输出格式，便于回归检测；
+- 编辑、设计、PDF、社交和微信子 Skill 改为向总控返回下一节点请求，不再自行调用下游 Skill。
+
+### 验证与上线
+
+- 后端单元/HTTP 回归扩展为 86 项并全部通过，Python 编译与 Skill smoke 通过；
+- 候选与生产公网均以同一“广州越秀地产阅璟台”任务完成真实 E2E；有效链为总控 → 研究 → 编辑 → 设计 → QA，子 Skill 无重复或失败；
+- 两次 E2E 均实际生成并打开同轮 Markdown 与独立 HTML，默认未误调用 PDF；
+- 槽 B 原子切换成功，槽 A、Nginx、共享依赖、持久数据与既有运行配置未变更；旧应用 release、旧 Skill 与环境配置均保留用于回滚。
+
 ### 安装与部署文档
 
 - 新增独立安装指南，明确本地开发、单进程演示、WSL2 和支持平台；
@@ -11,6 +42,15 @@
 - 每个不可变 release 使用独立 `.venv`，源码、前端与 Python 依赖可以一起回滚；
 - 明确反向代理访问控制、`APP_API_TOKEN` 的 SPA 限制、`/mcp` 阻断和 PDF 系统依赖；
 - Docker、多副本和原生 Windows 后端继续标记为未完成真实运行时验收，不做超前承诺。
+
+> 上述安装/部署文档描述的是长期推荐基线；本次既有槽 B 生产热修沿用已验收的共享 venv，requirements 未变化，没有在本次发布中执行 venv 迁移。
+
+### 文档与追溯
+
+- 新增文档索引、Skill 编排契约、版本与升级指南、测试与验收标准；
+- 新增版本轴、双槽隔离、controller-first 和默认 Markdown + HTML 四份 ADR；
+- 新增 V0.2 脱敏 Release Notes，以及后续迭代日志和发布检查清单模板；
+- 精确 Build ID 可以进入公开 Release Notes；运行 ID、服务器路径、内部文件哈希与回滚锚点由受控发布档案保存。
 
 ## App 0.2.0 / Skill 2.3.0 — 2026-08-25
 
@@ -41,7 +81,7 @@
 ### 验证
 
 - 初始实现阶段为 73 个后端测试；刷新恢复与幂等加固后扩展为 83 个；
-- 当前源码快照通过 83 个后端单元测试、Python 编译、前端类型检查与生产构建；
+- 该阶段源码快照通过 83 个后端单元测试、Python 编译、前端类型检查与生产构建；
 - Skill v2.3 smoke tests 通过。
 
 ## 历史 Skill 版本

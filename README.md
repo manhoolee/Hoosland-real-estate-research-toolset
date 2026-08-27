@@ -25,18 +25,21 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
 | 工作台应用 | `0.2.0` | FastAPI、React、API、文件、长任务恢复与管理配置 |
-| System Prompt | `real-estate-system-v0.2.0` | 全局身份、安全、证据、权限和交付规则 |
+| 当前 Build | `v0.2.0-controller-first-dual-output-20260825T081715Z` | 每次部署唯一；应用 SemVer 不替代 Build 身份 |
+| System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和交付规则 |
 | Skill 套件 | `2.3.0` | 1 个总控 + 10 个专项 Skill |
 | 项目状态 Schema | `2.1.0` | 仅在持久化数据契约变化时升级；Demo 阶段可能不兼容，迁移或重建路径见发布说明 |
+
+当前 Build 保留了 Application `0.2.0` 与 Skill `2.3.0`，但实际改变了应用编排/Ready/默认交付行为和 Skill 内容；这两项已登记为版本债务，下一 canonical release 应至少升级为 Application `0.2.1` / Skill `2.3.1`。
 
 ## 核心能力
 
 - 项目、多对话、附件、历史记录和成果文件管理；
 - REST + SSE 长任务，支持取消、失败重试和页面刷新后的后台任务恢复；
 - 每个对话独立使用 `inputs / work / outputs` 工作区；
-- DeepSeek Harness 依据 Skill 描述自动路由，不要求用户记忆 slash command；
-- 固定正式交付链：**业务专项 → 编辑 → 设计 → 按需 PDF → 交付 QA**；
-- 默认交付 Markdown + 独立 HTML；安装持久 PDF runtime 后可按需生成并逐页检查 PDF；
+- 服务端在每轮 Prompt 首行确定性提交 `comprehensive-real-estate-expert` 总控命令，再由总控依据 Skill 描述调用所需子 Skill；用户不需要记忆 slash command；
+- 文件型正式交付链：**总控 → 业务专项 → 编辑 → 设计 → 按需 PDF → 交付 QA**；
+- 地产研究、项目分析、策划方案和管理报告在用户未指定格式时默认交付 Markdown + 独立 HTML；安装持久 PDF runtime 后可按需生成并逐页检查 PDF；
 - 内部 MCP 能力网关：视觉、生图、扩展搜索、文档抽取、文本委派；未配置时明确失败，不伪造结果；
 - Provider 密钥加密保存且 API 不回传明文；运行日志不记录消息正文、附件内容或工具结果。
 
@@ -145,7 +148,7 @@ curl http://127.0.0.1:8000/api/capabilities
 
 | Skill | 职责 |
 |---|---|
-| `comprehensive-real-estate-expert` | 跨模块总控、范围、证据和质量闸门 |
+| `comprehensive-real-estate-expert` | 应用每轮提交入口命令所指向的唯一总控、范围、证据和质量闸门 |
 | `real-estate-research` | 城市、规划、土地、市场、竞品和客群研究 |
 | `real-estate-product-strategy` | 定位、面积、户配、价格、货值和节奏 |
 | `real-estate-storyline-marketing` | 品牌故事、营销策略、内容和销售话术 |
@@ -178,7 +181,7 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-本次源码快照已通过 83 个后端单元测试、Python 编译、前端类型检查与生产构建、Skill v2.3 smoke tests。自动化测试不等同于真实模型、真实 Provider、浏览器和 PDF 的生产验收。
+本次 controller-first / dual-output 源码快照已通过 86 个后端单元测试、Python 编译和 Skill v2.3 smoke tests；未变更的前端沿用此前已通过的类型检查与生产构建。自动化测试不等同于真实模型、真实 Provider、浏览器和 PDF 的生产验收。
 
 ## 数据与安全边界
 
@@ -207,12 +210,21 @@ bash ./tests/run_smoke_tests.sh
 
 ## 文档
 
+- [文档总索引](docs/INDEX.md)
 - [安装指南](docs/INSTALLATION.md)
 - [使用说明](docs/USAGE.md)
 - [配置参考](docs/CONFIGURATION.md)
 - [架构说明](docs/ARCHITECTURE.md)
+- [Skill 编排](docs/SKILL-ORCHESTRATION.md)
+- [独立知识提纯库开发文档](docs/KNOWLEDGE-REFINERY-CORE-DEVELOPMENT.md)
+- [独立知识提纯库开发步骤](docs/KNOWLEDGE-REFINERY-CORE-IMPLEMENTATION-PLAN.md)
+- [知识决策系统开发文档](docs/KNOWLEDGE-DECISION-SYSTEM-DEVELOPMENT.md)
+- [知识决策系统敏捷方案](docs/KNOWLEDGE-DECISION-SYSTEM-AGILE-IMPLEMENTATION-PLAN.md)
+- [版本与升级](docs/VERSIONING-AND-UPGRADES.md)
+- [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
+- [V0.2 发布说明](docs/releases/v0.2.0/RELEASE-NOTES.md)
 - [更新记录](CHANGELOG.md)
 - [贡献指南](CONTRIBUTING.md)
 

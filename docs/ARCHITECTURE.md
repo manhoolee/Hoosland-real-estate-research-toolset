@@ -44,8 +44,8 @@ flowchart TD
 2. 发送消息时携带附件 ID 和独立的 `client_request_id`。
 3. 后端先持久化用户消息与 `run.json=running`，两者成功后才启动模型。状态写入失败时禁止启动无法恢复的任务。
 4. `HarnessManager` 为 conversation 创建独立 cwd 和 session root，并签发仅绑定该 conversation 的临时 MCP bearer token。
-5. Cordis 装配主模型、沙箱、文件、会话、搜索、MCP 和唯一的 `real-estate-system-v0.2.0`。
-6. Agent 通过 Harness 内置 `skill` tool 按描述选择最匹配的 Skill；跨领域任务由总控协调。
+5. Cordis 装配主模型、沙箱、文件、会话、搜索、MCP 和唯一的 `real-estate-system-v0.2.1`。
+6. API 以首行 slash command 确定性提交 `comprehensive-real-estate-expert` 总控入口；Prompt/Skill 契约要求总控再通过 Harness 内置 `skill` tool 调用所需子 Skill 并对本轮调用去重。会话首行证明命令已提交，operation/E2E 证明后续子链；当前没有独立的总控正文加载回执。
 7. 中间材料写入 `work`，最终成品只能写入 `outputs`。
 8. 后端持久化唯一 assistant 结果、文件索引与终态；SSE 只发送安全进度和已提交结果。
 9. 页面刷新后按 `run → messages/files → run` 获取一致性快照；仍在运行时继续轮询，终态后自动回填结果。
@@ -72,11 +72,12 @@ DATA_DIR/
 
 ## 5. Skill 路由与交付链
 
-单一问题优先直接命中对应专项；只有跨越两个及以上模块、需求不清或需要完整交付时才启用总控。正式成果遵守固定链路：
+应用每轮先确定性提交总控入口命令；Prompt/Skill 契约要求单一问题由总控调用一个必要专项，跨模块问题由总控按依赖顺序调用多个专项。任何子 Skill 都不得替代总控作为入口，也不得调用总控自身。地产研究、项目分析、策划方案和管理报告的主成果在用户未指定格式时，默认交付内容对应的 Markdown 与独立 HTML；纯澄清、简短问答、明确不要文件，以及微信归档、社交素材、数据模型等有专项输出契约的任务除外。正式成果遵守固定链路：
 
 ```mermaid
 flowchart LR
-  B[业务责任专项] --> E[报告编辑]
+  C[综合地产总控] --> B[业务责任专项]
+  B --> E[报告编辑]
   E --> D[报告设计]
   D --> P{需要 PDF?}
   P -->|是| PDF[PDF 生成与逐页技术质检]
