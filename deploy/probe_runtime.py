@@ -26,10 +26,12 @@ def main() -> None:
     config = Path(os.environ.get("DSH_CONFIG", repository_root / "backend" / "cordis.yml"))
     workspace = Path(os.environ.get("DSH_CWD", repository_root / ".runtime-probe" / "workspace"))
     session_root = Path(os.environ.get("DSH_SESSION_ROOT", repository_root / ".runtime-probe" / "sessions"))
-    prompt = " ".join(sys.argv[1:]) or (
-        "请使用 comprehensive-real-estate-expert，"
+    task = " ".join(sys.argv[1:]) or (
         "请只回复：房地产专家运行时已就绪。不要调用外部工具。"
     )
+    prompt = "/comprehensive-real-estate-expert\n\n" + task
+    if prompt.splitlines()[0] != "/comprehensive-real-estate-expert":
+        raise RuntimeError("controller skill command must be the first prompt line")
 
     workspace.mkdir(parents=True, exist_ok=True)
     session_root.mkdir(parents=True, exist_ok=True)
