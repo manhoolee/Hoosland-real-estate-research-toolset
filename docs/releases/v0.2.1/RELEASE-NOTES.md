@@ -1,6 +1,6 @@
 # Hoosland 地产研究工作台 V0.2.1 发布说明
 
-- 发布状态：release candidate
+- 发布状态：online / observing
 - 发布日期：2026-08-27
 - 应用版本：`0.2.1`
 - Build ID：`v0.2.1-production-sync-version-info-20260827T062425Z`
@@ -78,6 +78,14 @@ Application 与 Skill 的 patch 升级用于关闭 V0.2.0 热修中“行为已�
 - 微信离线失败路径 smoke：通过；
 - 页面版本档案四档响应式浏览器验收：通过；
 - 浏览器控制台错误：0。
+
+上线后独立复验：
+
+- 应用与 Skill 两份 SHA-256 清单分别通过 35 项和 96 项校验；
+- `/api/health/live` 与 `/api/health/ready` 均返回 Application `0.2.1` 和本次精确 Build ID；
+- Ready 确认前端制品、运行时和总控 Skill 已配置；
+- 公网页面加载的新哈希 JS 与候选制品 SHA-256 完全一致；
+- 公网页面在 1440px 与 320px 复验版本号、GitHub/CHANGELOG 链接、实时 Build ID、返回首页入口和横向溢出，控制台无错误。
 
 ## 6. 兼容性、配置和数据
 
