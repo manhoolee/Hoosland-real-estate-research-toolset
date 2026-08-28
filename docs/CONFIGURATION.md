@@ -124,11 +124,11 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```bash
 VITE_API_BASE_URL=/agent-tools \
 VITE_DEPLOYMENT_SLOT=slot-b \
-VITE_APP_VERSION=0.2.2 \
+VITE_APP_VERSION=0.2.3 \
 npm run build
 ```
 
-V0.2.2 候选部署的后端 `BUILD_ID` 使用 `v0.2.2-conversation-token-usage-20260828T023809Z`，并保证前端显示的 Application `0.2.2` 与健康接口返回一致。
+V0.2.3 候选部署的后端 `BUILD_ID` 使用 `v0.2.3-output-persistence-20260828T040220Z`，并保证前端显示的 Application `0.2.3` 与健康接口返回一致。
 
 ## 8. 配置不变量
 

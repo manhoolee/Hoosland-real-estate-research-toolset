@@ -11,6 +11,22 @@
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
 
+## App 0.2.3 Build `v0.2.3-output-persistence-20260828T040220Z` / System Prompt v0.2.2 / Skill 2.3.1 / Usage sidecar 1 — 2026-08-28
+
+### 成果文件持久化
+
+- 修复 persistent Bash 切换目录后，文件工具可能把 `/tmp/**/outputs` 或嵌套 `outputs` 误当正式交付目录的问题；
+- 每轮 Prompt 注入唯一会话 `workspace`、`work` 与 `outputs` 绝对路径，并明确 Bash `cd` 不改变文件工具的会话根；
+- Cordis 恢复动态 runtime context，使模型能够持续看到 canonical session workspace；
+- 新增成功前硬门禁：本轮尝试生成的每个输出目标没有完整写入顶层 `workspace/outputs` 时，任务变为可重试失败，不发送错误的成功结果；
+- 私有审计只记录尝试数量、格式和路径分类，不记录客户文件名或原始路径。
+
+### 兼容性与验证
+
+- Application 从 `0.2.2` 升至 `0.2.3`，System Prompt 从 `real-estate-system-v0.2.1` 升至 `real-estate-system-v0.2.2`；Skill bundle、Project state Schema 和 usage sidecar Schema 均不变；
+- 不迁移、不覆盖现有 conversation、成果文件或 Token 用量；V1 / slot-a 不在发布范围内；
+- 后端 102 项单元与 HTTP 回归、Python 编译、前端类型检查和生产构建已通过；真实文件生成、更新、刷新与服务重启保持将在发布闸门中复验。
+
 ## App 0.2.2 Build `v0.2.2-conversation-token-usage-20260828T023809Z` / System Prompt v0.2.1 / Skill 2.3.1 / Usage sidecar 1 — 2026-08-28
 
 ### 对话 Token 消耗

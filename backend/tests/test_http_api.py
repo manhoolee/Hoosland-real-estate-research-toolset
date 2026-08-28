@@ -44,7 +44,11 @@ class HttpApiTests(unittest.TestCase):
 
     def test_run_output_format_audit_ignores_unchanged_old_files(self) -> None:
         baseline = {"report.html": (100, 1)}
-        current = {"report.html": (100, 1), "report.md": (200, 2)}
+        current = {
+            "report.html": (100, 1),
+            "report.md": (200, 2),
+            "empty.pdf": (0, 3),
+        }
 
         self.assertEqual(
             ["md"],
@@ -193,13 +197,13 @@ class HttpApiTests(unittest.TestCase):
         self.assertNotIn('"harness"', ready.text.lower())
         self.assertNotIn("harness", capabilities.text.lower())
 
-    def test_health_responses_expose_v021_slot_and_build_identity(self) -> None:
+    def test_health_responses_expose_current_slot_and_build_identity(self) -> None:
         live = self.client.get("/api/health/live")
         self.assertEqual(200, live.status_code)
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.2",
+                "version": "0.2.3",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -208,7 +212,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.2", ready.json()["version"])
+        self.assertEqual("0.2.3", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
@@ -532,6 +536,428 @@ class HttpApiTests(unittest.TestCase):
         ]
         self.assertEqual(["html", "md"], completed[-1]["run_output_formats"])
         self.assertTrue(completed[-1]["default_output_pair_present_this_run"])
+
+    def test_output_write_outside_canonical_outputs_cannot_report_success(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def misplaced_run(
+            _conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            on_notification(
+                {
+                    "method": "session.event",
+                    "payload": {
+                        "event": {
+                            "type": "tool/call",
+                            "data": {
+                                "name": "write",
+                                "arguments": json.dumps(
+                                    {
+                                        "file_path": "/tmp/web/outputs/report.md",
+                                        "content": "private report",
+                                    }
+                                ),
+                            },
+                        }
+                    },
+                }
+            )
+            return HarnessRunResult(
+                final_response="错误地声称文件已交付",
+                finish_reason="stop",
+                session_id=f"web-{conversation_id}",
+            )
+
+        self.app.state.harness.run = misplaced_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "生成正式报告", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("本轮研究暂未完成", response.text)
+        self.assertNotIn("错误地声称文件已交付", response.text)
+        run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
+        self.assertEqual("failed", run["status"])
+        self.assertTrue(run["retryable"])
+        self.assertEqual(
+            [],
+            self.client.get(
+                f"/api/conversations/{conversation_id}/files"
+            ).json()["items"],
+        )
+        records = [
+            json.loads(line)
+            for line in self.settings.operation_log_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        ]
+        rejected = [
+            item
+            for item in records
+            if item.get("event") == "agent.output.persistence_rejected"
+            and item.get("conversation_id") == conversation_id
+        ]
+        self.assertEqual(1, len(rejected))
+        self.assertEqual("AGENT_OUTPUT_NOT_PERSISTED", rejected[0]["error_code"])
+        self.assertEqual(1, rejected[0]["misplaced_output_write_attempt_count"])
+        self.assertNotIn("/tmp/web", json.dumps(rejected))
+
+    def test_every_attempted_output_target_must_be_persisted_before_success(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        paths = self.app.state.store.require(conversation_id)
+
+        async def incomplete_run(
+            _conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            for file_path in ("outputs/kept.md", "/tmp/web/outputs/missing.md"):
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "event": {
+                                "type": "tool/call",
+                                "data": {
+                                    "name": "write",
+                                    "arguments": {
+                                        "file_path": file_path,
+                                        "content": "report",
+                                    },
+                                },
+                            }
+                        },
+                    }
+                )
+            paths.outputs.joinpath("kept.md").write_text(
+                "# report",
+                encoding="utf-8",
+            )
+            return HarnessRunResult(
+                final_response="不完整交付",
+                finish_reason="stop",
+                session_id=f"web-{conversation_id}",
+            )
+
+        self.app.state.harness.run = incomplete_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "生成双格式正式报告", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("本轮研究暂未完成", response.text)
+        self.assertEqual(
+            "failed",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+
+    def test_zero_byte_canonical_output_cannot_report_success(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        paths = self.app.state.store.require(conversation_id)
+
+        async def empty_output_run(
+            _conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            on_notification(
+                {
+                    "method": "session.event",
+                    "payload": {
+                        "event": {
+                            "type": "tool/call",
+                            "data": {
+                                "name": "write",
+                                "arguments": {
+                                    "file_path": "outputs/empty.md",
+                                    "content": "",
+                                },
+                            },
+                        }
+                    },
+                }
+            )
+            paths.outputs.joinpath("empty.md").write_bytes(b"")
+            return HarnessRunResult(
+                final_response="空文件也声称完成",
+                finish_reason="stop",
+                session_id=f"web-{conversation_id}",
+            )
+
+        self.app.state.harness.run = empty_output_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "生成正式报告", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("本轮研究暂未完成", response.text)
+        self.assertNotIn("空文件也声称完成", response.text)
+        self.assertEqual(
+            "failed",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+
+    def test_truncating_existing_output_to_zero_bytes_cannot_report_success(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        paths = self.app.state.store.require(conversation_id)
+        output_path = paths.outputs.joinpath("report.md")
+        output_path.write_text("# previous report", encoding="utf-8")
+
+        async def truncated_output_run(
+            _conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            on_notification(
+                {
+                    "method": "session.event",
+                    "payload": {
+                        "event": {
+                            "type": "tool/call",
+                            "data": {
+                                "name": "edit",
+                                "arguments": {
+                                    "file_path": "outputs/report.md",
+                                    "old_string": "# previous report",
+                                    "new_string": "",
+                                },
+                            },
+                        }
+                    },
+                }
+            )
+            output_path.write_bytes(b"")
+            return HarnessRunResult(
+                final_response="截空旧文件也声称完成",
+                finish_reason="stop",
+                session_id=f"web-{conversation_id}",
+            )
+
+        self.app.state.harness.run = truncated_output_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "更新现有报告", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("本轮研究暂未完成", response.text)
+        self.assertNotIn("截空旧文件也声称完成", response.text)
+        self.assertEqual(
+            "failed",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+
+    def test_file_delivery_skill_without_persisted_output_cannot_succeed(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def missing_delivery_run(
+            _conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            on_notification(
+                {
+                    "method": "session.event",
+                    "payload": {
+                        "event": {
+                            "type": "tool/call",
+                            "data": {
+                                "name": "skill",
+                                "arguments": json.dumps(
+                                    {"name": "hoosland-pdf-output"}
+                                ),
+                            },
+                        }
+                    },
+                }
+            )
+            return HarnessRunResult(
+                final_response="没有文件却声称完成",
+                finish_reason="stop",
+                session_id=f"web-{conversation_id}",
+            )
+
+        self.app.state.harness.run = missing_delivery_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "生成正式报告", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("本轮研究暂未完成", response.text)
+        self.assertNotIn("没有文件却声称完成", response.text)
+        self.assertEqual(
+            "failed",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+
+    def test_advisory_skills_may_return_inline_text_without_an_output_file(self) -> None:
+        for skill_id, request_text in (
+            (
+                "real-estate-report-editorial",
+                "只在聊天中润色这段文字，不要生成文件",
+            ),
+            (
+                "real-estate-report-design",
+                "只在聊天中点评这份报告的版式，不要生成文件",
+            ),
+        ):
+            with self.subTest(skill_id=skill_id):
+                conversation_id = self.client.post(
+                    "/api/conversations",
+                    json={},
+                ).json()["id"]
+
+                async def inline_advisory_run(
+                    _conversation_id: str,
+                    _prompt: str,
+                    on_notification: object,
+                    *,
+                    run_id: str,
+                    session_generation: int = 0,
+                ) -> HarnessRunResult:
+                    del run_id, session_generation
+                    on_notification(
+                        {
+                            "method": "session.event",
+                            "payload": {
+                                "event": {
+                                    "type": "tool/call",
+                                    "data": {
+                                        "name": "skill",
+                                        "arguments": json.dumps({"name": skill_id}),
+                                    },
+                                }
+                            },
+                        }
+                    )
+                    return HarnessRunResult(
+                        final_response="只在聊天中返回的建议",
+                        finish_reason="stop",
+                        session_id=f"web-{conversation_id}",
+                    )
+
+                self.app.state.harness.run = inline_advisory_run
+                response = self.client.post(
+                    f"/api/conversations/{conversation_id}/messages",
+                    json={"content": request_text, "attachment_ids": []},
+                )
+
+                self.assertEqual(200, response.status_code)
+                self.assertIn("只在聊天中返回的建议", response.text)
+                self.assertEqual(
+                    "succeeded",
+                    self.client.get(
+                        f"/api/conversations/{conversation_id}/run"
+                    ).json()["status"],
+                )
+                self.assertEqual(
+                    [],
+                    self.client.get(
+                        f"/api/conversations/{conversation_id}/files"
+                    ).json()["items"],
+                )
+
+    def test_canonical_output_write_attempt_succeeds_and_prompt_names_workspace(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        paths = self.app.state.store.require(conversation_id)
+        captured_prompt = ""
+
+        async def persisted_run(
+            _conversation_id: str,
+            prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            nonlocal captured_prompt
+            del run_id, session_generation
+            captured_prompt = prompt
+            for name, content in (
+                ("report.md", "# report"),
+                ("report.html", "<!doctype html><html><body>report</body></html>"),
+            ):
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "event": {
+                                "type": "tool/call",
+                                "data": {
+                                    "name": "write",
+                                    "arguments": json.dumps(
+                                        {
+                                            "file_path": f"outputs/{name}",
+                                            "content": content,
+                                        }
+                                    ),
+                                },
+                            }
+                        },
+                    }
+                )
+                paths.outputs.joinpath(name).write_text(content, encoding="utf-8")
+            return HarnessRunResult(
+                final_response="已完成并持久化",
+                finish_reason="stop",
+                session_id=f"web-{conversation_id}",
+            )
+
+        self.app.state.harness.run = persisted_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "生成正式报告", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("已完成并持久化", response.text)
+        self.assertEqual(
+            "succeeded",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+        self.assertIn(f"会话工作区：{paths.workspace.resolve()}", captured_prompt)
+        self.assertIn("/tmp/**/outputs", captured_prompt)
+        files = self.client.get(
+            f"/api/conversations/{conversation_id}/files"
+        ).json()["items"]
+        self.assertEqual({"report.html", "report.md"}, {item["name"] for item in files})
 
     def test_provider_usage_streams_and_persists_by_conversation(self) -> None:
         missing = self.client.get(

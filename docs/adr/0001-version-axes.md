@@ -44,6 +44,8 @@ V0.2.1 canonical release 已按该决策把 Application 提升为 `0.2.1`、Skil
 
 V0.2.2 新增每个 conversation 可选的 `usage.json` Token accounting sidecar，并建立独立 Schema `1`。Project state Schema 继续为 `2.1.0`，因为 Skill 的 project_state / case payload 字段、含义和校验均未变化；Skill bundle 因此也继续为 `2.3.1`。Sidecar 缺失可按 0 读取、在首次新 usage 时惰性创建，旧 V0.2.1 会忽略它；不运行迁移，也不推算或回填升级前的历史 Token。回滚到 V0.2.1 时 sidecar 保留但停止更新，重新升级会保留一段不可恢复的统计缺口。
 
+V0.2.3 修改了运行编排、成功终态条件与全局工作区规则，因此 Application 升至 `0.2.3`，System Prompt 升至 `real-estate-system-v0.2.2`。Skill 内容、Project state Schema 和 usage sidecar 计数语义均未变化，继续使用 `2.3.1`、`2.1.0` 和 sidecar Schema `1`。
+
 ## 兼容性规则
 
 - Application 或 Prompt 升级不得自动改写 Project state Schema。

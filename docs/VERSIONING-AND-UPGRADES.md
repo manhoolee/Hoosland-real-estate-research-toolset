@@ -7,9 +7,9 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.2` | 后端、前端和公开应用行为版本 |
-| Build ID | `v0.2.2-conversation-token-usage-20260828T023809Z` | 本次不可变发布构建标识 |
-| System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和执行规则 |
+| Application SemVer | `0.2.3` | 后端、前端和公开应用行为版本 |
+| Build ID | `v0.2.3-output-persistence-20260828T040220Z` | 本次不可变发布构建标识 |
+| System Prompt | `real-estate-system-v0.2.2` | 全局身份、安全、证据、权限和执行规则 |
 | Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
 | Project state Schema | `2.1.0` | Skill 使用的持久化 project_state / case payload 契约 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection |
@@ -108,6 +108,16 @@ V0.2.2 将 Application 从 `0.2.1` 升至 `0.2.2`，新增对话 Token 用量统
 公开 release note 只保存脱敏摘要；包含内部拓扑或任务关联信息的原始证据必须进入访问受控的发布档案。
 
 ## 8. 当前 Build 的升级摘要
+
+V0.2.3 output persistence Build（Build ID：`v0.2.3-output-persistence-20260828T040220Z`）：
+
+- Application 从 `0.2.2` 升至 `0.2.3`，System Prompt 从 `real-estate-system-v0.2.1` 升至 `real-estate-system-v0.2.2`；Skill bundle `2.3.1`、Project state Schema `2.1.0` 与 usage sidecar Schema `1` 不变；
+- 动态 runtime context 与每轮绝对工作区注入共同固定唯一 `workspace/outputs`，明确禁止使用 `/tmp`、嵌套 outputs 或 shell `${PWD}/outputs` 作为正式交付目录；
+- 后端在写入成功状态和发送最终消息前，对本轮 output write 意图与真实顶层 outputs 指纹进行核对；缺失或格式不完整时返回可重试失败；
+- 不复制共享临时目录，不自动提升来源不确定的文件，不修改历史 conversation；回滚单位是整个 V0.2.3 应用与匹配的 System Prompt；
+- V1 / slot-a 不变，V0.2.2 Token 统计与 usage sidecar 继续兼容。
+
+### 上一 Build
 
 V0.2.2 Token usage visibility Build（Build ID：`v0.2.2-conversation-token-usage-20260828T023809Z`）：
 

@@ -24,14 +24,14 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
-| 工作台应用 | `0.2.2` | FastAPI、React、API、文件、长任务恢复与管理配置 |
-| 当前 Build | `v0.2.2-conversation-token-usage-20260828T023809Z` | 本次不可变发布构建标识 |
-| System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和交付规则 |
+| 工作台应用 | `0.2.3` | FastAPI、React、API、文件、长任务恢复与管理配置 |
+| 当前 Build | `v0.2.3-output-persistence-20260828T040220Z` | 本次不可变发布构建标识 |
+| System Prompt | `real-estate-system-v0.2.2` | 全局身份、安全、证据、权限和交付规则 |
 | Skill 套件 | `2.3.1` | 1 个总控 + 10 个专项 Skill |
 | 项目状态 Schema | `2.1.0` | Skill 使用的 project_state / case payload 契约，本次不变 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection；兼容、惰性创建 |
 
-V0.2.2 在不修改 System Prompt 与 Skill 套件的前提下，新增按对话累计的 Provider Token 消耗：运行中通过 SSE 更新，刷新后从独立的 `usage.json` accounting sidecar 恢复，并显示在输入框上方。Project state Schema 保持 `2.1.0`；新增独立的 usage sidecar Schema `1`。旧对话没有 sidecar 时返回 0并在首次记录时惰性创建，不做迁移，也不回填历史 Token。
+V0.2.3 修复最终文件可能被写入临时目录或嵌套 `outputs` 后仍误报成功的问题：运行 Prompt 注入唯一会话工作区，恢复 Harness 动态运行上下文，并在成功状态前核验本轮成果真实写入顶层 `workspace/outputs`。V0.2.2 的对话 Token 实时统计和 usage sidecar Schema `1` 保持不变；无需数据迁移。
 
 ## 核心能力
 
@@ -183,7 +183,7 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-V0.2.2 源码快照已通过 94 个后端单元/HTTP 测试、Python 编译、前端类型检查与生产构建；System Prompt 与 Skill v2.3.1 未变化。自动化测试不等同于真实模型、真实 Provider 和 PDF 的生产验收。
+V0.2.3 源码快照已通过 102 个后端单元/HTTP 测试、Python 编译、前端类型检查与生产构建；发布前还必须完成真实成果持久化 E2E。Skill v2.3.1 未变化。
 
 ## 数据与安全边界
 
@@ -228,6 +228,7 @@ V0.2.2 源码快照已通过 94 个后端单元/HTTP 测试、Python 编译、�
 - [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
+- [V0.2.3 发布说明](docs/releases/v0.2.3/RELEASE-NOTES.md)
 - [V0.2.2 发布说明](docs/releases/v0.2.2/RELEASE-NOTES.md)
 - [V0.2.1 发布说明](docs/releases/v0.2.1/RELEASE-NOTES.md)
 - [V0.2.0 发布说明](docs/releases/v0.2.0/RELEASE-NOTES.md)

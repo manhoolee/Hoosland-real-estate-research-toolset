@@ -31,9 +31,11 @@ from .harness_adapter import (
     HarnessManager,
     build_harness_prompt,
     notification_to_operation_event,
+    notification_to_output_write_attempt,
     notification_to_stream_event,
     notification_to_token_retry_attempt,
     notification_to_token_usage_sample,
+    output_relative_path_id,
     research_progress_event,
 )
 from .mcp_protocol import McpProtocol
@@ -52,6 +54,12 @@ from .storage import (
 
 
 LOGGER = logging.getLogger("real_estate_backend")
+
+_OUTPUT_DELIVERY_SKILLS = frozenset(
+    {
+        "hoosland-pdf-output",
+    }
+)
 
 
 class ConversationCreate(BaseModel):
@@ -266,7 +274,10 @@ def _has_new_or_updated_output(
     baseline: dict[str, tuple[int, int]],
     current: dict[str, tuple[int, int]],
 ) -> bool:
-    return any(baseline.get(name) != metadata for name, metadata in current.items())
+    return any(
+        metadata[0] > 0 and baseline.get(name) != metadata
+        for name, metadata in current.items()
+    )
 
 
 def _new_or_updated_output_formats(
@@ -277,7 +288,7 @@ def _new_or_updated_output_formats(
         {
             _file_type(name)
             for name, metadata in current.items()
-            if baseline.get(name) != metadata
+            if metadata[0] > 0 and baseline.get(name) != metadata
         }
     )
 
@@ -1444,6 +1455,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 content,
                 attachments,
                 conversation_history=conversation_history,
+                workspace_path=conversation_paths.workspace,
             )
             operation_log.record(
                 "agent.controller.injection.prepared",
@@ -1496,6 +1508,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         loop = asyncio.get_running_loop()
         last_notification: dict[str, Any] = {}
         usage_attempts: dict[tuple[str, int, int], int] = {}
+        output_write_attempt_count = 0
+        misplaced_output_write_attempt_count = 0
+        attempted_output_formats: set[str] = set()
+        attempted_output_target_ids: set[str] = set()
+        output_delivery_skill_invoked = False
         highest_progress_step = 1
         output_baseline = _output_fingerprint(conversation_paths.outputs)
         initial_usage_event = _token_usage_event(
@@ -1505,6 +1522,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         def on_notification(notification: object) -> None:
             nonlocal highest_progress_step
+            nonlocal misplaced_output_write_attempt_count
+            nonlocal output_delivery_skill_invoked
+            nonlocal output_write_attempt_count
+            output_attempt = notification_to_output_write_attempt(
+                notification,
+                conversation_paths.workspace,
+            )
+            if output_attempt is not None:
+                output_write_attempt_count += 1
+                if not output_attempt.canonical:
+                    misplaced_output_write_attempt_count += 1
+                if output_attempt.output_format:
+                    attempted_output_formats.add(output_attempt.output_format)
+                attempted_output_target_ids.add(output_attempt.target_id)
             retry_attempt = notification_to_token_retry_attempt(notification)
             if retry_attempt is not None:
                 usage_attempts[
@@ -1561,6 +1592,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return
             operation_event = notification_to_operation_event(notification)
             if operation_event is not None:
+                if operation_event.get("skill_id") in _OUTPUT_DELIVERY_SKILLS:
+                    output_delivery_skill_invoked = True
                 operation_log.record(
                     "agent.operation",
                     source="harness",
@@ -1627,6 +1660,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 if not await is_current():
                     raise asyncio.CancelledError
+                output_current = _output_fingerprint(conversation_paths.outputs)
+                run_output_formats = _new_or_updated_output_formats(
+                    output_baseline,
+                    output_current,
+                )
+                changed_output_target_ids = {
+                    output_relative_path_id(name)
+                    for name, metadata in output_current.items()
+                    if metadata[0] > 0 and output_baseline.get(name) != metadata
+                }
+                missing_attempted_target_count = len(
+                    attempted_output_target_ids - changed_output_target_ids
+                )
+                if (output_write_attempt_count or output_delivery_skill_invoked) and (
+                    not changed_output_target_ids
+                    or missing_attempted_target_count
+                ):
+                    operation_log.record(
+                        "agent.output.persistence_rejected",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        session_generation=active.session_generation,
+                        error_code="AGENT_OUTPUT_NOT_PERSISTED",
+                        output_write_attempt_count=output_write_attempt_count,
+                        misplaced_output_write_attempt_count=(
+                            misplaced_output_write_attempt_count
+                        ),
+                        attempted_output_formats=sorted(attempted_output_formats),
+                        run_output_formats=run_output_formats,
+                        missing_attempted_target_count=missing_attempted_target_count,
+                        output_delivery_skill_invoked=output_delivery_skill_invoked,
+                    )
+                    raise HarnessAdapterError(
+                        "AGENT_OUTPUT_NOT_PERSISTED",
+                        "研究助手尝试生成成果，但文件没有完整写入当前会话的正式成果目录",
+                    )
                 if seed_history:
                     store.update_meta(
                         conversation_id,
@@ -1660,10 +1732,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     item for item in store.list_files(conversation_id)
                     if item.get("kind") == "output"
                 ]
-                run_output_formats = _new_or_updated_output_formats(
-                    output_baseline,
-                    _output_fingerprint(conversation_paths.outputs),
-                )
                 operation_log.record(
                     "agent.run.completed",
                     source="harness",

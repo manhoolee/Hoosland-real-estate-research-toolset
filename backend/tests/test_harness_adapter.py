@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from app.harness_adapter import (
     SKILL_COMMAND,
     build_harness_prompt,
     notification_to_operation_event,
+    notification_to_output_write_attempt,
     notification_to_stream_event,
     notification_to_token_retry_attempt,
     notification_to_token_usage_sample,
@@ -22,9 +24,11 @@ class FakeNotification:
 
 class HarnessAdapterTests(unittest.TestCase):
     def test_single_specialty_prompt_deterministically_activates_controller(self) -> None:
+        workspace = (Path.cwd() / "conversation-workspace").resolve()
         prompt = build_harness_prompt(
             "请只做这个项目的竞品市场研究",
             [{"workspace_path": "inputs/file_a--plan.pdf", "name": "plan.pdf"}],
+            workspace_path=workspace,
         )
         self.assertTrue(prompt.startswith(f"{SKILL_COMMAND}\n\n[总控激活]\n"))
         self.assertEqual(SKILL_COMMAND, prompt.splitlines()[0])
@@ -34,6 +38,7 @@ class HarnessAdapterTests(unittest.TestCase):
         )
         headers = [
             "[总控激活]",
+            "[唯一工作区路径]",
             "[交付策略]",
             "[已完成历史]",
             "[附件清单]",
@@ -49,12 +54,83 @@ class HarnessAdapterTests(unittest.TestCase):
         self.assertIn("必须在 outputs/ 同时生成", prompt)
         self.assertIn("用户明确指定单一格式、其他格式或不要文件时", prompt)
         self.assertIn("本轮已有授权能力：无额外授权", prompt)
+        self.assertIn(f"会话工作区：{workspace}", prompt)
+        self.assertIn(f"最终成果唯一目录：{workspace / 'outputs'}", prompt)
+        self.assertIn("write/edit 文件工具不跟随 persistent bash 的 cd", prompt)
+        self.assertIn("/tmp/**/outputs", prompt)
         self.assertIn("inputs/file_a--plan.pdf", prompt)
         self.assertIn('"可用状态":"可用"', prompt)
         self.assertNotIn("专业联网搜索（Bocha）", prompt)
         self.assertNotIn("hoosland-pdf-render", prompt)
         self.assertNotIn("客户可见输出纪律", prompt)
         self.assertTrue(prompt.endswith('{"content":"请只做这个项目的竞品市场研究"}'))
+
+    def test_output_write_attempt_classifies_canonical_and_misplaced_paths(self) -> None:
+        workspace = (Path.cwd() / "conversation-workspace").resolve()
+
+        def notification(path: str, *, event_type: str = "tool/call") -> FakeNotification:
+            return FakeNotification(
+                "session.event",
+                {
+                    "event": {
+                        "type": event_type,
+                        "data": {
+                            "name": "write",
+                            "arguments": json.dumps(
+                                {"file_path": path, "content": "private report"}
+                            ),
+                        },
+                    }
+                },
+            )
+
+        relative = notification_to_output_write_attempt(
+            notification("outputs/report.md"),
+            workspace,
+        )
+        self.assertIsNotNone(relative)
+        assert relative is not None
+        self.assertTrue(relative.canonical)
+        self.assertEqual("md", relative.output_format)
+
+        absolute = notification_to_output_write_attempt(
+            notification(str(workspace / "outputs" / "report.html")),
+            workspace,
+        )
+        self.assertIsNotNone(absolute)
+        assert absolute is not None
+        self.assertTrue(absolute.canonical)
+        self.assertEqual("html", absolute.output_format)
+
+        misplaced = notification_to_output_write_attempt(
+            notification(str(workspace.parent / "temporary" / "outputs" / "report.md")),
+            workspace,
+        )
+        self.assertIsNotNone(misplaced)
+        assert misplaced is not None
+        self.assertFalse(misplaced.canonical)
+        self.assertEqual(relative.target_id, misplaced.target_id)
+
+        nested = notification_to_output_write_attempt(
+            notification("project-copy/outputs/report.md"),
+            workspace,
+        )
+        self.assertIsNotNone(nested)
+        assert nested is not None
+        self.assertFalse(nested.canonical)
+
+        self.assertIsNone(
+            notification_to_output_write_attempt(
+                notification("work/report.md"),
+                workspace,
+            )
+        )
+        self.assertIsNone(
+            notification_to_output_write_attempt(
+                notification("outputs/report.md", event_type="tool/execute/start"),
+                workspace,
+            )
+        )
 
     def test_later_prompt_also_forces_the_same_controller(self) -> None:
         prompt = build_harness_prompt("继续", [])
@@ -91,7 +167,10 @@ class HarnessAdapterTests(unittest.TestCase):
     def test_main_system_prompt_has_one_versioned_source(self) -> None:
         cordis_path = Path(__file__).resolve().parents[1] / "cordis.yml"
         cordis = cordis_path.read_text(encoding="utf-8")
-        self.assertEqual(1, cordis.count("real-estate-system-v0.2.1"))
+        self.assertEqual(1, cordis.count("real-estate-system-v0.2.2"))
+        self.assertIn("includeRuntimeContext: true", cordis)
+        self.assertIn("write/edit 文件工具不跟随 persistent Bash 的 cd", cordis)
+        self.assertIn("/tmp/**/outputs", cordis)
         self.assertEqual(
             1,
             cordis.count(

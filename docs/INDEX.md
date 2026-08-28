@@ -7,9 +7,9 @@
 | 版本轴 | 当前值 |
 |---|---|
 | 产品线 | V2 |
-| Application | `0.2.2` |
-| Build | `v0.2.2-conversation-token-usage-20260828T023809Z` |
-| System Prompt | `real-estate-system-v0.2.1` |
+| Application | `0.2.3` |
+| Build | `v0.2.3-output-persistence-20260828T040220Z` |
+| System Prompt | `real-estate-system-v0.2.2` |
 | Skill bundle | `2.3.1` |
 | Project state Schema | `2.1.0` |
 | Conversation usage sidecar Schema | `1` |
@@ -21,6 +21,7 @@
 - 地产研究、项目分析、策划方案和管理报告在用户未指定最终格式时，默认同轮生成 Markdown 与独立 HTML。
 - PDF 仍是按需格式；微信归档、社交素材和数据模型等专项任务保留各自输出契约。
 - 是否完成以真实操作记录和实际文件为准，不以模型在文本中的自述为准。
+- 文件工具的唯一正式交付根是当前会话顶层 `workspace/outputs`；临时目录或嵌套 `outputs` 不构成交付，缺失时不能进入成功终态。
 - 当前对话的可观察 Provider Token 用量按 conversation 累计，通过 SSE 更新并保存在可选 `usage.json` sidecar；reasoning 是 output 子集，不重复计入总量。
 
 ## 文档地图
@@ -44,6 +45,7 @@
 - [版本与升级指南](VERSIONING-AND-UPGRADES.md)：独立版本轴、升级要素、兼容性、迁移和回滚要求。
 - [迭代原则](ITERATION-PRINCIPLES.md)：长期不变量、发布分级和 Definition of Done。
 - [更新记录](../CHANGELOG.md)：按版本和 Build 记录已经发布与尚未发布的变化。
+- [V0.2.3 发布说明](releases/v0.2.3/RELEASE-NOTES.md)：唯一成果目录、成功前持久化门禁与兼容性说明。
 - [V0.2.2 发布说明](releases/v0.2.2/RELEASE-NOTES.md)：对话 Token 消耗统计、实时显示、持久化与兼容性说明。
 - [V0.2.1 发布说明](releases/v0.2.1/RELEASE-NOTES.md)：生产源码归档、版本身份修复和页面版本信息的公开摘要。
 - [V0.2.0 发布说明](releases/v0.2.0/RELEASE-NOTES.md)：首次上线、刷新恢复与总控优先热修的公开摘要。

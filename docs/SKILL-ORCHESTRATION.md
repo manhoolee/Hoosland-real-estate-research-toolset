@@ -61,14 +61,15 @@ System Prompt、每轮交付策略和 Skill 文档共同要求：
 - 正式报告遵守“业务专项 → 编辑 → 设计 → 按需 PDF → 最终 QA”。
 - 报告类主成果在用户未指定格式时默认生成 Markdown 与独立 HTML。
 
-这些是模型与 Skill 的执行契约。它们受到静态测试和真实 E2E 约束，但不是通用后端工作流引擎强制执行的状态转换。
+这些仍主要是模型与 Skill 的执行契约。应用不对所有自然语言请求做报告类型分类，但 V0.2.3 起会强制校验文件工具已经表达的交付意图：每个输出目标必须在当前会话顶层 `workspace/outputs` 真实新增或更新后才能进入成功终态。
 
-### 3.3 软审计
+### 3.3 持久化闸门与审计
 
 运行日志记录两类脱敏信号：
 
 - `agent.controller.injection.prepared`：证明应用已为该轮构造总控入口；它不单独证明 Harness 已成功加载总控。
-- `run_output_formats` 与 `default_output_pair_present_this_run`：记录本轮实际新增或更新的文件格式；该布尔值为 `false` 时当前只提供检测信号，不会自动推翻运行终态。
+- `agent.output.persistence_rejected`：文件工具尝试写入 outputs，但每个输出目标没有完整出现在 canonical `workspace/outputs` 时记录，并阻止成功终态；日志只保留内容无关的目标标识，不含文件名和原始路径。
+- `run_output_formats` 与 `default_output_pair_present_this_run`：记录本轮实际新增或更新的文件格式；后一个布尔值仍是报告契约审计信号，单独为 `false` 不代表所有简短问答都应失败。
 
 `output_formats` 可能包含对话历史中的既有成果。检测本轮交付必须使用 `run_output_formats`。
 
@@ -205,4 +206,3 @@ PDF 技术质检不能替代最终 QA。最终 QA 前不得把候选稿描述为
 - 用历史 `output_formats` 冒充本轮双格式交付。
 - 因 Prompt 中写了“必须”就声称后端已实现强制状态机。
 - 把 PDF 生成成功等同于内容和发布 QA 已通过。
-

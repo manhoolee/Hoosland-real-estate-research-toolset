@@ -104,7 +104,7 @@ PYTHON=python bash ./scripts/test.sh
 
 VITE_API_BASE_URL=/hoosland-real-estate-research-toolset \
 VITE_DEPLOYMENT_SLOT=single-linux \
-VITE_APP_VERSION=0.2.2 \
+VITE_APP_VERSION=0.2.3 \
 npm --prefix frontend run build
 
 test -s frontend/dist/index.html
@@ -119,7 +119,7 @@ test -s frontend/dist/index.html
 生成 build ID，并把 Git 跟踪文件与前端构建复制到新 release：
 
 ```bash
-HOOSLAND_BUILD_ID="v0.2.2-conversation-token-usage-20260828T023809Z"
+HOOSLAND_BUILD_ID="v0.2.3-output-persistence-20260828T040220Z"
 HOOSLAND_RELEASE_DIR="/opt/hoosland-real-estate-research-toolset/releases/${HOOSLAND_BUILD_ID}"
 
 sudo install -d -o root -g root -m 0755 "$HOOSLAND_RELEASE_DIR"
@@ -171,7 +171,7 @@ sudoedit /etc/hoosland-real-estate-research-toolset/agent.env
 ```dotenv
 APP_ENV=production
 APP_SLOT=single-linux
-BUILD_ID=v0.2.2-conversation-token-usage-20260828T023809Z
+BUILD_ID=v0.2.3-output-persistence-20260828T040220Z
 HOST=127.0.0.1
 PORT=8000
 DATA_DIR=/srv/hoosland-real-estate-research-toolset/data

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import Settings
@@ -111,6 +113,21 @@ class TokenRetryAttempt:
     turn: int
     step: int
     attempt: int
+
+
+@dataclass(frozen=True, slots=True)
+class OutputWriteAttempt:
+    """Content-free classification of one file-tool write target.
+
+    The raw path is deliberately not retained because it can contain customer
+    filenames.  The API only needs to know whether the agent intended to write
+    a deliverable and whether that target was inside the one canonical outputs
+    directory for this conversation.
+    """
+
+    canonical: bool
+    output_format: str | None
+    target_id: str
 
 
 def notification_to_token_retry_attempt(
@@ -248,6 +265,7 @@ def build_harness_prompt(
     attachments: list[dict[str, Any]],
     *,
     conversation_history: list[dict[str, str]] | None = None,
+    workspace_path: str | Path | None = None,
 ) -> str:
     # The controller is a runtime invariant, not a model routing preference.
     # Keeping the slash command as the literal first line makes every fresh
@@ -262,6 +280,20 @@ def build_harness_prompt(
         "- 调用约束：主控不得调用自身；同一子 Skill 本轮最多调用一次，明确失败后的重试除外\n"
         "- 本轮已有授权能力：无额外授权"
     )
+
+    if workspace_path is not None:
+        workspace = Path(workspace_path).resolve()
+        work = workspace / "work"
+        outputs = workspace / "outputs"
+        sections.append(
+            "[唯一工作区路径]\n"
+            f"- 会话工作区：{workspace}\n"
+            f"- 过程文件唯一目录：{work}\n"
+            f"- 最终成果唯一目录：{outputs}\n"
+            "- write/edit 文件工具不跟随 persistent bash 的 cd；优先始终使用相对路径 work/<文件> 或 outputs/<文件>，其基准只能是上述会话工作区。\n"
+            "- /tmp、/tmp/**/outputs、工作区内自建子目录的 outputs，以及当前 shell 的 ${PWD}/outputs 都不是交付目录；其中的文件不会出现在成果区，也不得据此声称已完成。\n"
+            "- 宣布完成前必须从上述唯一最终成果目录逐一核对本轮要求的文件确实存在、非空且可打开。"
+        )
 
     default_formats = " + ".join(format_name.upper() for format_name in DEFAULT_OUTPUT_FORMATS)
     sections.append(
@@ -304,6 +336,86 @@ def build_harness_prompt(
         + json.dumps({"content": content}, ensure_ascii=False, separators=(",", ":"))
     )
     return "\n\n".join(sections)
+
+
+def notification_to_output_write_attempt(
+    notification: object,
+    workspace_root: Path,
+) -> OutputWriteAttempt | None:
+    """Classify requested write/edit targets that use an ``outputs`` segment.
+
+    DeepSeek Harness intentionally permits writes to platform temporary roots
+    in ``workspace-write`` mode.  A model can therefore successfully write to
+    ``/tmp/.../outputs`` even though the application only serves
+    ``<workspace>/outputs``.  This parser gives the API a content-free signal
+    for a pre-success persistence gate.
+    """
+
+    method = getattr(notification, "method", None)
+    payload = getattr(notification, "payload", None)
+    if isinstance(notification, dict):
+        method = notification.get("method", method)
+        payload = notification.get("payload", payload)
+    if method != "session.event" or not isinstance(payload, dict):
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict) or event.get("type") != "tool/call":
+        return None
+    data = event.get("data")
+    if _operation_tool_category(_tool_name(data)) != "file_write":
+        return None
+    arguments = _tool_arguments(data)
+    if arguments is None:
+        return None
+    raw_path = next(
+        (
+            value
+            for key in ("file_path", "path", "target", "target_path")
+            if isinstance((value := arguments.get(key)), str) and value.strip()
+        ),
+        None,
+    )
+    if raw_path is None or "\x00" in raw_path:
+        return None
+
+    supplied = Path(raw_path)
+    # An outputs path outside the canonical root is still an output intent and
+    # must not be allowed to produce a false-success run.
+    output_indexes = [
+        index
+        for index, part in enumerate(supplied.parts)
+        if part.lower() == "outputs"
+    ]
+    if not output_indexes:
+        return None
+    relative_parts = supplied.parts[output_indexes[-1] + 1 :]
+    if not relative_parts:
+        return None
+    relative_output = Path(*relative_parts).as_posix()
+    workspace = workspace_root.resolve()
+    target = supplied if supplied.is_absolute() else workspace / supplied
+    try:
+        canonical_outputs = (workspace / "outputs").resolve()
+        resolved_target = target.resolve()
+        canonical_relative = resolved_target.relative_to(canonical_outputs)
+        canonical = resolved_target != canonical_outputs
+        if canonical:
+            relative_output = canonical_relative.as_posix()
+    except (OSError, ValueError):
+        canonical = False
+    suffix = supplied.suffix.lower().lstrip(".")
+    return OutputWriteAttempt(
+        canonical=canonical,
+        output_format=suffix or None,
+        target_id=output_relative_path_id(relative_output),
+    )
+
+
+def output_relative_path_id(relative_path: str | Path) -> str:
+    """Return an opaque stable id without retaining a customer filename."""
+
+    normalized = Path(relative_path).as_posix()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def notification_to_stream_event(notification: object) -> dict[str, Any] | None:
@@ -484,6 +596,38 @@ def _tool_name(data: object) -> str:
     if isinstance(call, dict):
         return _tool_name(call)
     return ""
+
+
+def _tool_arguments(data: object) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    candidates: list[object] = [
+        data.get("arguments"),
+        data.get("args"),
+        data.get("input"),
+        data.get("parameters"),
+    ]
+    call = data.get("call")
+    if isinstance(call, dict):
+        candidates.extend(
+            [
+                call.get("arguments"),
+                call.get("args"),
+                call.get("input"),
+                call.get("parameters"),
+            ]
+        )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+        if isinstance(candidate, str) and len(candidate) <= 5_000_000:
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+    return None
 
 
 def _skill_id(data: object) -> str | None:

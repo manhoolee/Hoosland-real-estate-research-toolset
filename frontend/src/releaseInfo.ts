@@ -1,21 +1,21 @@
 export const RELEASE_INFO = {
   releasedAt: "2026-08-28",
-  iteration: "对话 Token 消耗可见",
-  compatibility: "兼容更新 · usage sidecar v1 · 无迁移",
+  iteration: "成果文件可靠持久化",
+  compatibility: "兼容修复 · 无数据迁移 · V2 only",
   summary:
-    "按对话累计并实时展示 Provider 返回的 Token 消耗，刷新、取消和失败后仍可恢复已记录用量。",
+    "绑定唯一会话成果目录，在成功前核验本轮文件真实落盘，避免临时目录成果被误报为已交付。",
   changes: [
     {
-      title: "对话级累计",
-      description: "按 conversation 汇总主 Agent、子 Agent、重试与压缩步骤的 Provider 用量。",
+      title: "唯一路径",
+      description: "向研究助手明确注入当前会话 work 与 outputs 的唯一真实路径。",
     },
     {
-      title: "实时可见",
-      description: "输入框上方持续显示当前对话累计 Token，并通过流式事件同步最新数值。",
+      title: "成功硬门禁",
+      description: "尝试生成成果但正式 outputs 未完整变化时，任务转为可重试失败，不再误报成功。",
     },
     {
-      title: "兼容持久化",
-      description: "用量保存为可选 sidecar；旧对话无需迁移，旧版本也可忽略该文件。",
+      title: "原能力保留",
+      description: "对话 Token 实时统计、旧文件读取和现有 conversation 数据均保持兼容。",
     },
   ],
 } as const;
