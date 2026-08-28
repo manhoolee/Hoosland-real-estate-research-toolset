@@ -11,6 +11,25 @@
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
 
+## App 0.2.5 Build `v0.2.5-todo-write-recovery-20260828T090530Z` / System Prompt v0.2.4 / Skill 2.3.1 / Checklist sidecar 1 — 2026-08-28
+
+### todo/write 持久化拒绝恢复
+
+- 保留 V0.2.4 的严格持久化门禁：首张预完成、单次批量完成、项目集合变化和无任务/成果的清单仍会被拒绝，不以模型或 Harness 的本地成功替代应用成功；
+- 将拒绝原因改为有界类型；已有持久化基线的后续快照被拒时，应用读取最后一张已接受快照，把 revision、原因和权威 todos 作为同一根 Harness session 的服务端纠正指令回注；首张非法且没有 accepted items 时直接失败关闭；
+- 纠正后的下一张快照必须与权威基线完全一致；在确认恢复前，其他实质工具和 final 都会 fail closed，重复不匹配不会继续发送纠正；
+- 单轮最多处理 3 个彼此独立的拒绝事件，第 4 个事件以 `AGENT_CHECKLIST_RECOVERY_EXHAUSTED` 失败；存储、回注或协议异常也不会把运行误报为成功；
+- 应用接管 pinned SDK 的单一 notification subscription，以 `agent/inbox/spliced` 回执界定每次注入；纠正回执尚未到达时忽略排队的旧 idle，只在后续根 idle 收口最终回复；
+- 私有 operation log 只记录拒绝类型、attempt、revision 和结果，不保存任务正文、纠正 payload 或工具参数。
+
+### 版本、兼容性与发布状态
+
+- Application 从 `0.2.4` 升至 `0.2.5`，System Prompt 从 `real-estate-system-v0.2.3` 升至 `real-estate-system-v0.2.4`；Skill bundle `2.3.1`、Project state Schema `2.1.0`、usage sidecar Schema `1` 和 checklist sidecar Schema `1` 均不变；
+- Python、Node、Harness、系统依赖、公开 API、环境变量和持久化 Schema 均未变化，无数据迁移；
+- 精确源码 commit `914dc8f12a41a54ee2233f70834f24ed16330dcd` 的 GitHub Actions run `33157910758` 成功，本地与服务器端 132 项后端回归、Python 编译、前端类型检查/构建、`pip check` 和 Skill smoke 全部通过；
+- Build 已于 `2026-08-28T09:36:50Z` 上线 V2 / slot-b。3092 隔离候选与生产公网真实 Provider E2E 均生成 2 个任务、3 项成果要求和 8 个 revision，并以 5 次逐项完成收口；两端重启持久化复验通过；
+- 候选的真实 SDK wire gate 观察到 2 个 prompt 回执、2 张 todo 快照和 2 次 idle，最终只接受纠正后的回复。切换后本机、gateway 与公网 Ready 一致，`NRestarts=0`，高优先级与 recovery 失败日志为空；V1、Nginx、Skill 和公网 MCP 边界不变，V0.2.4 作为直接回滚点保留。
+
 ## App 0.2.4 Build `v0.2.4-task-checklist-20260828T043537Z` / System Prompt v0.2.3 / Skill 2.3.1 / Checklist sidecar 1 — 2026-08-28
 
 ### 任务清单与成果复核

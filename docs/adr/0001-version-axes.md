@@ -32,8 +32,8 @@ Build ID 必须能够关联构建清单、文件校验值和源代码修订。�
 
 | 轴 | V0.2 当前值 | 说明 |
 |---|---:|---|
-| Application | `0.2.4` | 从前一线上 V0.2.3 精确派生，现已上线 V2 / slot-b |
-| System Prompt | `real-estate-system-v0.2.3` | 新增任务拆解、逐项更新与成果复核契约 |
+| Application | `0.2.5` | 从前一线上 V0.2.4 精确派生，现已上线 V2 / slot-b |
+| System Prompt | `real-estate-system-v0.2.4` | 明确本地 todo 成功不等于应用持久化成功，并要求执行权威纠正 |
 | Skill bundle | `2.3.1` | 本次未修改 Skill 内容或套件接口 |
 | Project state Schema | `2.1.0` | 无数据结构变化，无迁移 |
 | Conversation usage sidecar Schema | `1` | 字段与计数语义未变化 |
@@ -49,6 +49,8 @@ V0.2.2 新增每个 conversation 可选的 `usage.json` Token accounting sidecar
 V0.2.3 修改了运行编排、成功终态条件与全局工作区规则，因此 Application 升至 `0.2.3`，System Prompt 升至 `real-estate-system-v0.2.2`。Skill 内容、Project state Schema 和 usage sidecar 计数语义均未变化，继续使用 `2.3.1`、`2.1.0` 和 sidecar Schema `1`。
 
 V0.2.4 从线上 V0.2.3 对应记录 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 直接派生，部署源码 commit 为 `de24812edb0920d728b0e1ea7d9e0954218ef7ce`。Application 升至 `0.2.4`，System Prompt 升至 `real-estate-system-v0.2.3`，新增按 run 隔离的 checklist sidecar Schema `1`；Skill bundle、Project state Schema 与 usage sidecar Schema 均不变化。该 sidecar 只为新运行惰性创建，不回填旧对话；回滚到 V0.2.3 时文件可保留并由旧代码忽略。
+
+V0.2.5 从线上 V0.2.4 记录 commit `6351cd2622a6903796a24e655ab2a98c02005fb1` 直接派生，部署源码 commit 为 `914dc8f12a41a54ee2233f70834f24ed16330dcd`。Application 升至 `0.2.5`，System Prompt 升至 `real-estate-system-v0.2.4`；已有 accepted baseline 时，拒绝后的权威纠正、prompt receipt 和后续 root idle 都是运行协调状态，不写入 checklist sidecar；首张非法而无基线时直接失败关闭。因此 Skill bundle、Project state Schema、usage sidecar Schema 与 Run checklist sidecar Schema 均不变化，也不执行数据迁移。
 
 ## 兼容性规则
 

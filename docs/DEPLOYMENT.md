@@ -104,7 +104,7 @@ PYTHON=python bash ./scripts/test.sh
 
 VITE_API_BASE_URL=/hoosland-real-estate-research-toolset \
 VITE_DEPLOYMENT_SLOT=single-linux \
-VITE_APP_VERSION=0.2.4 \
+VITE_APP_VERSION=0.2.5 \
 npm --prefix frontend run build
 
 test -s frontend/dist/index.html
@@ -119,7 +119,7 @@ test -s frontend/dist/index.html
 生成 build ID，并把 Git 跟踪文件与前端构建复制到新 release：
 
 ```bash
-HOOSLAND_BUILD_ID="v0.2.4-task-checklist-20260828T043537Z"
+HOOSLAND_BUILD_ID="v0.2.5-todo-write-recovery-20260828T090530Z"
 HOOSLAND_RELEASE_DIR="/opt/hoosland-real-estate-research-toolset/releases/${HOOSLAND_BUILD_ID}"
 
 sudo install -d -o root -g root -m 0755 "$HOOSLAND_RELEASE_DIR"
@@ -171,7 +171,7 @@ sudoedit /etc/hoosland-real-estate-research-toolset/agent.env
 ```dotenv
 APP_ENV=production
 APP_SLOT=single-linux
-BUILD_ID=v0.2.4-task-checklist-20260828T043537Z
+BUILD_ID=v0.2.5-todo-write-recovery-20260828T090530Z
 HOST=127.0.0.1
 PORT=8000
 DATA_DIR=/srv/hoosland-real-estate-research-toolset/data
@@ -319,12 +319,13 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' \
 8. 未授权访问被反向代理拒绝，公网 `/mcp` 返回 404；
 9. `journalctl`、磁盘、备份与告警入口可用。
 10. 对话运行中输入框上方的 Token 数值随 SSE 更新，刷新后与 `GET /api/conversations/{conversation_id}/usage` 一致。
+11. 涉及 todo/write 持久化拒绝恢复的版本，使用锁定 SDK 运行确定性 recovery-runtime gate，验证同一 root session 收到 correction receipt、跨过旧 idle、提交第二张 todo 快照，并在后续 root idle 后结束；该门禁不能替代真实 Provider E2E。
 
 ## 11. 数据备份与恢复
 
-`DATA_DIR` 包含 conversation、附件、成果、Harness sessions、operation logs、加密 runtime 配置，以及 V0.2.2 起每个 conversation 可选的 `usage.json` accounting sidecar。备份必须同时保存数据和对应的 `ADMIN_SESSION_SECRET` / `CONFIG_ENCRYPTION_KEY`，但两者不应存放在同一低权限归档中。
+`DATA_DIR` 包含 conversation、附件、成果、Harness sessions、operation logs、加密 runtime 配置、V0.2.2 起每个 conversation 可选的 `usage.json` accounting sidecar，以及 V0.2.4 起的 checklist sidecar。备份必须同时保存数据和对应的 `ADMIN_SESSION_SECRET` / `CONFIG_ENCRYPTION_KEY`，但两者不应存放在同一低权限归档中。
 
-`usage.json` 使用独立 sidecar Schema `1`；缺失时 V0.2.2 返回 0，V0.2.1 会忽略该文件。Project state Schema 保持 `2.1.0`。从 V0.2.1 升级不需要预生成文件或运行迁移器，但升级前的历史 Token 不会回填。
+`usage.json` 使用独立 sidecar Schema `1`；缺失时 V0.2.2 返回 0，V0.2.1 会忽略该文件。`checklists/{run_id}.json` 同样使用独立 sidecar Schema `1`，旧版本会忽略该目录。Project state Schema 保持 `2.1.0`。升级不需要预生成 sidecar 或运行迁移器，但升级前的历史 Token 和清单不会回填。
 
 优先使用文件系统或云盘的一致性快照。小型单机环境可以在维护窗口停服务后归档：
 

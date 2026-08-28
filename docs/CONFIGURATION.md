@@ -124,11 +124,11 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```bash
 VITE_API_BASE_URL=/agent-tools \
 VITE_DEPLOYMENT_SLOT=slot-b \
-VITE_APP_VERSION=0.2.4 \
+VITE_APP_VERSION=0.2.5 \
 npm run build
 ```
 
-V0.2.4 线上后端 `BUILD_ID` 使用 `v0.2.4-task-checklist-20260828T043537Z`，并保证前端显示的 Application `0.2.4` 与健康接口返回一致。隔离候选使用相同 Build ID，但必须改用 3092 和独立 `DATA_DIR`；生产 V2 / slot-b 使用 3091 与既有生产数据目录。
+V0.2.5 线上后端 `BUILD_ID` 使用 `v0.2.5-todo-write-recovery-20260828T090530Z`，并保证前端显示的 Application `0.2.5` 与健康接口返回一致。隔离候选使用相同 Build ID，但必须改用 3092 和独立 `DATA_DIR`；生产 V2 / slot-b 使用 3091 与既有生产数据目录。本次没有新增或改变环境变量。
 
 ## 8. 配置不变量
 

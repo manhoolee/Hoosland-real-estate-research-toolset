@@ -20,23 +20,28 @@
 
 ## 2. 当前自动化基线
 
-当前线上 V0.2.3 源码快照的最低基线：
+当前线上 V0.2.5 源码快照的最低基线：
 
-- 后端单元与 HTTP 回归：102 项全部通过；
+- 后端单元与 HTTP 回归：132 项全部通过；
 - `python -m compileall -q app tests`：通过；
 - Skill bundle smoke tests：通过；
 - 若前端发生变化：TypeScript 检查与生产构建必须通过；
 - 若 Python 或 Node 依赖发生变化：依赖一致性检查、锁文件和干净环境安装必须通过。
 
-“102 项”是 V0.2.3 线上基线事实，不是永久固定目标。V0.2.4 新增行为必须增加对应回归用例，并在候选记录中更新实际数量。
+“132 项”是 V0.2.5 当前线上基线事实，不是永久固定目标。后续新增行为必须增加对应回归用例，并在候选记录中更新实际数量。
 
-V0.2.4 固定工作树已运行 124 项后端单元与 HTTP 回归并全部通过；Python 编译、前端类型检查与生产构建、Skill smoke 也已通过。本地固定清单快照已在 1440、1024、375 和 320px 完成浏览器结构与溢出检查，控制台无错误或警告。隔离候选和生产公网的真实 Provider 流式 E2E 均已通过，并验证逐项 revision、成果文件、刷新读取、sidecar 与服务重启保持一致。
+V0.2.5 精确源码在本地、GitHub Actions 和服务器端均完成对应自动化门禁；Python 编译、前端类型检查与生产构建、`pip check`、Skill smoke 和 release manifest 也已通过。隔离候选和生产公网的真实 Provider 流式 E2E 均验证逐项 revision、成果文件、刷新读取、sidecar 与服务重启保持一致；候选另用 pinned SDK 的真实 stdio/notification wire 确定性复现“旧 idle 先到、纠正回执后到”的顺序，确认最终只收口纠正后的 turn。
 
-V0.2.4 任务清单专项至少验证：
+V0.2.5 任务清单与拒绝恢复专项至少验证：
 
 - 只消费根 Agent 成功后的 `todo/write`，不从 `tool/call` 参数、普通文本或子 Agent 清单推断状态；
 - 整表快照同时含任务与成果要求，revision 单调，重复和乱序事件不能回退，已完成项不能变回进行中；
 - 首张清单必须早于 Skill、搜索、命令、文件或其他实质操作，且不得已有 completed；后续单次更新不能批量新增多个 completed，成功前必须观察到至少一次首张后的逐项完成；
+- 批量完成等非法快照必须继续被持久化层拒绝；服务端反馈包含最后一张已接受 revision 和权威 todos，模型必须在同一根 session 中把下一张快照精确恢复为该基线；
+- 首张非法快照没有 accepted items 可供权威恢复时必须直接失败关闭，不得宣称已自动纠正；
+- recovery pending 时，其他实质工具、final 或不匹配的 todo 快照必须立即失败；同一 incident 不重复纠正，最多允许 3 个独立恢复事件，第 4 个事件耗尽失败；
+- followup prompt 的 inbox receipt 尚未到达时，排队的旧 idle 不得终止运行；必须继续处理纠正快照、纠正后最终回复和后续根 idle；
+- followup 注入失败、checklist 读取/写入失败和恢复耗尽均 fail closed，并旋转不可继续使用的 Harness session；
 - 清单与 `run_id`、用户消息和最终 assistant 一一对应，重试新建清单且不复制用户消息；
 - 刷新和断流恢复得到同一 revision，取消、失败和中断把剩余项目收口为未完成；
 - checklist prepare/commit、assistant append、run success write 任一故障都不能先发送成功事件；连续恢复失败后再次读取必须幂等收敛，不能留下 run/checklist 相反终态或重复 assistant；

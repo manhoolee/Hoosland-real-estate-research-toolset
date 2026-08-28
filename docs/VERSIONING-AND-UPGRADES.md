@@ -7,15 +7,15 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.4` | 后端、前端和公开应用行为版本；已上线 V2 / slot-b |
-| Build ID | `v0.2.4-task-checklist-20260828T043537Z` | 从前一线上 Build 精确派生并完成原子切换 |
-| System Prompt | `real-estate-system-v0.2.3` | 全局身份、安全、证据、权限、任务复核和执行规则 |
+| Application SemVer | `0.2.5` | 后端、前端和公开应用行为版本；已上线 V2 / slot-b |
+| Build ID | `v0.2.5-todo-write-recovery-20260828T090530Z` | 从前一线上 Build 精确派生并完成原子切换 |
+| System Prompt | `real-estate-system-v0.2.4` | 全局身份、安全、证据、权限、任务复核和执行规则 |
 | Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
 | Project state Schema | `2.1.0` | Skill 使用的持久化 project_state / case payload 契约 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection |
 | Run checklist sidecar Schema | `1` | 按 run 保存任务与成果复核快照 |
 
-这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。V0.2.4 因此为运行清单建立独立 sidecar Schema `1`，不借用 usage 或 project state 的版本号。
+这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。V0.2.4 因此为运行清单建立独立 sidecar Schema `1`，不借用 usage 或 project state 的版本号；V0.2.5 只改变拒绝后的运行协调，sidecar 字段和复核语义不变，因此继续使用 Schema `1`。
 
 V0.2.2 的 `usage.json` 使用独立 sidecar Schema `1`。文件缺失等价于 0，应用在首次收到新 usage 时惰性创建，旧 V0.2.1 会忽略它；不需要迁移，但升级前的历史 Token不会被推算或回填。Skill 所消费的 project_state / case payload 继续为 `2.1.0`，此次没有修改 case 文件或 Skill 契约。
 
@@ -111,15 +111,24 @@ V0.2.2 将 Application 从 `0.2.1` 升至 `0.2.2`，新增对话 Token 用量统
 
 ## 8. 当前 Build 的升级摘要
 
+V0.2.5 todo/write recovery（Build ID：`v0.2.5-todo-write-recovery-20260828T090530Z`）：
+
+- 以线上 V0.2.4 记录 commit `6351cd2622a6903796a24e655ab2a98c02005fb1` 为父基线，发布分支为 `release/v0.2.5-todo-write-recovery`，部署源码 commit 为 `914dc8f12a41a54ee2233f70834f24ed16330dcd`；
+- Application 升至 `0.2.5`，System Prompt 升至 `real-estate-system-v0.2.4`；Skill bundle、Project state Schema、usage sidecar 与 checklist sidecar Schema 均不变；
+- 持久化层仍拒绝非法快照；已有 accepted baseline 时，应用把最后一张已接受快照作为同一根 Harness session 的权威纠正，要求精确重置，并以 prompt receipt 和后续 root idle 封闭完整纠正 turn；首张非法且没有基线时直接失败关闭；
+- recovery pending 时禁止其他实质操作和 final；注入、存储、协议或重复恢复失败均 fail closed，无配置、依赖或数据迁移；
+- 已于 `2026-08-28T09:36:50Z` 上线 V2 / slot-b；直接回滚点为完整 V0.2.4 release。
+
+### 前一线上与直接回滚 Build
+
 V0.2.4 task checklist（Build ID：`v0.2.4-task-checklist-20260828T043537Z`）：
 
 - 以线上 V0.2.3 部署记录 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 为唯一父基线，发布分支为 `release/v0.2.4-task-checklist`，部署源码 commit 为 `de24812edb0920d728b0e1ea7d9e0954218ef7ce`；
-- Application 升至 `0.2.4`，System Prompt 升至 `real-estate-system-v0.2.3`；Skill bundle、Project state Schema 与 usage sidecar 不变；
-- 使用 Harness 原生 `todo_write` / `todo/write` 建立任务与成果要求的整表快照，应用新增 Run checklist sidecar Schema `1`，并在 SSE、消息与恢复链路中发送完整 revision；
-- 未完成或未复核项目在终态保留为未完成；文件成果还需与本轮 canonical outputs 的真实变化一致；
-- 已于 `2026-08-28T06:09:01Z` 上线 V2 / slot-b；直接回滚点为完整 V0.2.3 release，新增 checklist sidecar 可保留并由旧代码忽略。
+- Application 升至 `0.2.4`，System Prompt 升至 `real-estate-system-v0.2.3`，首次建立 Run checklist sidecar Schema `1`；
+- 使用 Harness 原生 `todo_write` / `todo/write` 建立任务与成果要求的整表快照，并在 SSE、消息与恢复链路中发送完整 revision；
+- 已于 `2026-08-28T06:09:01Z` 上线 V2 / slot-b；V0.2.5 上线后作为直接回滚点保留。
 
-### 前一线上与直接回滚 Build
+### 更早线上 Build
 
 V0.2.3 output persistence Build（Build ID：`v0.2.3-output-persistence-20260828T040220Z`）：
 
@@ -129,7 +138,7 @@ V0.2.3 output persistence Build（Build ID：`v0.2.3-output-persistence-20260828
 - 不复制共享临时目录，不自动提升来源不确定的文件，不修改历史 conversation；回滚单位是整个 V0.2.3 应用与匹配的 System Prompt；
 - V1 / slot-a 不变，V0.2.2 Token 统计与 usage sidecar 继续兼容。
 
-### 上一 Build
+### 更早 Build
 
 V0.2.2 Token usage visibility Build（Build ID：`v0.2.2-conversation-token-usage-20260828T023809Z`）：
 
