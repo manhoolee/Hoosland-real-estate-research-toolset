@@ -24,18 +24,20 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
-| 工作台应用 | `0.2.1` | FastAPI、React、API、文件、长任务恢复与管理配置 |
-| 当前 Build | `v0.2.1-production-sync-version-info-20260827T062425Z` | 每次部署唯一；应用 SemVer 不替代 Build 身份 |
+| 工作台应用 | `0.2.2` | FastAPI、React、API、文件、长任务恢复与管理配置 |
+| 当前 Build | `v0.2.2-conversation-token-usage-20260828T023809Z` | 本次不可变发布构建标识 |
 | System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和交付规则 |
 | Skill 套件 | `2.3.1` | 1 个总控 + 10 个专项 Skill |
-| 项目状态 Schema | `2.1.0` | 仅在持久化数据契约变化时升级；Demo 阶段可能不兼容，迁移或重建路径见发布说明 |
+| 项目状态 Schema | `2.1.0` | Skill 使用的 project_state / case payload 契约，本次不变 |
+| Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection；兼容、惰性创建 |
 
-V0.2.1 把已经在线验证的 controller-first、默认双格式和失败关闭行为正式归档到可重建源码，并关闭 Application `0.2.0` / Skill `2.3.0` 共用不同内容的版本债务。页面现可查看实时应用版本、Build ID、本次修改内容和 GitHub 源码。
+V0.2.2 在不修改 System Prompt 与 Skill 套件的前提下，新增按对话累计的 Provider Token 消耗：运行中通过 SSE 更新，刷新后从独立的 `usage.json` accounting sidecar 恢复，并显示在输入框上方。Project state Schema 保持 `2.1.0`；新增独立的 usage sidecar Schema `1`。旧对话没有 sidecar 时返回 0并在首次记录时惰性创建，不做迁移，也不回填历史 Token。
 
 ## 核心能力
 
 - 项目、多对话、附件、历史记录和成果文件管理；
 - REST + SSE 长任务，支持取消、失败重试和页面刷新后的后台任务恢复；
+- 按 conversation 累计并实时展示主 Agent、子 Agent、重试与压缩步骤中可观察到的 Provider Token 用量；
 - 每个对话独立使用 `inputs / work / outputs` 工作区；
 - 服务端在每轮 Prompt 首行确定性提交 `comprehensive-real-estate-expert` 总控命令，再由总控依据 Skill 描述调用所需子 Skill；用户不需要记忆 slash command；
 - 文件型正式交付链：**总控 → 业务专项 → 编辑 → 设计 → 按需 PDF → 交付 QA**；
@@ -49,7 +51,7 @@ V0.2.1 把已经在线验证的 controller-first、默认双格式和失败关�
 flowchart TD
   U[用户] --> SPA[React / TypeScript SPA]
   SPA -->|REST + SSE| API[FastAPI Orchestrator]
-  API --> STORE[Conversation Store\nmessages / files / run state]
+  API --> STORE[Conversation Store\nmessages / files / run state / usage sidecar]
   API --> RUNTIME[Agent Runtime]
   RUNTIME --> LLM[LLM]
   RUNTIME --> H[DeepSeek Harness + Cordis\n沙箱 / 会话 / 工具 / 取消恢复]
@@ -181,11 +183,12 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-V0.2.1 源码快照已通过 86 个后端单元/HTTP 测试、Python 编译、前端类型检查与生产构建，以及 Skill v2.3.1 smoke tests；版本界面另完成 1440、1024、375 和 320px 浏览器验收。自动化测试不等同于真实模型、真实 Provider 和 PDF 的生产验收。
+V0.2.2 源码快照已通过 94 个后端单元/HTTP 测试、Python 编译、前端类型检查与生产构建；System Prompt 与 Skill v2.3.1 未变化。自动化测试不等同于真实模型、真实 Provider 和 PDF 的生产验收。
 
 ## 数据与安全边界
 
 - 对话、附件、过程文件、成品和 Harness session 按 conversation 隔离；
+- `usage.json` 是每个 conversation 下独立、可选的统计 sidecar，不包含消息正文；其独立 Schema 为 `1`，缺失时按 0 处理，不改变 project_state Schema `2.1.0`；
 - 管理配置中的 API 密钥加密保存，但业务消息和附件本身不是应用层全量加密；
 - 管理员登录保护历史列表和配置后台，不构成完整的多租户 IAM；
 - `/mcp` 仅供内部 Harness 使用，生产反向代理应阻断公网访问；
@@ -225,6 +228,7 @@ V0.2.1 源码快照已通过 86 个后端单元/HTTP 测试、Python 编译、�
 - [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
+- [V0.2.2 发布说明](docs/releases/v0.2.2/RELEASE-NOTES.md)
 - [V0.2.1 发布说明](docs/releases/v0.2.1/RELEASE-NOTES.md)
 - [V0.2.0 发布说明](docs/releases/v0.2.0/RELEASE-NOTES.md)
 - [更新记录](CHANGELOG.md)

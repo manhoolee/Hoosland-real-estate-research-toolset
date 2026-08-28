@@ -1,21 +1,21 @@
 export const RELEASE_INFO = {
-  releasedAt: "2026-08-27",
-  iteration: "生产基线归档与版本信息可见",
-  compatibility: "兼容更新 · 无数据迁移",
+  releasedAt: "2026-08-28",
+  iteration: "对话 Token 消耗可见",
+  compatibility: "兼容更新 · usage sidecar v1 · 无迁移",
   summary:
-    "将已在线验证的总控优先、默认双格式与失败关闭行为纳入可重建源码基线，并补齐公开版本身份。",
+    "按对话累计并实时展示 Provider 返回的 Token 消耗，刷新、取消和失败后仍可恢复已记录用量。",
   changes: [
     {
-      title: "生产行为归档",
-      description: "固化总控优先路由、总控缺失时失败关闭，以及本轮输出格式审计。",
+      title: "对话级累计",
+      description: "按 conversation 汇总主 Agent、子 Agent、重试与压缩步骤的 Provider 用量。",
     },
     {
-      title: "默认双格式交付",
-      description: "地产研究与报告类任务在未指定格式时默认生成 Markdown 与独立 HTML。",
+      title: "实时可见",
+      description: "输入框上方持续显示当前对话累计 Token，并通过流式事件同步最新数值。",
     },
     {
-      title: "版本来源可见",
-      description: "页面展示实时应用版本与 Build ID，并提供 GitHub 源码和完整更新记录入口。",
+      title: "兼容持久化",
+      description: "用量保存为可选 sidecar；旧对话无需迁移，旧版本也可忽略该文件。",
     },
   ],
 } as const;

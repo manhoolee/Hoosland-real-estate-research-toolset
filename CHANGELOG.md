@@ -11,6 +11,31 @@
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
 
+## App 0.2.2 Build `v0.2.2-conversation-token-usage-20260828T023809Z` / System Prompt v0.2.1 / Skill 2.3.1 / Usage sidecar 1 — 2026-08-28
+
+### 对话 Token 消耗
+
+- 按 `conversation_id` 累计 Harness 可观察到的 Provider usage，并在输入框上方显示当前对话累计 Token；
+- 新增 `GET /api/conversations/{conversation_id}/usage`，消息 SSE 同步发送初始与增量 `usage` snapshot，刷新和切换对话后可恢复；
+- 统计包含主 Agent、SDK 通知树中的子 Agent、实际开始的重试 attempt，以及成功落盘的 `compaction/summary`；
+- 同一 attempt 的 usage chunk 与最终 assistant message 使用后值替换，不重复累计；`reasoning_tokens` 保留为 `output_tokens` 子项明细，不再次加入 `total_tokens`；
+- 取消、失败和服务重启前已经持久化的 usage 保留；旧事件重放通过 session event seq 去重。
+
+### 数据与兼容性
+
+- Application 从 `0.2.1` 升至 `0.2.2`；System Prompt 保持 `real-estate-system-v0.2.1`，Skill bundle 保持 `2.3.1`；
+- 每个 conversation 可新增独立、可选的 `usage.json` accounting sidecar；旧对话没有该文件时返回 0，旧 V0.2.1 会忽略该文件；
+- Project state Schema 保持 `2.1.0`；`usage.json` 使用独立 Conversation usage sidecar Schema `1`，缺失等价于 0并可惰性创建，因此无迁移；升级前的历史 Token 不回填；
+- 回滚到 V0.2.1 时保留 sidecar，无需删除或改写 conversation 数据；V0.2.1 不会更新统计，重新升级后会留下回滚期间不可恢复的用量缺口；
+- Python requirements、Node dependencies、System Prompt 与 Skill 内容均未变化。
+
+### 验证
+
+- 后端单元与 HTTP 回归：94 项全部通过；
+- Python 编译、前端 TypeScript 检查与生产构建：通过；
+- 自动化覆盖 chunk/final 替换、重试、子 Agent、压缩、取消、持久化、旧对话缺省、404 与 conversation 隔离；
+- 候选 Build 已冻结为 `v0.2.2-conversation-token-usage-20260828T023809Z`；正式切换前后均需补充真实 Provider 验收证据。
+
 ## App 0.2.1 Build `v0.2.1-production-sync-version-info-20260827T062425Z` / Skill 2.3.1 — 2026-08-27
 
 ### 生产基线与版本身份

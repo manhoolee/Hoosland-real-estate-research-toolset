@@ -199,7 +199,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.1",
+                "version": "0.2.2",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -208,7 +208,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.1", ready.json()["version"])
+        self.assertEqual("0.2.2", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
@@ -533,6 +533,189 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(["html", "md"], completed[-1]["run_output_formats"])
         self.assertTrue(completed[-1]["default_output_pair_present_this_run"])
 
+    def test_provider_usage_streams_and_persists_by_conversation(self) -> None:
+        missing = self.client.get(
+            "/api/conversations/conversation_missing_000/usage"
+        )
+        self.assertEqual(404, missing.status_code)
+
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del session_generation
+            root_session = f"root-{run_id}"
+
+            def emit(
+                session_id: str,
+                event_type: str,
+                seq: int,
+                data: dict[str, object],
+            ) -> None:
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {"type": event_type, "seq": seq, "data": data},
+                        },
+                    }
+                )
+
+            emit(
+                root_session,
+                "assistant/chunk",
+                1,
+                {
+                    "turn": 1,
+                    "step": 1,
+                    "chunk": {
+                        "type": "usage",
+                        "usage": {
+                            "inputTokens": 100,
+                            "outputTokens": 10,
+                            "reasoningTokens": 9,
+                            "cacheReadTokens": 20,
+                            "cacheWriteTokens": 5,
+                        },
+                    },
+                },
+            )
+            emit(
+                root_session,
+                "assistant/message",
+                2,
+                {
+                    "turn": 1,
+                    "step": 1,
+                    "usage": {
+                        "inputTokens": 110,
+                        "outputTokens": 12,
+                        "reasoningTokens": 10,
+                        "cacheReadTokens": 25,
+                        "cacheWriteTokens": 5,
+                    },
+                },
+            )
+            emit(
+                f"child-{run_id}",
+                "assistant/message",
+                1,
+                {
+                    "turn": 1,
+                    "step": 1,
+                    "usage": {
+                        "inputTokens": 30,
+                        "outputTokens": 4,
+                        "reasoningTokens": 2,
+                        "cacheReadTokens": 2,
+                    },
+                },
+            )
+            emit(
+                root_session,
+                "llm/retry-started",
+                3,
+                {"turn": 1, "step": 1, "retry": 1},
+            )
+            emit(
+                root_session,
+                "assistant/message",
+                4,
+                {
+                    "turn": 1,
+                    "step": 1,
+                    "usage": {
+                        "inputTokens": 55,
+                        "outputTokens": 4,
+                        "reasoningTokens": 3,
+                    },
+                },
+            )
+            emit(
+                root_session,
+                "compaction/summary",
+                5,
+                {
+                    "compactionId": "compact-1",
+                    "usage": {
+                        "inputTokens": 20,
+                        "outputTokens": 2,
+                        "reasoningTokens": 1,
+                        "cacheReadTokens": 3,
+                    },
+                },
+            )
+            # A replayed durable event must not bill the compaction twice.
+            emit(
+                root_session,
+                "compaction/summary",
+                5,
+                {
+                    "compactionId": "compact-1",
+                    "usage": {
+                        "inputTokens": 20,
+                        "outputTokens": 2,
+                        "reasoningTokens": 1,
+                        "cacheReadTokens": 3,
+                    },
+                },
+            )
+            await asyncio.sleep(0)
+            return HarnessRunResult(
+                final_response="usage complete",
+                finish_reason="stop",
+                session_id=root_session,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "measure this", "attachment_ids": []},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn("event: usage", response.text)
+        self.assertIn('"total_tokens":272', response.text)
+        self.assertLess(
+            response.text.rfind('"type":"usage"'),
+            response.text.index('"type":"final"'),
+        )
+        self.assertNotIn("sessionId", response.text)
+        self.assertNotIn("root-", response.text)
+        usage_response = self.client.get(
+            f"/api/conversations/{conversation_id}/usage"
+        )
+        self.assertEqual(200, usage_response.status_code)
+        self.assertEqual(conversation_id, usage_response.json()["conversation_id"])
+        self.assertEqual(
+            {
+                "uncached_input_tokens": 215,
+                "output_tokens": 22,
+                "reasoning_tokens": 16,
+                "cache_read_tokens": 30,
+                "cache_write_tokens": 5,
+                "total_tokens": 272,
+                "updated_at": usage_response.json()["usage"]["updated_at"],
+                "includes_subagents": True,
+                "source": "provider_reported",
+            },
+            usage_response.json()["usage"],
+        )
+        self.assertIsNotNone(usage_response.json()["usage"]["updated_at"])
+
+        other_conversation = self.client.post("/api/conversations", json={}).json()["id"]
+        other_usage = self.client.get(
+            f"/api/conversations/{other_conversation}/usage"
+        ).json()["usage"]
+        self.assertEqual(0, other_usage["total_tokens"])
+
     def test_config_generation_swap_blocks_new_agent_runs(self) -> None:
         logged_in = self.client.post(
             "/api/admin/login",
@@ -598,15 +781,37 @@ class HttpApiTests(unittest.TestCase):
         async def fake_run(
             _conversation_id: str,
             prompt: str,
-            _on_notification: object,
+            on_notification: object,
             *,
             run_id: str,
             session_generation: int = 0,
         ) -> HarnessRunResult:
-            del run_id
             call_index = len(calls)
             calls.append((session_generation, prompt))
             if call_index == 0:
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": f"root-{run_id}",
+                            "event": {
+                                "type": "assistant/chunk",
+                                "seq": 1,
+                                "data": {
+                                    "turn": 1,
+                                    "step": 1,
+                                    "chunk": {
+                                        "type": "usage",
+                                        "usage": {
+                                            "inputTokens": 21,
+                                            "outputTokens": 3,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    }
+                )
                 first_started.set()
                 await asyncio.to_thread(release_first.wait, 2)
                 return HarnessRunResult(
@@ -661,6 +866,10 @@ class HttpApiTests(unittest.TestCase):
         ).json()["status"])
         metadata = self.app.state.store.read_meta(conversation_id)
         self.assertEqual(1, metadata["agent_session_generation"])
+        cancelled_usage = self.client.get(
+            f"/api/conversations/{conversation_id}/usage"
+        ).json()["usage"]
+        self.assertEqual(24, cancelled_usage["total_tokens"])
 
         continued = self.client.post(
             f"/api/conversations/{conversation_id}/messages",

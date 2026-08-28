@@ -23,6 +23,7 @@ import {
   getCapabilities,
   getConversation,
   getConversationRun,
+  getConversationUsage,
   getReleaseIdentity,
   listFiles,
   listMessages,
@@ -52,6 +53,7 @@ import type {
   CapabilityState,
   CapabilityView,
   ChatMessage,
+  TokenUsage,
   WorkspaceFile,
 } from "./types";
 
@@ -59,6 +61,14 @@ const SESSION_CONVERSATION_KEY = `${STORAGE_NAMESPACE}:conversation`;
 const SESSION_PROJECT_KEY = `${STORAGE_NAMESPACE}:project`;
 const HOOSLAND_HOME_URL = "http://hoosland.com/";
 const RECOVERY_RECONNECT_NOTICE = "后台任务仍在运行，页面正在重新连接；无需重复发送。";
+
+const EMPTY_TOKEN_USAGE: TokenUsage = {
+  uncachedInputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  totalTokens: 0,
+};
 
 const capabilityDefinitions = [
   {
@@ -216,6 +226,38 @@ function errorStatus(error: unknown): number | undefined {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
+}
+
+function mergeTokenUsage(previous: TokenUsage | undefined, next: TokenUsage): TokenUsage {
+  if (!previous) return next;
+  const previousTime = Date.parse(previous.updatedAt || "");
+  const nextTime = Date.parse(next.updatedAt || "");
+  if (Number.isFinite(previousTime) && Number.isFinite(nextTime)) {
+    return nextTime < previousTime ? previous : next;
+  }
+  if (Number.isFinite(nextTime)) return next;
+
+  const merged = {
+    ...next,
+    conversationId: next.conversationId || previous.conversationId,
+    uncachedInputTokens: Math.max(previous.uncachedInputTokens, next.uncachedInputTokens),
+    outputTokens: Math.max(previous.outputTokens, next.outputTokens),
+    cacheReadTokens: Math.max(previous.cacheReadTokens, next.cacheReadTokens),
+    cacheWriteTokens: Math.max(previous.cacheWriteTokens, next.cacheWriteTokens),
+    reasoningTokens: Math.max(previous.reasoningTokens || 0, next.reasoningTokens || 0),
+    updatedAt: previous.updatedAt,
+  };
+  return {
+    ...merged,
+    totalTokens: Math.max(
+      previous.totalTokens,
+      next.totalTokens,
+      merged.uncachedInputTokens +
+        merged.outputTokens +
+        merged.cacheReadTokens +
+        merged.cacheWriteTokens,
+    ),
+  };
 }
 
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -422,6 +464,9 @@ export default function App() {
   const conversationIdRef = useRef<string | null>(initialIdRef.current);
   const conversationPromiseRef = useRef<Promise<string> | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [tokenUsageByConversation, setTokenUsageByConversation] = useState<
+    Record<string, TokenUsage>
+  >({});
   const [files, setFiles] = useState<WorkspaceFile[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityView[]>(createInitialCapabilities);
   const [serviceState, setServiceState] = useState<ServiceState>("checking");
@@ -455,6 +500,15 @@ export default function App() {
   const readyFiles = useMemo(
     () => files.filter((file) => file.status === "ready" && file.kind !== "output"),
     [files],
+  );
+  const tokenUsage = useMemo(
+    () => conversationId
+      ? tokenUsageByConversation[conversationId] || {
+          ...EMPTY_TOKEN_USAGE,
+          conversationId,
+        }
+      : EMPTY_TOKEN_USAGE,
+    [conversationId, tokenUsageByConversation],
   );
   const isUploading = files.some((file) => file.status === "uploading");
 
@@ -513,6 +567,23 @@ export default function App() {
     setTerminationPending(options.terminationPending === true);
   }, [commitContextIds]);
 
+  const applyConversationTokenUsage = useCallback((id: string, next: TokenUsage) => {
+    if (next.conversationId && next.conversationId !== id) return;
+    const usage = { ...next, conversationId: id };
+    setTokenUsageByConversation((current) => {
+      const merged = mergeTokenUsage(current[id], usage);
+      return merged === current[id] ? current : { ...current, [id]: merged };
+    });
+  }, []);
+
+  const refreshConversationTokenUsage = useCallback(async (
+    id: string,
+    signal?: AbortSignal,
+  ) => {
+    const usage = await getConversationUsage(id, signal);
+    applyConversationTokenUsage(id, usage);
+  }, [applyConversationTokenUsage]);
+
   const refreshCapabilities = useCallback(async () => {
     try {
       const response = await getCapabilities();
@@ -535,6 +606,31 @@ export default function App() {
       .catch(() => setReleaseIdentity(null));
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    if (!conversationId) return;
+    const controller = new AbortController();
+    let requestActive = false;
+    const refresh = async () => {
+      if (requestActive || controller.signal.aborted) return;
+      requestActive = true;
+      try {
+        await refreshConversationTokenUsage(conversationId, controller.signal);
+      } catch (error) {
+        // Usage is supplementary UI. A rolling deploy may briefly expose the
+        // frontend before the endpoint, so keep chat functionality unaffected.
+        if (isAbortError(error)) return;
+      } finally {
+        requestActive = false;
+      }
+    };
+    void refresh();
+    const interval = isSending ? window.setInterval(() => void refresh(), 1_500) : undefined;
+    return () => {
+      controller.abort();
+      if (interval !== undefined) window.clearInterval(interval);
+    };
+  }, [conversationId, isSending, refreshConversationTokenUsage]);
 
   const beginDetachedRunRecovery = useCallback((
     nextProjectId: string,
@@ -829,6 +925,9 @@ export default function App() {
                     : message.progress,
               }));
             },
+            onUsage: (usage) => {
+              if (id) applyConversationTokenUsage(id, usage);
+            },
           },
           controller.signal,
         );
@@ -938,7 +1037,12 @@ export default function App() {
         }
       }
     },
-    [ensureConversation, reconcileConversation, updateAssistantMessage],
+    [
+      applyConversationTokenUsage,
+      ensureConversation,
+      reconcileConversation,
+      updateAssistantMessage,
+    ],
   );
 
   const handleSend = useCallback(() => {
@@ -1398,6 +1502,7 @@ export default function App() {
           />
           <Composer
             value={draft}
+            tokenUsage={tokenUsage}
             attachedFileCount={readyFiles.length}
             isSending={isSending}
             isStopping={isStopping}

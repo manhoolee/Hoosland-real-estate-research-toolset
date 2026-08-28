@@ -1,8 +1,26 @@
 import { ArrowUp, Paperclip, Stop } from "@phosphor-icons/react";
-import { useLayoutEffect, useRef } from "react";
+import { useId, useLayoutEffect, useRef } from "react";
+import type { TokenUsage } from "../types";
+
+const exactTokenFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 });
+
+function formatTokenCount(value: number): string {
+  const count = Math.max(0, Math.trunc(value));
+  if (count < 1_000) return exactTokenFormatter.format(count);
+  const units = [
+    { threshold: 1_000_000_000, suffix: "B" },
+    { threshold: 1_000_000, suffix: "M" },
+    { threshold: 1_000, suffix: "K" },
+  ];
+  const unit = units.find(({ threshold }) => count >= threshold) || units[2];
+  const scaled = count / unit.threshold;
+  const digits = scaled >= 100 ? 0 : 1;
+  return `${Number(scaled.toFixed(digits))}${unit.suffix}`;
+}
 
 interface ComposerProps {
   value: string;
+  tokenUsage: TokenUsage;
   attachedFileCount: number;
   isSending: boolean;
   isStopping: boolean;
@@ -17,6 +35,7 @@ interface ComposerProps {
 
 export function Composer({
   value,
+  tokenUsage,
   attachedFileCount,
   isSending,
   isStopping,
@@ -28,6 +47,7 @@ export function Composer({
   onStop,
   onFilesSelected,
 }: ComposerProps) {
+  const usageDetailsId = useId();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composingRef = useRef(false);
@@ -37,6 +57,17 @@ export function Composer({
     !isSending &&
     !isStopping &&
     !terminationPending;
+  const totalTokens = Math.max(0, Math.trunc(tokenUsage.totalTokens));
+  const usageAnnouncement = [
+    `本对话已消耗 ${exactTokenFormatter.format(totalTokens)} Tokens`,
+    `非缓存输入 ${exactTokenFormatter.format(tokenUsage.uncachedInputTokens)}`,
+    `输出 ${exactTokenFormatter.format(tokenUsage.outputTokens)}`,
+    tokenUsage.reasoningTokens
+      ? `其中推理 ${exactTokenFormatter.format(tokenUsage.reasoningTokens)}`
+      : "",
+    `缓存读取 ${exactTokenFormatter.format(tokenUsage.cacheReadTokens)}`,
+    `缓存写入 ${exactTokenFormatter.format(tokenUsage.cacheWriteTokens)}`,
+  ].filter(Boolean).join("，");
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -47,6 +78,32 @@ export function Composer({
 
   return (
     <div className="composer-region">
+      <div className="token-usage-meter">
+        <span className="token-usage-track" aria-hidden="true" />
+        <output
+          className={`token-usage-readout${isSending ? " is-running" : ""}`}
+          aria-live="polite"
+          aria-atomic="true"
+          aria-label={usageAnnouncement}
+          aria-describedby={usageDetailsId}
+          tabIndex={0}
+        >
+          <span className="token-usage-dot" aria-hidden="true" />
+          <span>本对话已消耗</span>
+          <strong>{formatTokenCount(totalTokens)}</strong>
+          <span>Tokens</span>
+          {isSending ? <span className="token-usage-live">计量中</span> : null}
+        </output>
+        <span id={usageDetailsId} className="token-usage-tooltip" role="tooltip">
+          <span>非缓存输入 {exactTokenFormatter.format(tokenUsage.uncachedInputTokens)}</span>
+          <span>输出 {exactTokenFormatter.format(tokenUsage.outputTokens)}</span>
+          {tokenUsage.reasoningTokens ? (
+            <span>其中推理 {exactTokenFormatter.format(tokenUsage.reasoningTokens)}</span>
+          ) : null}
+          <span>缓存读取 {exactTokenFormatter.format(tokenUsage.cacheReadTokens)}</span>
+          <span>缓存写入 {exactTokenFormatter.format(tokenUsage.cacheWriteTokens)}</span>
+        </span>
+      </div>
       <div className="composer-box">
         <label className="sr-only" htmlFor="message-input">
           输入你的问题

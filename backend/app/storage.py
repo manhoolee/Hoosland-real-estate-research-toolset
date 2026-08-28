@@ -25,6 +25,13 @@ CLIENT_REQUEST_ID_RE = re.compile(
 RUN_STATUSES = frozenset(
     {"idle", "running", "succeeded", "failed", "cancelled", "interrupted"}
 )
+TOKEN_USAGE_BUCKET_FIELDS = (
+    "uncached_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
 
 
 class StorageError(RuntimeError):
@@ -53,6 +60,22 @@ class FileNotFound(StorageError):
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _zero_token_usage() -> dict[str, int]:
+    return {field: 0 for field in TOKEN_USAGE_BUCKET_FIELDS}
+
+
+def _validated_token_usage_buckets(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise StorageError("conversation token usage buckets are invalid")
+    result: dict[str, int] = {}
+    for field in TOKEN_USAGE_BUCKET_FIELDS:
+        item = value.get(field, 0 if field == "reasoning_tokens" else None)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise StorageError("conversation token usage buckets are invalid")
+        result[field] = item
+    return result
 
 
 def sanitize_filename(value: str | None) -> str:
@@ -99,6 +122,7 @@ class ConversationPaths:
     messages: Path
     files: Path
     run: Path
+    usage: Path
 
 
 class ConversationStore:
@@ -144,6 +168,7 @@ class ConversationStore:
             messages=root / "messages.jsonl",
             files=root / "files.json",
             run=root / "run.json",
+            usage=root / "usage.json",
         )
 
     def create_or_reuse(
@@ -191,6 +216,15 @@ class ConversationStore:
                     "status": "idle",
                     "updated_at": now,
                     "retryable": False,
+                },
+            )
+            self._atomic_json(
+                paths.usage,
+                {
+                    "version": 1,
+                    "totals": _zero_token_usage(),
+                    "updated_at": None,
+                    "samples": {},
                 },
             )
             paths.messages.touch(mode=0o640)
@@ -297,6 +331,162 @@ class ConversationStore:
             value["updated_at"] = utc_now()
             self._atomic_json(paths.meta, value)
             return value
+
+    def read_token_usage(self, conversation_id: str) -> dict[str, Any]:
+        """Read durable provider-reported usage, defaulting old chats to zero."""
+
+        paths = self.require(conversation_id)
+        if not paths.usage.exists():
+            return {
+                "version": 1,
+                "totals": _zero_token_usage(),
+                "updated_at": None,
+                "samples": {},
+            }
+        if paths.usage.is_symlink() or not paths.usage.is_file():
+            raise StorageError("conversation token usage state is missing or unsafe")
+        try:
+            with paths.usage.open("r", encoding="utf-8") as handle:
+                value = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise StorageError("conversation token usage state is invalid") from exc
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise StorageError("conversation token usage state is invalid")
+
+        totals = _validated_token_usage_buckets(value.get("totals"))
+        samples = value.get("samples")
+        if not isinstance(samples, dict):
+            raise StorageError("conversation token usage samples are invalid")
+        normalized_samples: dict[str, dict[str, Any]] = {}
+        for sample_id, sample in samples.items():
+            if not isinstance(sample_id, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", sample_id
+            ):
+                raise StorageError("conversation token usage sample id is invalid")
+            if not isinstance(sample, dict):
+                raise StorageError("conversation token usage sample is invalid")
+            seq = sample.get("seq")
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+                raise StorageError("conversation token usage sample seq is invalid")
+            normalized_samples[sample_id] = {
+                "seq": seq,
+                "buckets": _validated_token_usage_buckets(sample.get("buckets")),
+            }
+
+        updated_at = value.get("updated_at")
+        if updated_at is not None:
+            _timestamp(updated_at, "token usage updated_at")
+        active_run_id = value.get("active_run_id")
+        if active_run_id is not None and (
+            not isinstance(active_run_id, str) or not RUN_ID_RE.fullmatch(active_run_id)
+        ):
+            raise StorageError("conversation token usage run id is invalid")
+        return {
+            "version": 1,
+            "totals": totals,
+            "updated_at": updated_at,
+            "samples": normalized_samples,
+            **(
+                {"active_run_id": active_run_id}
+                if isinstance(active_run_id, str)
+                else {}
+            ),
+        }
+
+    def begin_token_usage_run(
+        self,
+        conversation_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Open a new accounting run without discarding replay protection."""
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_token_usage(conversation_id)
+            if previous.get("active_run_id") == run_id:
+                return previous
+            value = {
+                "version": 1,
+                "totals": previous["totals"],
+                "updated_at": previous.get("updated_at"),
+                "active_run_id": run_id,
+                "samples": previous["samples"],
+            }
+            self._atomic_json(paths.usage, value)
+            return value
+
+    def record_token_usage(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+        session_id: str,
+        event_seq: int,
+        turn: int,
+        step: int,
+        attempt: int,
+        buckets: dict[str, int],
+        sample_kind: str = "model_step",
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically replace one attempt sample and update conversation totals.
+
+        Samples from an early usage chunk and the finalized assistant message
+        share the same run/session/turn/step/attempt key.  Different retry
+        attempts deliberately use different keys and are therefore additive.
+        """
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session id is invalid")
+        if sample_kind not in {"model_step", "compaction"}:
+            raise ValueError("token usage sample kind is invalid")
+        for name, item in (
+            ("event seq", event_seq),
+            ("turn", turn),
+            ("step", step),
+            ("attempt", attempt),
+        ):
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ValueError(f"{name} is invalid")
+        normalized = _validated_token_usage_buckets(buckets)
+        sample_material = "\0".join(
+            (run_id, session_id, sample_kind, str(turn), str(step), str(attempt))
+        ).encode("utf-8")
+        sample_id = hashlib.sha256(sample_material).hexdigest()
+
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous_state = self.read_token_usage(conversation_id)
+            samples = dict(previous_state["samples"])
+            previous_entry = samples.get(sample_id)
+            if previous_entry is not None and event_seq <= previous_entry["seq"]:
+                return previous_state, False
+            previous_sample = (
+                previous_entry["buckets"] if previous_entry is not None else None
+            )
+
+            totals = dict(previous_state["totals"])
+            for field in TOKEN_USAGE_BUCKET_FIELDS:
+                totals[field] = (
+                    totals[field]
+                    - (previous_sample.get(field, 0) if previous_sample else 0)
+                    + normalized[field]
+                )
+                if totals[field] < 0:
+                    raise StorageError("conversation token usage total became invalid")
+            samples[sample_id] = {"seq": event_seq, "buckets": normalized}
+            value = {
+                "version": 1,
+                "totals": totals,
+                "updated_at": utc_now(),
+                "active_run_id": previous_state.get("active_run_id") or run_id,
+                "samples": samples,
+            }
+            self._atomic_json(paths.usage, value)
+            return value, True
 
     def read_run(self, conversation_id: str) -> dict[str, Any]:
         """Return the durable, content-free state of the latest research turn.

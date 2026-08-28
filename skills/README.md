@@ -15,4 +15,4 @@
 bash ./tests/run_smoke_tests.sh
 ```
 
-`manifest.json` 是套件版本和 Skill 顺序的机器可读清单。项目状态文件中的 Schema `2.1.0` 与套件版本 `2.3.1` 独立管理。
+`manifest.json` 是套件版本和 Skill 顺序的机器可读清单。Skill 使用的 project_state / case payload Schema 仍为 `2.1.0`，套件版本仍为 `2.3.1`。V0.2.2 新增的 conversation `usage.json` 使用独立 sidecar Schema `1`，不修改 case payload 或 Skill 内容。

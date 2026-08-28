@@ -104,7 +104,7 @@ PYTHON=python bash ./scripts/test.sh
 
 VITE_API_BASE_URL=/hoosland-real-estate-research-toolset \
 VITE_DEPLOYMENT_SLOT=single-linux \
-VITE_APP_VERSION=0.2.1 \
+VITE_APP_VERSION=0.2.2 \
 npm --prefix frontend run build
 
 test -s frontend/dist/index.html
@@ -119,7 +119,7 @@ test -s frontend/dist/index.html
 生成 build ID，并把 Git 跟踪文件与前端构建复制到新 release：
 
 ```bash
-HOOSLAND_BUILD_ID="$(git rev-parse --short=12 HEAD)"
+HOOSLAND_BUILD_ID="v0.2.2-conversation-token-usage-20260828T023809Z"
 HOOSLAND_RELEASE_DIR="/opt/hoosland-real-estate-research-toolset/releases/${HOOSLAND_BUILD_ID}"
 
 sudo install -d -o root -g root -m 0755 "$HOOSLAND_RELEASE_DIR"
@@ -171,7 +171,7 @@ sudoedit /etc/hoosland-real-estate-research-toolset/agent.env
 ```dotenv
 APP_ENV=production
 APP_SLOT=single-linux
-BUILD_ID=replace-with-current-git-build-id
+BUILD_ID=v0.2.2-conversation-token-usage-20260828T023809Z
 HOST=127.0.0.1
 PORT=8000
 DATA_DIR=/srv/hoosland-real-estate-research-toolset/data
@@ -318,10 +318,13 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' \
 7. 按需 PDF 的生成、文本提取和逐页渲染；
 8. 未授权访问被反向代理拒绝，公网 `/mcp` 返回 404；
 9. `journalctl`、磁盘、备份与告警入口可用。
+10. 对话运行中输入框上方的 Token 数值随 SSE 更新，刷新后与 `GET /api/conversations/{conversation_id}/usage` 一致。
 
 ## 11. 数据备份与恢复
 
-`DATA_DIR` 包含 conversation、附件、成果、Harness sessions、operation logs 与加密 runtime 配置。备份必须同时保存数据和对应的 `ADMIN_SESSION_SECRET` / `CONFIG_ENCRYPTION_KEY`，但两者不应存放在同一低权限归档中。
+`DATA_DIR` 包含 conversation、附件、成果、Harness sessions、operation logs、加密 runtime 配置，以及 V0.2.2 起每个 conversation 可选的 `usage.json` accounting sidecar。备份必须同时保存数据和对应的 `ADMIN_SESSION_SECRET` / `CONFIG_ENCRYPTION_KEY`，但两者不应存放在同一低权限归档中。
+
+`usage.json` 使用独立 sidecar Schema `1`；缺失时 V0.2.2 返回 0，V0.2.1 会忽略该文件。Project state Schema 保持 `2.1.0`。从 V0.2.1 升级不需要预生成文件或运行迁移器，但升级前的历史 Token 不会回填。
 
 优先使用文件系统或云盘的一致性快照。小型单机环境可以在维护窗口停服务后归档：
 
@@ -344,6 +347,8 @@ sudo systemctl start hoosland-real-estate-research-toolset.service
 4. 核对 Schema、配置和数据兼容性并完成备份；
 5. 记录当前 `readlink -f /opt/hoosland-real-estate-research-toolset/current`；
 6. 原子切换 symlink，重启服务并执行完整放行检查。
+
+V0.2.2 会惰性引入 usage sidecar Schema `1`：应用首次记录 Provider usage 时按 conversation 创建文件。不要为了“初始化”而批量改写旧 conversation，也不要把缺少 `usage.json` 视为数据损坏。
 
 切换命令示例：
 
@@ -375,6 +380,8 @@ sudo systemctl restart hoosland-real-estate-research-toolset.service
 ```
 
 回滚后重新检查 live、ready + `frontend_built`、外部页面、真实最小对话和成果读取。保留故障 release、日志与脱敏诊断用于复盘，不要为了回滚删除客户数据或覆盖另一份备份。
+
+从 V0.2.2 回滚到 V0.2.1 时保留 `usage.json`：旧应用不会读取或更新它，删除反而会丢失已经观测到的统计；再次升级到 V0.2.2 时可继续读取回滚前的累计值。必须接受并记录一个边界：V0.2.1 回滚运行期间产生的 Token 不会计入 sidecar，重新升级后也无法回填这段缺口。
 
 ## 14. 停用
 

@@ -92,6 +92,153 @@ class ConversationStoreTests(unittest.TestCase):
                 client_request_id="not-a-canonical-uuid",
             )
 
+    def test_token_usage_replaces_same_attempt_and_accumulates_retries(self) -> None:
+        conversation_id = "conversation_usage_001"
+        first_run = "a" * 32
+        second_run = "b" * 32
+        self.store.create_or_reuse(conversation_id)
+        self.store.begin_token_usage_run(conversation_id, first_run)
+
+        first, changed = self.store.record_token_usage(
+            conversation_id,
+            run_id=first_run,
+            session_id="root-session",
+            event_seq=1,
+            turn=1,
+            step=1,
+            attempt=0,
+            buckets={
+                "uncached_input_tokens": 10,
+                "output_tokens": 2,
+                "reasoning_tokens": 2,
+                "cache_read_tokens": 3,
+                "cache_write_tokens": 0,
+            },
+        )
+        self.assertTrue(changed)
+        self.assertEqual(10, first["totals"]["uncached_input_tokens"])
+
+        finalized, changed = self.store.record_token_usage(
+            conversation_id,
+            run_id=first_run,
+            session_id="root-session",
+            event_seq=2,
+            turn=1,
+            step=1,
+            attempt=0,
+            buckets={
+                "uncached_input_tokens": 12,
+                "output_tokens": 5,
+                "reasoning_tokens": 4,
+                "cache_read_tokens": 7,
+                "cache_write_tokens": 1,
+            },
+        )
+        self.assertTrue(changed)
+        self.assertEqual(
+            {
+                "uncached_input_tokens": 12,
+                "output_tokens": 5,
+                "reasoning_tokens": 4,
+                "cache_read_tokens": 7,
+                "cache_write_tokens": 1,
+            },
+            finalized["totals"],
+        )
+
+        child_buckets = {
+            "uncached_input_tokens": 8,
+            "output_tokens": 3,
+            "reasoning_tokens": 1,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+        self.store.record_token_usage(
+            conversation_id,
+            run_id=first_run,
+            session_id="child-session",
+            event_seq=1,
+            turn=1,
+            step=1,
+            attempt=0,
+            buckets=child_buckets,
+        )
+        retry_buckets = {
+            "uncached_input_tokens": 4,
+            "output_tokens": 1,
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+        retried, changed = self.store.record_token_usage(
+            conversation_id,
+            run_id=first_run,
+            session_id="root-session",
+            event_seq=4,
+            turn=1,
+            step=1,
+            attempt=1,
+            buckets=retry_buckets,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(24, retried["totals"]["uncached_input_tokens"])
+        self.assertEqual(9, retried["totals"]["output_tokens"])
+        repeated, changed = self.store.record_token_usage(
+            conversation_id,
+            run_id=first_run,
+            session_id="root-session",
+            event_seq=4,
+            turn=1,
+            step=1,
+            attempt=1,
+            buckets={**retry_buckets, "output_tokens": 999},
+        )
+        self.assertFalse(changed)
+        self.assertEqual(retried["totals"], repeated["totals"])
+
+        self.store.begin_token_usage_run(conversation_id, second_run)
+        second, _changed = self.store.record_token_usage(
+            conversation_id,
+            run_id=second_run,
+            session_id="root-session",
+            event_seq=1,
+            turn=1,
+            step=1,
+            attempt=0,
+            buckets={
+                "uncached_input_tokens": 2,
+                "output_tokens": 1,
+                "reasoning_tokens": 1,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        )
+        self.assertEqual(26, second["totals"]["uncached_input_tokens"])
+        self.assertEqual(10, second["totals"]["output_tokens"])
+
+        reopened = ConversationStore(self.store.root).read_token_usage(conversation_id)
+        self.assertEqual(second["totals"], reopened["totals"])
+        self.assertEqual(second_run, reopened["active_run_id"])
+
+    def test_legacy_conversation_without_usage_file_reads_as_zero(self) -> None:
+        conversation_id = "conversation_usage_old"
+        self.store.create_or_reuse(conversation_id)
+        self.store.require(conversation_id).usage.unlink()
+
+        usage = self.store.read_token_usage(conversation_id)
+
+        self.assertEqual(
+            {
+                "uncached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+            usage["totals"],
+        )
+        self.assertIsNone(usage["updated_at"])
+
     def test_identifier_cannot_escape_root(self) -> None:
         with self.assertRaises(InvalidIdentifier):
             self.store.create_or_reuse("../../outside")

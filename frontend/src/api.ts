@@ -1,4 +1,4 @@
-import type { AssistantProgress, ChatMessage, WorkspaceFile } from "./types";
+import type { AssistantProgress, ChatMessage, TokenUsage, WorkspaceFile } from "./types";
 import { createClientId } from "./clientId";
 import { API_BASE_URL } from "./deployment";
 
@@ -149,6 +149,7 @@ export interface ReleaseIdentity {
 export interface StreamCallbacks {
   onReplace: (content: string) => void;
   onProgress: (progress: AssistantProgress) => void;
+  onUsage: (usage: TokenUsage) => void;
 }
 
 const PUBLIC_PROGRESS_STAGES: Record<string, AssistantProgress> = {
@@ -472,16 +473,140 @@ export async function getConversationRun(
   };
 }
 
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function tokenNumber(
+  sources: Array<Record<string, unknown> | undefined>,
+  keys: string[],
+): number | undefined {
+  for (const source of sources) {
+    if (!source) continue;
+    for (const key of keys) {
+      const value = source[key];
+      const parsed = typeof value === "number"
+        ? value
+        : typeof value === "string" && value.trim()
+          ? Number(value)
+          : Number.NaN;
+      if (Number.isFinite(parsed)) return Math.max(0, Math.trunc(parsed));
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Normalise both the app usage contract and common provider-style field names.
+ * Keeping this tolerant lets the UI work across rolling frontend/backend deploys.
+ */
+export function normaliseTokenUsage(
+  payload: unknown,
+  fallbackConversationId?: string,
+): TokenUsage {
+  const root = objectValue(payload) || {};
+  const data = objectValue(root.data);
+  const usage =
+    objectValue(root.usage) ||
+    objectValue(root.token_usage) ||
+    objectValue(data?.usage) ||
+    objectValue(data?.token_usage) ||
+    data ||
+    root;
+  const sources = [usage, data, root];
+  const uncachedInputTokens = tokenNumber(sources, [
+    "uncached_input_tokens",
+    "uncachedInputTokens",
+    "input_tokens",
+    "inputTokens",
+    "prompt_tokens",
+    "promptTokens",
+  ]) || 0;
+  const outputTokens = tokenNumber(sources, [
+    "output_tokens",
+    "outputTokens",
+    "completion_tokens",
+    "completionTokens",
+  ]) || 0;
+  const cacheReadTokens = tokenNumber(sources, [
+    "cache_read_tokens",
+    "cacheReadTokens",
+    "cached_input_tokens",
+    "cachedInputTokens",
+  ]) || 0;
+  const cacheWriteTokens = tokenNumber(sources, [
+    "cache_write_tokens",
+    "cacheWriteTokens",
+  ]) || 0;
+  const reasoningTokens = tokenNumber(sources, [
+    "reasoning_tokens",
+    "reasoningTokens",
+  ]);
+  const calculatedTotal =
+    uncachedInputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const totalTokens = tokenNumber(sources, ["total_tokens", "totalTokens"]) ?? calculatedTotal;
+  const conversationIdValue =
+    usage.conversation_id ||
+    usage.conversationId ||
+    data?.conversation_id ||
+    data?.conversationId ||
+    root.conversation_id ||
+    root.conversationId;
+  const updatedAtValue =
+    usage.updated_at ||
+    usage.updatedAt ||
+    data?.updated_at ||
+    data?.updatedAt ||
+    root.updated_at ||
+    root.updatedAt;
+
+  return {
+    conversationId: typeof conversationIdValue === "string"
+      ? conversationIdValue
+      : fallbackConversationId,
+    uncachedInputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+    totalTokens,
+    updatedAt: typeof updatedAtValue === "string" ? updatedAtValue : undefined,
+  };
+}
+
+export async function getConversationUsage(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<TokenUsage> {
+  const response = await fetch(apiUrl(`/api/conversations/${conversationId}/usage`), {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) throw await parseError(response, "无法读取本对话的 Token 消耗。");
+  return normaliseTokenUsage(await response.json(), conversationId);
+}
+
 function extractStreamValue(payload: unknown): {
-  kind: "delta" | "replace" | "progress" | "error" | "none";
+  kind: "delta" | "replace" | "progress" | "usage" | "error" | "none";
   value: string;
   progress?: AssistantProgress;
+  usage?: TokenUsage;
 } {
   if (typeof payload === "string") return { kind: "delta", value: payload };
   if (!payload || typeof payload !== "object") return { kind: "none", value: "" };
 
   const data = payload as Record<string, unknown>;
   const type = String(data.type || data.event || "").toLowerCase();
+  if (type === "usage" || type === "token_usage" || type === "token-usage") {
+    return {
+      kind: "usage",
+      value: "",
+      usage: normaliseTokenUsage(data),
+    };
+  }
   if (type === "error") {
     return {
       kind: "error",
@@ -546,6 +671,10 @@ function applyStreamPayload(
   }
   if (event.kind === "progress" && event.progress) {
     callbacks.onProgress(event.progress);
+    return;
+  }
+  if (event.kind === "usage" && event.usage) {
+    callbacks.onUsage(event.usage);
     return;
   }
   if (event.kind === "delta") {

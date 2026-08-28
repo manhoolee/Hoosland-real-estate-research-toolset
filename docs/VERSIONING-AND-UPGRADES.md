@@ -7,13 +7,16 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.1` | 后端、前端和公开应用行为版本 |
-| Build ID | `v0.2.1-production-sync-version-info-20260827T062425Z` | 每次不可变构建的唯一标识 |
+| Application SemVer | `0.2.2` | 后端、前端和公开应用行为版本 |
+| Build ID | `v0.2.2-conversation-token-usage-20260828T023809Z` | 本次不可变发布构建标识 |
 | System Prompt | `real-estate-system-v0.2.1` | 全局身份、安全、证据、权限和执行规则 |
 | Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
-| Project state Schema | `2.1.0` | 持久化项目状态的数据契约 |
+| Project state Schema | `2.1.0` | Skill 使用的持久化 project_state / case payload 契约 |
+| Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection |
 
-这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Schema；只有持久化数据契约变化时才升级 Schema。
+这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。
+
+V0.2.2 的 `usage.json` 使用独立 sidecar Schema `1`。文件缺失等价于 0，应用在首次收到新 usage 时惰性创建，旧 V0.2.1 会忽略它；不需要迁移，但升级前的历史 Token不会被推算或回填。Skill 所消费的 project_state / case payload 继续为 `2.1.0`，此次没有修改 case 文件或 Skill 契约。
 
 ## 2. 当前行为契约
 
@@ -46,9 +49,10 @@ Application 在每轮提交 Harness 前，以首行 slash command 确定性提�
 | System Prompt | 全局身份、安全、证据、权限、路由或执行真实性规则变化 | 新 prompt version、对抗/回归用例、CHANGELOG |
 | Skill bundle | Skill 内容、输入输出、交接协议、方法或质量闸门变化 | manifest 版本、Skill smoke、总控链路 E2E |
 | Schema | 持久化字段、含义、约束或读取兼容性变化 | 迁移器或重建路径、备份、前向/回滚验证 |
+| Conversation usage sidecar | `usage.json` 字段、计数语义、去重身份或读取默认值变化 | sidecar version、兼容读取、持久化与回滚测试 |
 | Build ID | 每次构建和部署候选 | 唯一 ID、Git commit、manifest、SHA-256、前一回滚点 |
 
-V0.2.1 已将 Application 升至 `0.2.1`、Skill bundle 升至 `2.3.1`，关闭上一热修中运行行为和 Skill 内容变化却继续沿用旧 SemVer 的版本债务。System Prompt 与 Project state Schema 本次没有语义变化，因此不跟随跳号。
+V0.2.2 将 Application 从 `0.2.1` 升至 `0.2.2`，新增对话 Token 用量统计、持久化和显示。System Prompt 继续为 `real-estate-system-v0.2.1`，Skill bundle 继续为 `2.3.1`，Project state Schema 继续为 `2.1.0`。新增独立的 Conversation usage sidecar Schema `1`；旧对话惰性创建，无迁移，历史 Token 不回填。
 
 ## 4. 升级要素矩阵
 
@@ -75,7 +79,7 @@ V0.2.1 已将 Application 升至 `0.2.1`、Skill bundle 升至 `2.3.1`，关闭�
 - **条件兼容**：需要新增配置、重建前端或执行可逆迁移；必须列明前置条件。
 - **不兼容**：API、配置或数据契约无法直接沿用；必须给出迁移器、人工迁移或重新初始化路径。
 
-没有数据迁移也必须明确写出“Schema 未变化、无数据迁移”，防止后续维护者误判遗漏。
+没有批量数据迁移也必须明确写出 Schema 是“未变化”还是“兼容升级并惰性创建”，以及历史数据是否回填，防止后续维护者把迁移策略误判为遗漏。
 
 ## 6. 标准升级流程
 
@@ -93,7 +97,7 @@ V0.2.1 已将 Application 升至 `0.2.1`、Skill bundle 升至 `2.3.1`，关闭�
 
 每个不可变 release 至少记录：
 
-- Application、Build、System Prompt、Skill bundle 和 Schema 版本；
+- Application、Build、System Prompt、Skill bundle、Project state Schema 和 Conversation usage sidecar Schema 版本；
 - Git commit、工作树状态和构建时间；
 - 基线 Build 与完整变更文件清单；
 - 源码、前端资产、Skill、依赖锁和发布脚本的 SHA-256；
@@ -105,13 +109,12 @@ V0.2.1 已将 Application 升至 `0.2.1`、Skill bundle 升至 `2.3.1`，关闭�
 
 ## 8. 当前 Build 的升级摘要
 
-V0.2.1 production-sync / version-info Build：
+V0.2.2 Token usage visibility Build（Build ID：`v0.2.2-conversation-token-usage-20260828T023809Z`）：
 
-- 将现网已经验证的 controller-first、总控缺失失败关闭、子 Skill 交接和默认 Markdown + HTML 行为正式纳入 Git 基线；
-- Application 从 `0.2.0` 升至 `0.2.1`，Skill bundle 从 `2.3.0` 升至 `2.3.1`；
-- 页面品牌区新增 GitHub 源码入口与可见版本号，版本档案读取 `/api/health/live` 展示实时 Application 和 Build ID；
-- 版本档案公开展示发布日期、兼容性和三组修改摘要，完整内容链接到仓库 `CHANGELOG.md`；
-- System Prompt 继续为 `real-estate-system-v0.2.1`，Project state Schema 继续为 `2.1.0`，没有数据迁移；
-- Python 与 Node 依赖、既有公开业务 API 和持久数据布局不变；
-- 86 项后端测试、Python 编译、前端类型检查/生产构建、Skill v2.3.1 smoke 和四档响应式浏览器验收通过；
-- 发布使用新的不可变 Build 与成对 Skill 目录；前一应用、Skill 和配置仍保留为回滚点。
+- Application 从 `0.2.1` 升至 `0.2.2`；System Prompt `real-estate-system-v0.2.1` 与 Skill bundle `2.3.1` 不变；
+- 后端从 Harness 持久事件提取 Provider usage，按 conversation 汇总主 Agent、子 Agent、实际重试 attempt 与成功压缩调用；同一 attempt 的 chunk/final 使用后值替换，reasoning 只作 output 明细；
+- 新增 `GET /api/conversations/{conversation_id}/usage` 与 SSE `usage` snapshot，前端在输入框上方显示当前对话累计 Token；
+- `usage.json` 是可选 accounting sidecar，Schema 为 `1`；旧对话缺失时返回 0并在新 usage 到达时惰性创建，无迁移且不回填历史 Token；Project state Schema 保持 `2.1.0`；
+- Python requirements、Node dependencies、System Prompt、Skill 内容和现有项目/案例状态字段不变；
+- 自动化覆盖用量替换、重试、子 Agent、压缩、取消、持久化、旧数据和对话隔离；发布前仍需使用真实 Provider 完成最小验收；
+- 回滚到 V0.2.1 时无需删除 `usage.json`；旧应用不会读取或更新它。后续再切回 V0.2.2 可继续使用回滚前的统计，但 V0.2.1 运行期间的 Token 会形成不可恢复的缺口。

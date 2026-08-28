@@ -32,6 +32,8 @@ from .harness_adapter import (
     build_harness_prompt,
     notification_to_operation_event,
     notification_to_stream_event,
+    notification_to_token_retry_attempt,
+    notification_to_token_usage_sample,
     research_progress_event,
 )
 from .mcp_protocol import McpProtocol
@@ -160,7 +162,7 @@ def _operation_route(path: str) -> str:
         return "/api/projects/{project_id}/conversations"
     conversation = re.fullmatch(
         r"/api/conversations/[A-Za-z0-9_-]{1,128}"
-        r"(?P<suffix>/messages|/run|/cancel|/files(?:/[A-Za-z0-9_-]{1,128}(?:/open)?)?)?",
+        r"(?P<suffix>/messages|/run|/usage|/cancel|/files(?:/[A-Za-z0-9_-]{1,128}(?:/open)?)?)?",
         path,
     )
     if conversation is not None:
@@ -339,6 +341,51 @@ def _public_run_state(record: dict[str, Any], *, active: bool) -> dict[str, Any]
         if isinstance(value, str):
             result[field] = value
     return result
+
+
+def _public_token_usage(record: dict[str, Any]) -> dict[str, Any]:
+    totals = record.get("totals")
+    if not isinstance(totals, dict):
+        totals = {}
+
+    def bucket(name: str) -> int:
+        value = totals.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    uncached_input_tokens = bucket("uncached_input_tokens")
+    output_tokens = bucket("output_tokens")
+    reasoning_tokens = bucket("reasoning_tokens")
+    cache_read_tokens = bucket("cache_read_tokens")
+    cache_write_tokens = bucket("cache_write_tokens")
+    return {
+        "uncached_input_tokens": uncached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        # reasoning_tokens is an output subdivision and is intentionally not
+        # added again here.
+        "total_tokens": (
+            uncached_input_tokens
+            + output_tokens
+            + cache_read_tokens
+            + cache_write_tokens
+        ),
+        "updated_at": record.get("updated_at"),
+        "includes_subagents": True,
+        "source": "provider_reported",
+    }
+
+
+def _token_usage_event(
+    conversation_id: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "usage",
+        "conversation_id": conversation_id,
+        "usage": _public_token_usage(record),
+    }
 
 
 def _assistant_reply_for(
@@ -575,6 +622,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.active_guard = asyncio.Lock()
     app.state.config_update_in_progress = False
     app.state.background_tasks: set[asyncio.Task[None]] = set()
+
+    def read_token_usage_safely(conversation_id: str) -> dict[str, Any]:
+        """Keep optional accounting damage from blocking the research chat."""
+
+        try:
+            return store.read_token_usage(conversation_id)
+        except Exception:
+            operation_log.record(
+                "agent.token_usage.failed",
+                source="backend",
+                conversation_id=conversation_id,
+                error_code="TOKEN_USAGE_READ_FAILED",
+            )
+            LOGGER.exception("Failed to read token usage conversation=%s", conversation_id)
+            return {"totals": {}, "updated_at": None}
+
+    def begin_token_usage_run_safely(conversation_id: str, run_id: str) -> None:
+        try:
+            store.begin_token_usage_run(conversation_id, run_id)
+        except Exception:
+            operation_log.record(
+                "agent.token_usage.failed",
+                source="backend",
+                conversation_id=conversation_id,
+                run_id=run_id,
+                error_code="TOKEN_USAGE_BEGIN_FAILED",
+            )
+            LOGGER.exception(
+                "Failed to begin token usage run conversation=%s run=%s",
+                conversation_id,
+                run_id,
+            )
 
     def rotate_active_session(conversation_id: str, active: ActiveRun) -> None:
         """Persist exactly one new SDK session generation for a disposed run."""
@@ -1235,6 +1314,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 record = reconcile_inactive_run(conversation_id, record)
             return _public_run_state(record, active=False)
 
+    @app.get("/api/conversations/{conversation_id}/usage")
+    async def get_conversation_usage(conversation_id: str) -> dict[str, Any]:
+        store.require(conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "usage": _public_token_usage(read_token_usage_safely(conversation_id)),
+        }
+
     @app.post("/api/conversations/{conversation_id}/messages")
     async def send_message(
         request: Request,
@@ -1352,6 +1439,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 active=active,
                 required=True,
             )
+            begin_token_usage_run_safely(conversation_id, active.run_id)
             prompt = build_harness_prompt(
                 content,
                 attachments,
@@ -1407,11 +1495,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         last_notification: dict[str, Any] = {}
+        usage_attempts: dict[tuple[str, int, int], int] = {}
         highest_progress_step = 1
         output_baseline = _output_fingerprint(conversation_paths.outputs)
+        initial_usage_event = _token_usage_event(
+            conversation_id,
+            read_token_usage_safely(conversation_id),
+        )
 
         def on_notification(notification: object) -> None:
             nonlocal highest_progress_step
+            retry_attempt = notification_to_token_retry_attempt(notification)
+            if retry_attempt is not None:
+                usage_attempts[
+                    (retry_attempt.session_id, retry_attempt.turn, retry_attempt.step)
+                ] = retry_attempt.attempt
+
+            usage_sample = notification_to_token_usage_sample(notification)
+            if usage_sample is not None:
+                attempt = (
+                    usage_attempts.get(
+                        (usage_sample.session_id, usage_sample.turn, usage_sample.step),
+                        0,
+                    )
+                    if usage_sample.sample_kind == "model_step"
+                    else 0
+                )
+                try:
+                    usage_record, usage_changed = store.record_token_usage(
+                        conversation_id,
+                        run_id=active.run_id,
+                        session_id=usage_sample.session_id,
+                        event_seq=usage_sample.event_seq,
+                        turn=usage_sample.turn,
+                        step=usage_sample.step,
+                        attempt=attempt,
+                        buckets=usage_sample.buckets(),
+                        sample_kind=usage_sample.sample_kind,
+                    )
+                except Exception:
+                    operation_log.record(
+                        "agent.token_usage.failed",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        error_code="TOKEN_USAGE_PERSIST_FAILED",
+                    )
+                    LOGGER.exception(
+                        "Failed to persist token usage conversation=%s run=%s",
+                        conversation_id,
+                        active.run_id,
+                    )
+                else:
+                    # Usage can arrive while a cancellation is settling.  It is
+                    # still billable work, so persist and surface the final
+                    # snapshot before the stream closes.
+                    if usage_changed:
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            _token_usage_event(conversation_id, usage_record),
+                        )
             if active.cancel_event.is_set():
                 return
             operation_event = notification_to_operation_event(notification)
@@ -1711,6 +1856,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task.add_done_callback(app.state.background_tasks.discard)
 
         async def event_stream() -> AsyncIterator[bytes]:
+            yield _sse(initial_usage_event)
             yield _sse(research_progress_event("brief"))
             while True:
                 try:

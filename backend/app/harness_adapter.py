@@ -71,6 +71,178 @@ class HarnessRunResult:
     session_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class TokenUsageSample:
+    """One provider-reported usage sample for a Harness model step.
+
+    Harness emits an early usage chunk and may later emit a finalized
+    assistant message for the same ``(session, turn, step)``.  Consumers must
+    replace the earlier sample with the latter instead of adding both.
+    ``reasoningTokens`` is retained as a detail bucket but is already a
+    subdivision of ``outputTokens`` and must not be added to the total.
+    """
+
+    session_id: str
+    sample_kind: str
+    event_seq: int
+    turn: int
+    step: int
+    uncached_input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+
+    def buckets(self) -> dict[str, int]:
+        return {
+            "uncached_input_tokens": self.uncached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TokenRetryAttempt:
+    """A provider retry attempt that has actually started for one model step."""
+
+    session_id: str
+    turn: int
+    step: int
+    attempt: int
+
+
+def notification_to_token_retry_attempt(
+    notification: object,
+) -> TokenRetryAttempt | None:
+    """Extract ``llm/retry-started`` so separately billed attempts stay distinct."""
+
+    method = getattr(notification, "method", None)
+    payload = getattr(notification, "payload", None)
+    if isinstance(notification, dict):
+        method = notification.get("method", method)
+        payload = notification.get("payload", payload)
+    if method != "session.event" or not isinstance(payload, dict):
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict) or event.get("type") != "llm/retry-started":
+        return None
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return None
+    turn = _nonnegative_token_integer(data.get("turn"))
+    step = _nonnegative_token_integer(data.get("step"))
+    attempt = _nonnegative_token_integer(data.get("retry"))
+    if turn is None or step is None or attempt is None:
+        return None
+    session_id = payload.get("sessionId", payload.get("session_id"))
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    return TokenRetryAttempt(
+        session_id=session_id,
+        turn=turn,
+        step=step,
+        attempt=attempt,
+    )
+
+
+def notification_to_token_usage_sample(
+    notification: object,
+) -> TokenUsageSample | None:
+    """Extract a validated provider usage sample from a Harness notification."""
+
+    method = getattr(notification, "method", None)
+    payload = getattr(notification, "payload", None)
+    if isinstance(notification, dict):
+        method = notification.get("method", method)
+        payload = notification.get("payload", payload)
+    if method != "session.event" or not isinstance(payload, dict):
+        return None
+
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    event_seq = _nonnegative_token_integer(event.get("seq"))
+    data = event.get("data")
+    if event_seq is None or not isinstance(data, dict):
+        return None
+
+    usage: object = None
+    sample_kind = "model_step"
+    if event_type == "assistant/chunk":
+        chunk = data.get("chunk")
+        if isinstance(chunk, dict) and chunk.get("type") == "usage":
+            usage = chunk.get("usage")
+    elif event_type == "assistant/message":
+        usage = data.get("usage")
+    elif event_type == "compaction/summary":
+        usage = data.get("usage")
+        sample_kind = "compaction"
+    if not isinstance(usage, dict):
+        return None
+
+    if sample_kind == "compaction":
+        # Compaction is a direct LLM call outside an agent turn/step.  Its
+        # per-session event seq is the durable unique identity for accounting.
+        turn, step = event_seq, 0
+    else:
+        turn = _nonnegative_token_integer(data.get("turn"))
+        step = _nonnegative_token_integer(data.get("step"))
+    input_tokens = _nonnegative_token_integer(
+        usage.get("inputTokens", usage.get("input_tokens"))
+    )
+    output_tokens = _nonnegative_token_integer(
+        usage.get("outputTokens", usage.get("output_tokens"))
+    )
+    cache_read_tokens = _optional_token_integer(
+        usage.get("cacheReadTokens", usage.get("cache_read_tokens"))
+    )
+    cache_write_tokens = _optional_token_integer(
+        usage.get("cacheWriteTokens", usage.get("cache_write_tokens"))
+    )
+    reasoning_tokens = _optional_token_integer(
+        usage.get("reasoningTokens", usage.get("reasoning_tokens"))
+    )
+    if None in {turn, step, input_tokens, output_tokens}:
+        return None
+    if (
+        cache_read_tokens is None
+        or cache_write_tokens is None
+        or reasoning_tokens is None
+    ):
+        return None
+
+    session_id = payload.get("sessionId", payload.get("session_id"))
+    if not isinstance(session_id, str) or not session_id.strip():
+        # A missing session id would make root/subagent steps collide.  The
+        # production SDK always supplies it, so malformed emitters are ignored.
+        return None
+    return TokenUsageSample(
+        session_id=session_id,
+        sample_kind=sample_kind,
+        event_seq=event_seq,
+        turn=turn,
+        step=step,
+        uncached_input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+
+
+def _nonnegative_token_integer(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _optional_token_integer(value: object) -> int | None:
+    return 0 if value is None else _nonnegative_token_integer(value)
+
+
 def build_harness_prompt(
     content: str,
     attachments: list[dict[str, Any]],

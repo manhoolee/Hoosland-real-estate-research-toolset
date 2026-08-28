@@ -9,6 +9,8 @@ from app.harness_adapter import (
     build_harness_prompt,
     notification_to_operation_event,
     notification_to_stream_event,
+    notification_to_token_retry_attempt,
+    notification_to_token_usage_sample,
 )
 
 
@@ -119,6 +121,153 @@ class HarnessAdapterTests(unittest.TestCase):
             )
         )
         self.assertIsNone(event)
+
+    def test_usage_chunk_extracts_disjoint_provider_buckets(self) -> None:
+        sample = notification_to_token_usage_sample(
+            FakeNotification(
+                "session.event",
+                {
+                    "sessionId": "child-session-1",
+                    "event": {
+                        "type": "assistant/chunk",
+                        "seq": 17,
+                        "data": {
+                            "turn": 2,
+                            "step": 3,
+                            "chunk": {
+                                "type": "usage",
+                                "usage": {
+                                    "inputTokens": 100,
+                                    "outputTokens": 40,
+                                    "reasoningTokens": 30,
+                                    "cacheReadTokens": 20,
+                                    "cacheWriteTokens": 5,
+                                },
+                            },
+                        },
+                    },
+                },
+            )
+        )
+
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        self.assertEqual("child-session-1", sample.session_id)
+        self.assertEqual("model_step", sample.sample_kind)
+        self.assertEqual(17, sample.event_seq)
+        self.assertEqual((2, 3), (sample.turn, sample.step))
+        self.assertEqual(
+            {
+                "uncached_input_tokens": 100,
+                "output_tokens": 40,
+                "reasoning_tokens": 30,
+                "cache_read_tokens": 20,
+                "cache_write_tokens": 5,
+            },
+            sample.buckets(),
+        )
+
+    def test_final_usage_defaults_optional_buckets_and_requires_session_id(self) -> None:
+        event = {
+            "type": "assistant/message",
+            "seq": 8,
+            "data": {
+                "turn": 1,
+                "step": 1,
+                "usage": {"inputTokens": 9, "outputTokens": 4},
+            },
+        }
+        sample = notification_to_token_usage_sample(
+            FakeNotification(
+                "session.event",
+                {"sessionId": "root-session", "event": event},
+            )
+        )
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        self.assertEqual(0, sample.reasoning_tokens)
+        self.assertEqual(0, sample.cache_read_tokens)
+        self.assertEqual(0, sample.cache_write_tokens)
+        self.assertIsNone(
+            notification_to_token_usage_sample(
+                FakeNotification("session.event", {"event": event})
+            )
+        )
+
+    def test_compaction_summary_extracts_provider_usage(self) -> None:
+        sample = notification_to_token_usage_sample(
+            FakeNotification(
+                "session.event",
+                {
+                    "sessionId": "root-session",
+                    "event": {
+                        "type": "compaction/summary",
+                        "seq": 42,
+                        "data": {
+                            "compactionId": "compact-1",
+                            "usage": {
+                                "inputTokens": 80,
+                                "outputTokens": 6,
+                                "reasoningTokens": 2,
+                            },
+                        },
+                    },
+                },
+            )
+        )
+
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        self.assertEqual("compaction", sample.sample_kind)
+        self.assertEqual(42, sample.event_seq)
+        self.assertEqual((42, 0), (sample.turn, sample.step))
+        self.assertEqual(80, sample.uncached_input_tokens)
+        self.assertEqual(6, sample.output_tokens)
+
+    def test_usage_rejects_negative_and_boolean_token_counts(self) -> None:
+        def notification(input_tokens: object) -> FakeNotification:
+            return FakeNotification(
+                "session.event",
+                {
+                    "sessionId": "root-session",
+                    "event": {
+                        "type": "assistant/message",
+                        "seq": 1,
+                        "data": {
+                            "turn": 1,
+                            "step": 1,
+                            "usage": {
+                                "inputTokens": input_tokens,
+                                "outputTokens": 1,
+                            },
+                        },
+                    },
+                },
+            )
+
+        self.assertIsNone(notification_to_token_usage_sample(notification(-1)))
+        self.assertIsNone(notification_to_token_usage_sample(notification(True)))
+
+    def test_retry_started_identifies_the_actual_attempt(self) -> None:
+        attempt = notification_to_token_retry_attempt(
+            FakeNotification(
+                "session.event",
+                {
+                    "sessionId": "root-session",
+                    "event": {
+                        "type": "llm/retry-started",
+                        "data": {"turn": 4, "step": 2, "retry": 1},
+                    },
+                },
+            )
+        )
+
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertEqual(
+            ("root-session", 4, 2, 1),
+            (attempt.session_id, attempt.turn, attempt.step, attempt.attempt),
+        )
 
     def test_skill_notification_hides_internal_skill_identity(self) -> None:
         event = notification_to_stream_event(

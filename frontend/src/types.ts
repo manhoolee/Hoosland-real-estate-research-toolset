@@ -29,6 +29,17 @@ export interface AssistantProgress {
   etaLabel: string;
 }
 
+export interface TokenUsage {
+  conversationId?: string;
+  uncachedInputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens?: number;
+  totalTokens: number;
+  updatedAt?: string;
+}
+
 export type FileStatus = "uploading" | "ready" | "error";
 
 export interface WorkspaceFile {

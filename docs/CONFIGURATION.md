@@ -20,6 +20,8 @@
 | `LOG_LEVEL` | `info` | 应用日志级别 |
 | `CORS_ORIGINS` | 空 | 逗号分隔的额外允许来源 |
 
+V0.2.2 会在 `DATA_DIR/conversations/{conversation_id}/usage.json` 保存独立的 Token accounting sidecar，Schema 为 `1`。它没有新增环境变量，也不是配置文件：应用负责原子写入，运维和用户不应手工编辑。Project state Schema 保持 `2.1.0`。旧对话没有 sidecar 时 API 返回 0，并在首次记录新 usage 时惰性创建；不迁移，也不回填升级前的历史 Token。回滚到 V0.2.1 时文件保留但不会更新，重新升级后会存在回滚期间的统计缺口。
+
 ## 3. Harness 与模型
 
 | 变量 | 默认值 | 说明 |
@@ -122,9 +124,11 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```bash
 VITE_API_BASE_URL=/agent-tools \
 VITE_DEPLOYMENT_SLOT=slot-b \
-VITE_APP_VERSION=0.2.1 \
+VITE_APP_VERSION=0.2.2 \
 npm run build
 ```
+
+V0.2.2 候选部署的后端 `BUILD_ID` 使用 `v0.2.2-conversation-token-usage-20260828T023809Z`，并保证前端显示的 Application `0.2.2` 与健康接口返回一致。
 
 ## 8. 配置不变量
 
