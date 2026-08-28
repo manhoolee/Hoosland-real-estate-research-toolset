@@ -183,7 +183,7 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-V0.2.3 源码快照已通过 102 个后端单元/HTTP 测试、Python 编译、前端类型检查与生产构建；发布前还必须完成真实成果持久化 E2E。Skill v2.3.1 未变化。
+V0.2.3 已上线 V2 / slot-b，并通过 102 个后端单元/HTTP 测试、Python 编译、前端类型检查、生产构建，以及隔离候选和生产真实成果持久化 E2E；同名 Markdown/HTML 更新后，API、磁盘与服务重启后的字节哈希一致。V1 未变更，Skill v2.3.1 未变化。
 
 ## 数据与安全边界
 

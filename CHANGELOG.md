@@ -25,7 +25,7 @@
 
 - Application 从 `0.2.2` 升至 `0.2.3`，System Prompt 从 `real-estate-system-v0.2.1` 升至 `real-estate-system-v0.2.2`；Skill bundle、Project state Schema 和 usage sidecar Schema 均不变；
 - 不迁移、不覆盖现有 conversation、成果文件或 Token 用量；V1 / slot-a 不在发布范围内；
-- 后端 102 项单元与 HTTP 回归、Python 编译、前端类型检查和生产构建已通过；真实文件生成、更新、刷新与服务重启保持将在发布闸门中复验。
+- Build `v0.2.3-output-persistence-20260828T040220Z` 已上线 V2 / slot-b；后端 102 项单元与 HTTP 回归、Python 编译、前端类型检查、生产构建、隔离候选和生产真实 Provider E2E 均通过；同名 Markdown/HTML 更新后的哈希发生变化，API 与磁盘一致，V2 重启后文件和 Token 统计保持，V1 前后快照一致。
 
 ## App 0.2.2 Build `v0.2.2-conversation-token-usage-20260828T023809Z` / System Prompt v0.2.1 / Skill 2.3.1 / Usage sidecar 1 — 2026-08-28
 
