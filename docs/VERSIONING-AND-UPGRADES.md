@@ -7,14 +7,15 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.3` | 后端、前端和公开应用行为版本 |
-| Build ID | `v0.2.3-output-persistence-20260828T040220Z` | 本次不可变发布构建标识 |
-| System Prompt | `real-estate-system-v0.2.2` | 全局身份、安全、证据、权限和执行规则 |
+| Application SemVer | `0.2.4`（候选） | 后端、前端和公开应用行为版本；线上仍为 `0.2.3` |
+| Build ID | `v0.2.4-task-checklist-20260828T043537Z`（候选） | 从当前线上 Build 精确派生，尚未切换 |
+| System Prompt | `real-estate-system-v0.2.3` | 全局身份、安全、证据、权限、任务复核和执行规则 |
 | Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
 | Project state Schema | `2.1.0` | Skill 使用的持久化 project_state / case payload 契约 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection |
+| Run checklist sidecar Schema | `1` | 按 run 保存任务与成果复核快照 |
 
-这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。
+这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。V0.2.4 因此为运行清单建立独立 sidecar Schema `1`，不借用 usage 或 project state 的版本号。
 
 V0.2.2 的 `usage.json` 使用独立 sidecar Schema `1`。文件缺失等价于 0，应用在首次收到新 usage 时惰性创建，旧 V0.2.1 会忽略它；不需要迁移，但升级前的历史 Token不会被推算或回填。Skill 所消费的 project_state / case payload 继续为 `2.1.0`，此次没有修改 case 文件或 Skill 契约。
 
@@ -50,6 +51,7 @@ Application 在每轮提交 Harness 前，以首行 slash command 确定性提�
 | Skill bundle | Skill 内容、输入输出、交接协议、方法或质量闸门变化 | manifest 版本、Skill smoke、总控链路 E2E |
 | Schema | 持久化字段、含义、约束或读取兼容性变化 | 迁移器或重建路径、备份、前向/回滚验证 |
 | Conversation usage sidecar | `usage.json` 字段、计数语义、去重身份或读取默认值变化 | sidecar version、兼容读取、持久化与回滚测试 |
+| Run checklist sidecar | 清单 item、状态、revision、run 绑定、终态复核或读取兼容性变化 | sidecar version、事件乱序/隔离、恢复、终态与回滚测试 |
 | Build ID | 每次构建和部署候选 | 唯一 ID、Git commit、manifest、SHA-256、前一回滚点 |
 
 V0.2.2 将 Application 从 `0.2.1` 升至 `0.2.2`，新增对话 Token 用量统计、持久化和显示。System Prompt 继续为 `real-estate-system-v0.2.1`，Skill bundle 继续为 `2.3.1`，Project state Schema 继续为 `2.1.0`。新增独立的 Conversation usage sidecar Schema `1`；旧对话惰性创建，无迁移，历史 Token 不回填。
@@ -108,6 +110,16 @@ V0.2.2 将 Application 从 `0.2.1` 升至 `0.2.2`，新增对话 Token 用量统
 公开 release note 只保存脱敏摘要；包含内部拓扑或任务关联信息的原始证据必须进入访问受控的发布档案。
 
 ## 8. 当前 Build 的升级摘要
+
+V0.2.4 task checklist Candidate（Build ID：`v0.2.4-task-checklist-20260828T043537Z`）：
+
+- 以线上 V0.2.3 部署记录 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 为唯一父基线，候选分支为 `release/v0.2.4-task-checklist`；
+- Application 升至 `0.2.4`，System Prompt 升至 `real-estate-system-v0.2.3`；Skill bundle、Project state Schema 与 usage sidecar 不变；
+- 使用 Harness 原生 `todo_write` / `todo/write` 建立任务与成果要求的整表快照，应用新增 Run checklist sidecar Schema `1`，并在 SSE、消息与恢复链路中发送完整 revision；
+- 未完成或未复核项目在终态保留为未完成；文件成果还需与本轮 canonical outputs 的真实变化一致；
+- 当前未部署，线上继续运行 V0.2.3；回滚候选只需切回整个 V0.2.3 release，新增 checklist sidecar 可保留并由旧代码忽略。
+
+### 当前线上 Build
 
 V0.2.3 output persistence Build（Build ID：`v0.2.3-output-persistence-20260828T040220Z`）：
 

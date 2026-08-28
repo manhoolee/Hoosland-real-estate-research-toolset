@@ -25,6 +25,31 @@ CLIENT_REQUEST_ID_RE = re.compile(
 RUN_STATUSES = frozenset(
     {"idle", "running", "succeeded", "failed", "cancelled", "interrupted"}
 )
+CHECKLIST_VERSION = 1
+CHECKLIST_MAX_ITEMS = 100
+CHECKLIST_MAX_CONTENT_CHARACTERS = 500
+CHECKLIST_MAX_DETAIL_CHARACTERS = 200
+CHECKLIST_MODEL_STATUSES = frozenset({"pending", "in_progress", "completed"})
+CHECKLIST_ITEM_STATUSES = frozenset({*CHECKLIST_MODEL_STATUSES, "incomplete"})
+CHECKLIST_RUN_STATUSES = frozenset(
+    {
+        "idle",
+        "planning",
+        "running",
+        "committing",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+    }
+)
+CHECKLIST_TERMINAL_STATUSES = frozenset(
+    {"succeeded", "failed", "cancelled", "interrupted"}
+)
+CHECKLIST_ITEM_ID_RE = re.compile(r"^chk_[0-9a-f]{24}$")
+CHECKLIST_FILE_RE = re.compile(
+    r"^成果文件\(\.([A-Za-z0-9][A-Za-z0-9+_-]{0,15})\)｜(.+)$"
+)
 TOKEN_USAGE_BUCKET_FIELDS = (
     "uncached_input_tokens",
     "output_tokens",
@@ -56,6 +81,10 @@ class ProjectConflict(StorageError):
 
 class FileNotFound(StorageError):
     code = "FILE_NOT_FOUND"
+
+
+class ChecklistError(StorageError):
+    code = "CHECKLIST_ERROR"
 
 
 def utc_now() -> str:
@@ -123,6 +152,7 @@ class ConversationPaths:
     files: Path
     run: Path
     usage: Path
+    checklists: Path
 
 
 class ConversationStore:
@@ -169,6 +199,7 @@ class ConversationStore:
             files=root / "files.json",
             run=root / "run.json",
             usage=root / "usage.json",
+            checklists=root / "checklists",
         )
 
     def create_or_reuse(
@@ -227,6 +258,7 @@ class ConversationStore:
                     "samples": {},
                 },
             )
+            paths.checklists.mkdir(mode=0o750)
             paths.messages.touch(mode=0o640)
             return metadata, True
 
@@ -310,6 +342,13 @@ class ConversationStore:
                 or directory.resolve() != workspace_root / name
             ):
                 raise StorageError(f"conversation {name} directory is missing or unsafe")
+        if paths.checklists.is_symlink():
+            raise StorageError("conversation checklists directory is unsafe")
+        if paths.checklists.exists() and (
+            not paths.checklists.is_dir()
+            or paths.checklists.resolve() != paths.root.resolve() / "checklists"
+        ):
+            raise StorageError("conversation checklists directory is unsafe")
         return paths
 
     def read_meta(self, conversation_id: str) -> dict[str, Any]:
@@ -486,6 +525,633 @@ class ConversationStore:
                 "samples": samples,
             }
             self._atomic_json(paths.usage, value)
+            return value, True
+
+    @staticmethod
+    def _empty_checklist(run_id: str) -> dict[str, Any]:
+        return {
+            "version": CHECKLIST_VERSION,
+            "run_id": run_id,
+            "revision": 0,
+            "completion_revisions": 0,
+            "source_seq": None,
+            "phase": "planning",
+            "updated_at": utc_now(),
+            "items": [],
+        }
+
+    @staticmethod
+    def _checklist_item_id(index: int, content: str) -> str:
+        material = f"{index}\0{content}".encode("utf-8")
+        return f"chk_{hashlib.sha256(material).hexdigest()[:24]}"
+
+    @staticmethod
+    def _classify_checklist_content(content: str) -> tuple[str, str | None]:
+        if content.startswith("任务｜") and content.removeprefix("任务｜").strip():
+            return "task", None
+        file_match = CHECKLIST_FILE_RE.fullmatch(content)
+        if file_match is not None and file_match.group(2).strip():
+            return "file", f".{file_match.group(1).lower()}"
+        if content.startswith("成果回复｜") and content.removeprefix("成果回复｜").strip():
+            return "reply", None
+        raise ChecklistError(
+            "checklist item must start with 任务｜, 成果文件(.ext)｜, or 成果回复｜"
+        )
+
+    @staticmethod
+    def _validated_model_todos(todos: object) -> list[dict[str, str]]:
+        if not isinstance(todos, list) or not todos or len(todos) > CHECKLIST_MAX_ITEMS:
+            raise ChecklistError("checklist todo list is empty or too large")
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        in_progress = 0
+        for item in todos:
+            if not isinstance(item, dict) or set(item) != {"content", "status"}:
+                raise ChecklistError("checklist todo item shape is invalid")
+            content = item.get("content")
+            status = item.get("status")
+            if not isinstance(content, str):
+                raise ChecklistError("checklist todo content is invalid")
+            content = content.strip()
+            if not content or len(content) > CHECKLIST_MAX_CONTENT_CHARACTERS:
+                raise ChecklistError("checklist todo content is empty or too long")
+            if content in seen:
+                raise ChecklistError("checklist todo content must be unique")
+            if status not in CHECKLIST_MODEL_STATUSES:
+                raise ChecklistError("checklist todo status is invalid")
+            in_progress += int(status == "in_progress")
+            if in_progress > 1:
+                raise ChecklistError("checklist may have at most one in-progress item")
+            seen.add(content)
+            normalized.append({"content": content, "status": str(status)})
+        return normalized
+
+    @staticmethod
+    def _validated_checklist(value: object) -> dict[str, Any]:
+        if not isinstance(value, dict) or value.get("version") != CHECKLIST_VERSION:
+            raise StorageError("conversation checklist state is invalid")
+        run_id = value.get("run_id")
+        if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+            raise StorageError("conversation checklist run id is invalid")
+        revision = value.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise StorageError("conversation checklist revision is invalid")
+        completion_revisions = value.get("completion_revisions", 0)
+        if (
+            isinstance(completion_revisions, bool)
+            or not isinstance(completion_revisions, int)
+            or completion_revisions < 0
+            or completion_revisions > revision
+        ):
+            raise StorageError("conversation checklist completion revisions are invalid")
+        source_seq = value.get("source_seq")
+        if source_seq is not None and (
+            isinstance(source_seq, bool)
+            or not isinstance(source_seq, int)
+            or source_seq < 0
+        ):
+            raise StorageError("conversation checklist source seq is invalid")
+        phase = value.get("phase")
+        if phase not in CHECKLIST_RUN_STATUSES - {"idle"}:
+            raise StorageError("conversation checklist phase is invalid")
+        updated_at = value.get("updated_at")
+        if updated_at is not None:
+            _timestamp(updated_at, "checklist updated_at")
+        items = value.get("items")
+        if not isinstance(items, list) or len(items) > CHECKLIST_MAX_ITEMS:
+            raise StorageError("conversation checklist items are invalid")
+        normalized_items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_content: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise StorageError("conversation checklist item is invalid")
+            allowed_keys = {"id", "kind", "content", "status", "extension", "detail"}
+            if not set(item).issubset(allowed_keys):
+                raise StorageError("conversation checklist item shape is invalid")
+            item_id = item.get("id")
+            kind = item.get("kind")
+            content = item.get("content")
+            item_status = item.get("status")
+            extension = item.get("extension")
+            detail = item.get("detail")
+            if (
+                not isinstance(item_id, str)
+                or not CHECKLIST_ITEM_ID_RE.fullmatch(item_id)
+                or item_id in seen_ids
+            ):
+                raise StorageError("conversation checklist item id is invalid")
+            if kind not in {"task", "file", "reply"}:
+                raise StorageError("conversation checklist item kind is invalid")
+            if (
+                not isinstance(content, str)
+                or not content
+                or len(content) > CHECKLIST_MAX_CONTENT_CHARACTERS
+                or content in seen_content
+            ):
+                raise StorageError("conversation checklist item content is invalid")
+            if item_status not in CHECKLIST_ITEM_STATUSES:
+                raise StorageError("conversation checklist item status is invalid")
+            if detail is not None and (
+                not isinstance(detail, str)
+                or not detail.strip()
+                or len(detail) > CHECKLIST_MAX_DETAIL_CHARACTERS
+            ):
+                raise StorageError("conversation checklist item detail is invalid")
+            try:
+                classified_kind, classified_extension = (
+                    ConversationStore._classify_checklist_content(content)
+                )
+            except ChecklistError as exc:
+                raise StorageError("conversation checklist item content is invalid") from exc
+            if classified_kind != kind:
+                raise StorageError("conversation checklist item kind does not match content")
+            if kind == "file":
+                if (
+                    not isinstance(extension, str)
+                    or not re.fullmatch(r"\.[a-z0-9][a-z0-9+_-]{0,15}", extension)
+                ):
+                    raise StorageError("conversation checklist file extension is invalid")
+                if extension != classified_extension:
+                    raise StorageError(
+                        "conversation checklist file extension does not match content"
+                    )
+            elif extension is not None:
+                raise StorageError("conversation checklist non-file item has an extension")
+            seen_ids.add(item_id)
+            seen_content.add(content)
+            normalized_items.append(
+                {
+                    "id": item_id,
+                    "kind": kind,
+                    "content": content,
+                    "status": item_status,
+                    **({"extension": extension} if kind == "file" else {}),
+                    **({"detail": detail.strip()} if isinstance(detail, str) else {}),
+                }
+            )
+        if phase == "planning" and items:
+            raise StorageError("conversation planning checklist must be empty")
+        if phase in {*CHECKLIST_TERMINAL_STATUSES, "committing"} and any(
+            item["status"] not in {"completed", "incomplete"}
+            or not item.get("detail")
+            for item in normalized_items
+        ):
+            raise StorageError("conversation terminal checklist is not fully reviewed")
+        return {
+            "version": CHECKLIST_VERSION,
+            "run_id": run_id,
+            "revision": revision,
+            "completion_revisions": completion_revisions,
+            "source_seq": source_seq,
+            "phase": phase,
+            "updated_at": updated_at,
+            "items": normalized_items,
+        }
+
+    @staticmethod
+    def _checklist_path(paths: ConversationPaths, run_id: str) -> Path:
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        return paths.checklists / f"{run_id}.json"
+
+    @staticmethod
+    def _ensure_checklists_directory(paths: ConversationPaths) -> None:
+        if paths.checklists.is_symlink():
+            raise StorageError("conversation checklists directory is unsafe")
+        if paths.checklists.exists():
+            if (
+                not paths.checklists.is_dir()
+                or paths.checklists.resolve() != paths.root.resolve() / "checklists"
+            ):
+                raise StorageError("conversation checklists directory is unsafe")
+            return
+        paths.checklists.mkdir(mode=0o750)
+
+    def read_checklist(
+        self,
+        conversation_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one run-owned checklist without materializing legacy state."""
+
+        paths = self.require(conversation_id)
+        checklist_path = self._checklist_path(paths, run_id)
+        if checklist_path.is_symlink():
+            raise StorageError("conversation checklist state is unsafe")
+        if not checklist_path.exists():
+            return None
+        if (
+            not checklist_path.is_file()
+            or checklist_path.resolve()
+            != paths.root.resolve() / "checklists" / f"{run_id}.json"
+        ):
+            raise StorageError("conversation checklist state is missing or unsafe")
+        try:
+            with checklist_path.open("r", encoding="utf-8") as handle:
+                value = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise StorageError("conversation checklist state is invalid") from exc
+        normalized = self._validated_checklist(value)
+        if normalized["run_id"] != run_id:
+            raise StorageError("conversation checklist run id does not match its sidecar")
+        return normalized
+
+    def start_checklist(self, conversation_id: str, run_id: str) -> dict[str, Any]:
+        """Atomically open a blank planning checklist for one application run."""
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            self._ensure_checklists_directory(paths)
+            existing = self.read_checklist(conversation_id, run_id)
+            if existing is not None:
+                return existing
+            value = self._empty_checklist(run_id)
+            self._atomic_json(self._checklist_path(paths, run_id), value)
+            return value
+
+    def apply_checklist_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+        event_seq: int,
+        todos: object,
+    ) -> tuple[dict[str, Any], bool]:
+        """Apply one canonical root-session ``todo/write`` whole snapshot.
+
+        The first accepted snapshot defines immutable ordered item content and
+        stable ids. Later snapshots may update only statuses. Duplicate or
+        out-of-order event sequences are harmless last-write-wins replays, and
+        a completed item can never regress.
+        """
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        if isinstance(event_seq, bool) or not isinstance(event_seq, int) or event_seq < 0:
+            raise ValueError("checklist event seq is invalid")
+        normalized = self._validated_model_todos(todos)
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_checklist(conversation_id, run_id)
+            if previous is None:
+                raise ChecklistError("checklist run has not been started")
+            if previous.get("phase") in {
+                *CHECKLIST_TERMINAL_STATUSES,
+                "committing",
+            }:
+                return previous, False
+            previous_seq = previous.get("source_seq")
+            if isinstance(previous_seq, int) and event_seq <= previous_seq:
+                return previous, False
+
+            previous_items = previous["items"]
+            if previous_items:
+                expected = [item["content"] for item in previous_items]
+                received = [item["content"] for item in normalized]
+                if received != expected:
+                    raise ChecklistError(
+                        "checklist items cannot be renamed, reordered, added, or removed"
+                    )
+                newly_completed = sum(
+                    old["status"] != "completed"
+                    and incoming["status"] == "completed"
+                    for old, incoming in zip(
+                        previous_items,
+                        normalized,
+                        strict=True,
+                    )
+                )
+                if newly_completed > 1:
+                    raise ChecklistError(
+                        "one checklist update cannot complete multiple unfinished items"
+                    )
+                items = []
+                for old, incoming in zip(previous_items, normalized, strict=True):
+                    status = (
+                        "completed"
+                        if old["status"] == "completed"
+                        else incoming["status"]
+                    )
+                    items.append({**old, "status": status})
+            else:
+                items = []
+                if any(item["status"] == "completed" for item in normalized):
+                    raise ChecklistError(
+                        "initial checklist items cannot already be completed"
+                    )
+                newly_completed = 0
+                task_count = 0
+                deliverable_count = 0
+                file_extensions: set[str] = set()
+                reply_count = 0
+                for index, incoming in enumerate(normalized):
+                    kind, extension = self._classify_checklist_content(incoming["content"])
+                    task_count += int(kind == "task")
+                    deliverable_count += int(kind in {"file", "reply"})
+                    if kind == "file":
+                        assert extension is not None
+                        if extension in file_extensions:
+                            raise ChecklistError(
+                                "checklist must contain only one deliverable per file extension"
+                            )
+                        file_extensions.add(extension)
+                    if kind == "reply":
+                        reply_count += 1
+                        if reply_count > 1:
+                            raise ChecklistError(
+                                "checklist must contain at most one reply deliverable"
+                            )
+                    items.append(
+                        {
+                            "id": self._checklist_item_id(index, incoming["content"]),
+                            "kind": kind,
+                            "content": incoming["content"],
+                            "status": incoming["status"],
+                            **({"extension": extension} if extension else {}),
+                        }
+                    )
+                if task_count == 0 or deliverable_count == 0:
+                    raise ChecklistError(
+                        "initial checklist requires at least one task and one deliverable"
+                    )
+
+            value = {
+                "version": CHECKLIST_VERSION,
+                "run_id": run_id,
+                "revision": int(previous["revision"]) + 1,
+                "completion_revisions": (
+                    int(previous.get("completion_revisions", 0))
+                    + int(newly_completed == 1)
+                ),
+                "source_seq": event_seq,
+                "phase": "running",
+                "updated_at": utc_now(),
+                "items": items,
+            }
+            self._atomic_json(self._checklist_path(paths, run_id), value)
+            return value, True
+
+    @staticmethod
+    def _normalized_checklist_extensions(values: Iterable[str]) -> set[str]:
+        result: set[str] = set()
+        for item in values:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            extension = item.strip().lower()
+            result.add(extension if extension.startswith(".") else f".{extension}")
+        return result
+
+    @staticmethod
+    def _review_checklist_items(
+        items: list[dict[str, Any]],
+        *,
+        output_extensions: set[str],
+        has_reply: bool,
+    ) -> list[dict[str, Any]]:
+        reviewed: list[dict[str, Any]] = []
+        for item in items:
+            if item["status"] == "incomplete" and isinstance(item.get("detail"), str):
+                reviewed.append(dict(item))
+                continue
+            model_completed = item["status"] == "completed"
+            verified = model_completed
+            if item["kind"] == "file":
+                verified = model_completed and item.get("extension") in output_extensions
+            elif item["kind"] == "reply":
+                verified = model_completed and has_reply
+
+            if verified and item["kind"] == "file":
+                detail = (
+                    "已检测到本轮新增或更新的 "
+                    f"{item.get('extension')} 成果"
+                )
+            elif verified and item["kind"] == "reply":
+                detail = "已检测到本轮非空成果回复"
+            elif verified:
+                detail = "已完成并复核"
+            elif item["kind"] == "task":
+                detail = "本轮结束时尚未完成或未完成复核"
+            elif not model_completed:
+                detail = "尚未完成复核"
+            elif item["kind"] == "file":
+                detail = (
+                    "未检测到本轮新增或更新的 "
+                    f"{item.get('extension')} 成果"
+                )
+            else:
+                detail = "未检测到本轮非空成果回复"
+            reviewed.append(
+                {
+                    **item,
+                    "status": "completed" if verified else "incomplete",
+                    "detail": detail[:CHECKLIST_MAX_DETAIL_CHARACTERS],
+                }
+            )
+        return reviewed
+
+    def prepare_checklist_success(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+        output_extensions: Iterable[str] = (),
+        final_response: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Durably review success evidence without exposing a success phase yet."""
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        normalized_extensions = self._normalized_checklist_extensions(output_extensions)
+        has_reply = isinstance(final_response, str) and bool(final_response.strip())
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_checklist(conversation_id, run_id)
+            if previous is None:
+                raise ChecklistError("checklist run has not been started")
+            if previous["phase"] == "committing":
+                return previous, False
+            if previous["phase"] == "succeeded":
+                return previous, False
+            if previous["phase"] != "running":
+                raise ChecklistError("checklist is not eligible for success preparation")
+            if (
+                not previous["items"]
+                or int(previous.get("completion_revisions", 0)) < 1
+                or any(item["status"] == "in_progress" for item in previous["items"])
+            ):
+                raise ChecklistError(
+                    "checklist has no post-initial item completion or is still in progress"
+                )
+            value = {
+                **previous,
+                "revision": int(previous["revision"]) + 1,
+                "phase": "committing",
+                "updated_at": utc_now(),
+                "items": self._review_checklist_items(
+                    previous["items"],
+                    output_extensions=normalized_extensions,
+                    has_reply=has_reply,
+                ),
+            }
+            self._atomic_json(self._checklist_path(paths, run_id), value)
+            return value, True
+
+    def commit_checklist_success(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Commit reviewed success internally before the run commit is published."""
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_checklist(conversation_id, run_id)
+            if previous is None:
+                raise ChecklistError("checklist run has not been started")
+            if previous["phase"] == "succeeded":
+                return previous, False
+            if previous["phase"] != "committing":
+                raise ChecklistError("checklist success was not prepared")
+            value = {
+                **previous,
+                "revision": int(previous["revision"]) + 1,
+                "phase": "succeeded",
+                "updated_at": utc_now(),
+            }
+            self._atomic_json(self._checklist_path(paths, run_id), value)
+            return value, True
+
+    def confirm_checklist_success(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Advance public revision after a pending run commit becomes durable."""
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_checklist(conversation_id, run_id)
+            if previous is None:
+                raise ChecklistError("checklist run has not been started")
+            if previous["phase"] != "succeeded":
+                raise ChecklistError("checklist success is not committed")
+            value = {
+                **previous,
+                "revision": int(previous["revision"]) + 1,
+                "updated_at": utc_now(),
+            }
+            self._atomic_json(self._checklist_path(paths, run_id), value)
+            return value, True
+
+    def correct_checklist_terminal_phase(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+        status: str,
+        output_extensions: Iterable[str] = (),
+        final_response: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Make an already reviewed terminal sidecar match its authoritative run."""
+
+        if status not in CHECKLIST_TERMINAL_STATUSES:
+            raise ValueError("checklist terminal status is invalid")
+        normalized_extensions = self._normalized_checklist_extensions(output_extensions)
+        has_reply = isinstance(final_response, str) and bool(final_response.strip())
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_checklist(conversation_id, run_id)
+            if previous is None:
+                raise ChecklistError("checklist run has not been started")
+            if previous["phase"] == status:
+                return previous, False
+            if previous["phase"] not in CHECKLIST_TERMINAL_STATUSES:
+                raise ChecklistError("checklist is not already terminal")
+            value = {
+                **previous,
+                "revision": int(previous["revision"]) + 1,
+                "phase": status,
+                "updated_at": utc_now(),
+                "items": self._review_checklist_items(
+                    previous["items"],
+                    output_extensions=normalized_extensions,
+                    has_reply=has_reply,
+                ),
+            }
+            self._atomic_json(self._checklist_path(paths, run_id), value)
+            return value, True
+
+    def finalize_checklist(
+        self,
+        conversation_id: str,
+        *,
+        run_id: str,
+        status: str,
+        output_extensions: Iterable[str] = (),
+        final_response: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Close a checklist and independently verify its deliverables."""
+
+        if not RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("run id is invalid")
+        if status not in CHECKLIST_TERMINAL_STATUSES:
+            raise ValueError("checklist terminal status is invalid")
+        if status == "succeeded":
+            _prepared, prepared_changed = self.prepare_checklist_success(
+                conversation_id,
+                run_id=run_id,
+                output_extensions=output_extensions,
+                final_response=final_response,
+            )
+            committed, committed_changed = self.commit_checklist_success(
+                conversation_id,
+                run_id=run_id,
+            )
+            return committed, prepared_changed or committed_changed
+        normalized_extensions = self._normalized_checklist_extensions(output_extensions)
+        has_reply = isinstance(final_response, str) and bool(final_response.strip())
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            previous = self.read_checklist(conversation_id, run_id)
+            if previous is None:
+                raise ChecklistError("checklist run has not been started")
+            if previous.get("phase") in CHECKLIST_TERMINAL_STATUSES:
+                if previous["phase"] == status:
+                    return previous, False
+                return self.correct_checklist_terminal_phase(
+                    conversation_id,
+                    run_id=run_id,
+                    status=status,
+                    output_extensions=normalized_extensions,
+                    final_response=final_response,
+                )
+            items = self._review_checklist_items(
+                previous["items"],
+                output_extensions=normalized_extensions,
+                has_reply=has_reply,
+            )
+            value = {
+                "version": CHECKLIST_VERSION,
+                "run_id": run_id,
+                "revision": int(previous["revision"]) + 1,
+                "completion_revisions": int(
+                    previous.get("completion_revisions", 0)
+                ),
+                "source_seq": previous.get("source_seq"),
+                "phase": status,
+                "updated_at": utc_now(),
+                "items": items,
+            }
+            self._atomic_json(self._checklist_path(paths, run_id), value)
             return value, True
 
     def read_run(self, conversation_id: str) -> dict[str, Any]:

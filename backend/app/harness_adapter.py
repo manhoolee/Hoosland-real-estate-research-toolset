@@ -14,7 +14,12 @@ from typing import Any, Callable
 from .config import Settings
 from .capabilities import McpAccessRegistry
 from .runtime_config import DEFAULT_OUTPUT_FORMATS, RuntimeConfigStore
-from .storage import ConversationStore
+from .storage import (
+    CHECKLIST_MAX_CONTENT_CHARACTERS,
+    CHECKLIST_MAX_ITEMS,
+    CHECKLIST_MODEL_STATUSES,
+    ConversationStore,
+)
 
 _RESEARCH_PROGRESS = {
     "brief": {
@@ -71,6 +76,26 @@ class HarnessRunResult:
     final_response: str
     finish_reason: str | None
     session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChecklistTodo:
+    content: str
+    status: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"content": self.content, "status": self.status}
+
+
+@dataclass(frozen=True, slots=True)
+class ChecklistSnapshot:
+    session_id: str
+    event_seq: int
+    event_time_ms: int
+    todos: tuple[ChecklistTodo, ...]
+
+    def todo_dicts(self) -> list[dict[str, str]]:
+        return [todo.as_dict() for todo in self.todos]
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +329,16 @@ def build_harness_prompt(
         "- 主控在宣布完成前必须核对本轮要求的所有文件实际存在且可打开；默认不生成 PDF。"
     )
 
+    sections.append(
+        "[任务与成果清单]\n"
+        "- 除读取本段固定规则与当前请求外，本轮第一个实质动作必须调用 todo_write；先提交完整清单，再调用 Skill、检索、读取、分析、命令或文件工具。\n"
+        "- 清单必须至少包含一个以“任务｜”开头的执行任务，以及至少一个成果项。文件成果必须逐格式单列，严格写成“成果文件(.ext)｜说明”（例如成果文件(.md)｜研究报告），每种扩展名只列一项；不形成文件时写“成果回复｜说明”。\n"
+        "- todo_write 每次发送完整清单。首次清单不得包含 completed；首次提交后不得改名、重排、新增或删除项目，只能更新状态；按顺序执行时最多一个项目为 in_progress。\n"
+        "- 每完成并复核一个任务或成果要求，必须立即再次调用 todo_write 更新整表，每次最多把一个此前未完成项目改为 completed，不得批量补记。只有取得实际证据后才能标 completed。\n"
+        "- 输出文件必须在唯一 outputs/ 中实际存在、非空且对应本轮新增或更新，才可把相应成果文件项标为 completed；最终答复非空且已复核，才可把成果回复项标为 completed。\n"
+        "- 提交 final 前必须最后调用一次 todo_write，同步所有已完成与未完成项目；未完成项目保持 pending，不得伪报 completed。"
+    )
+
     if conversation_history:
         sections.append(
             "[已完成历史]\n"
@@ -336,6 +371,88 @@ def build_harness_prompt(
         + json.dumps({"content": content}, ensure_ascii=False, separators=(",", ":"))
     )
     return "\n\n".join(sections)
+
+
+def harness_session_id(
+    conversation_id: str,
+    run_id: str,
+    session_generation: int,
+) -> str:
+    """Build the one root SDK session id shared by the manager and observers."""
+
+    return f"web-{conversation_id}-g{session_generation}-r{run_id}"
+
+
+def notification_to_checklist_snapshot(
+    notification: object,
+    *,
+    expected_session_id: str,
+) -> ChecklistSnapshot | None:
+    """Extract a successful root-session ``todo/write`` whole-list snapshot.
+
+    The Python SDK forwards notifications for the root session and all known
+    descendants. A child agent owns a different todo list, so accepting only the
+    exact root id is mandatory. Tool-call arguments are deliberately ignored:
+    only the committed ``todo/write`` event proves that validation and execution
+    succeeded inside Harness.
+    """
+
+    method = getattr(notification, "method", None)
+    payload = getattr(notification, "payload", None)
+    if isinstance(notification, dict):
+        method = notification.get("method", method)
+        payload = notification.get("payload", payload)
+    if method != "session.event" or not isinstance(payload, dict):
+        return None
+    if payload.get("sessionId") != expected_session_id:
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict) or event.get("type") != "todo/write":
+        return None
+    event_seq = event.get("seq")
+    event_time_ms = event.get("time", 0)
+    if (
+        isinstance(event_seq, bool)
+        or not isinstance(event_seq, int)
+        or event_seq < 0
+        or isinstance(event_time_ms, bool)
+        or not isinstance(event_time_ms, int)
+        or event_time_ms < 0
+    ):
+        return None
+    data = event.get("data")
+    todos = data.get("todos") if isinstance(data, dict) else None
+    if not isinstance(todos, list) or not todos or len(todos) > CHECKLIST_MAX_ITEMS:
+        return None
+    normalized: list[ChecklistTodo] = []
+    seen: set[str] = set()
+    in_progress = 0
+    for item in todos:
+        if not isinstance(item, dict) or set(item) != {"content", "status"}:
+            return None
+        content = item.get("content")
+        status = item.get("status")
+        if not isinstance(content, str):
+            return None
+        content = content.strip()
+        if (
+            not content
+            or len(content) > CHECKLIST_MAX_CONTENT_CHARACTERS
+            or content in seen
+            or status not in CHECKLIST_MODEL_STATUSES
+        ):
+            return None
+        seen.add(content)
+        in_progress += int(status == "in_progress")
+        if in_progress > 1:
+            return None
+        normalized.append(ChecklistTodo(content=content, status=str(status)))
+    return ChecklistSnapshot(
+        session_id=expected_session_id,
+        event_seq=event_seq,
+        event_time_ms=event_time_ms,
+        todos=tuple(normalized),
+    )
 
 
 def notification_to_output_write_attempt(
@@ -544,6 +661,9 @@ def _safe_operation_identifier(value: str) -> str:
 def _operation_tool_category(tool_name: str) -> str:
     normalized = tool_name.lower()
     categories = (
+        ("todo_write", "checklist"),
+        ("todo-write", "checklist"),
+        ("todo", "checklist"),
         ("skill", "skill"),
         ("vision_analyze", "vision_analyze"),
         ("image_generate", "image_generate"),
@@ -758,7 +878,7 @@ class HarnessManager:
         # eviction, or configuration reset.  The HTTP run id makes the SDK id
         # unique while the application restores continuity from its own
         # successful-message history.
-        session_id = f"web-{conversation_id}-g{session_generation}-r{run_id}"
+        session_id = harness_session_id(conversation_id, run_id, session_generation)
         try:
             result = await asyncio.to_thread(
                 runner.run,

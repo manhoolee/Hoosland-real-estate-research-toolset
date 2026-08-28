@@ -8,6 +8,8 @@ from pathlib import Path
 from app.harness_adapter import (
     SKILL_COMMAND,
     build_harness_prompt,
+    harness_session_id,
+    notification_to_checklist_snapshot,
     notification_to_operation_event,
     notification_to_output_write_attempt,
     notification_to_stream_event,
@@ -40,6 +42,7 @@ class HarnessAdapterTests(unittest.TestCase):
             "[总控激活]",
             "[唯一工作区路径]",
             "[交付策略]",
+            "[任务与成果清单]",
             "[已完成历史]",
             "[附件清单]",
             "[当前请求]",
@@ -167,7 +170,7 @@ class HarnessAdapterTests(unittest.TestCase):
     def test_main_system_prompt_has_one_versioned_source(self) -> None:
         cordis_path = Path(__file__).resolve().parents[1] / "cordis.yml"
         cordis = cordis_path.read_text(encoding="utf-8")
-        self.assertEqual(1, cordis.count("real-estate-system-v0.2.2"))
+        self.assertEqual(1, cordis.count("real-estate-system-v0.2.3"))
         self.assertIn("includeRuntimeContext: true", cordis)
         self.assertIn("write/edit 文件工具不跟随 persistent Bash 的 cd", cordis)
         self.assertIn("/tmp/**/outputs", cordis)
@@ -191,6 +194,143 @@ class HarnessAdapterTests(unittest.TestCase):
         self.assertIn("微信资料转换/归档、社交平台素材", cordis)
         self.assertIn("业务责任专项 → real-estate-report-editorial → real-estate-report-design", cordis)
         self.assertIn("最终 QA 放行前只能准确称为相应阶段的候选稿或待审批包", cordis)
+        self.assertIn("name: '@deepseek-ai/dsh-tool-todo'", cordis)
+        self.assertIn("allowParallelInProgress: false", cordis)
+        self.assertIn("goals: false", cordis)
+        self.assertIn("第一个实质动作必须调用 todo_write", cordis)
+
+    def test_todo_write_parser_accepts_only_bounded_unique_root_snapshots(self) -> None:
+        session_id = harness_session_id("conversation_123456", "a" * 32, 3)
+
+        def notification(
+            *,
+            root: str = session_id,
+            seq: object = 7,
+            todos: object = None,
+        ) -> FakeNotification:
+            return FakeNotification(
+                "session.event",
+                {
+                    "sessionId": root,
+                    "event": {
+                        "type": "todo/write",
+                        "seq": seq,
+                        "time": 123,
+                        "data": {
+                            "todos": todos
+                            if todos is not None
+                            else [
+                                {"content": "任务｜核验数据", "status": "completed"},
+                                {"content": "成果回复｜摘要", "status": "in_progress"},
+                            ]
+                        },
+                    },
+                },
+            )
+
+        snapshot = notification_to_checklist_snapshot(
+            notification(),
+            expected_session_id=session_id,
+        )
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(7, snapshot.event_seq)
+        self.assertEqual(
+            ["任务｜核验数据", "成果回复｜摘要"],
+            [item.content for item in snapshot.todos],
+        )
+
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                notification(root=f"{session_id}-child"),
+                expected_session_id=session_id,
+            )
+        )
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                notification(seq=-1),
+                expected_session_id=session_id,
+            )
+        )
+        duplicate = [
+            {"content": "任务｜重复", "status": "pending"},
+            {"content": "任务｜重复", "status": "pending"},
+        ]
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                notification(todos=duplicate),
+                expected_session_id=session_id,
+            )
+        )
+        two_active = [
+            {"content": "任务｜一", "status": "in_progress"},
+            {"content": "成果回复｜二", "status": "in_progress"},
+        ]
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                notification(todos=two_active),
+                expected_session_id=session_id,
+            )
+        )
+        too_long = [
+            {"content": "任" * 501, "status": "pending"},
+        ]
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                notification(todos=too_long),
+                expected_session_id=session_id,
+            )
+        )
+
+    def test_todo_write_parser_ignores_calls_and_noncanonical_item_shapes(self) -> None:
+        session_id = harness_session_id("conversation_123456", "b" * 32, 0)
+        tool_call = FakeNotification(
+            "session.event",
+            {
+                "sessionId": session_id,
+                "event": {
+                    "type": "tool/call",
+                    "seq": 1,
+                    "data": {"name": "todo_write", "arguments": {"todos": []}},
+                },
+            },
+        )
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                tool_call,
+                expected_session_id=session_id,
+            )
+        )
+        todo_operation = notification_to_operation_event(tool_call)
+        self.assertIsNotNone(todo_operation)
+        assert todo_operation is not None
+        self.assertEqual("checklist", todo_operation["tool_name"])
+        self.assertNotIn("arguments", todo_operation)
+        extra_key = FakeNotification(
+            "session.event",
+            {
+                "sessionId": session_id,
+                "event": {
+                    "type": "todo/write",
+                    "seq": 2,
+                    "data": {
+                        "todos": [
+                            {
+                                "content": "任务｜核验",
+                                "status": "pending",
+                                "private": "must not pass",
+                            }
+                        ]
+                    },
+                },
+            },
+        )
+        self.assertIsNone(
+            notification_to_checklist_snapshot(
+                extra_key,
+                expected_session_id=session_id,
+            )
+        )
 
     def test_text_notification_is_not_public_or_used_as_progress(self) -> None:
         event = notification_to_stream_event(

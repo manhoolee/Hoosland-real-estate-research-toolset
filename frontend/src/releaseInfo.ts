@@ -1,21 +1,21 @@
 export const RELEASE_INFO = {
   releasedAt: "2026-08-28",
-  iteration: "成果文件可靠持久化",
-  compatibility: "兼容修复 · 无数据迁移 · V2 only",
+  iteration: "任务清单与成果复核",
+  compatibility: "兼容新增 · sidecar 惰性创建 · V2 候选",
   summary:
-    "绑定唯一会话成果目录，在成功前核验本轮文件真实落盘，避免临时目录成果被误报为已交付。",
+    "把每轮需求拆成任务与成果要求，运行中逐项更新，结束后保留已完成与未完成的复核结果。",
   changes: [
     {
-      title: "唯一路径",
-      description: "向研究助手明确注入当前会话 work 与 outputs 的唯一真实路径。",
+      title: "需求拆解",
+      description: "运行开始后生成任务与成果要求两组清单，并绑定到本轮任务。",
     },
     {
-      title: "成功硬门禁",
-      description: "尝试生成成果但正式 outputs 未完整变化时，任务转为可重试失败，不再误报成功。",
+      title: "逐项复核",
+      description: "执行中按项同步状态，文件成果还会与本轮实际落盘格式交叉核验。",
     },
     {
-      title: "原能力保留",
-      description: "对话 Token 实时统计、旧文件读取和现有 conversation 数据均保持兼容。",
+      title: "可靠恢复",
+      description: "刷新、停止、失败和重试后仍显示对应运行的完整清单，不覆盖旧轮次。",
     },
   ],
 } as const;

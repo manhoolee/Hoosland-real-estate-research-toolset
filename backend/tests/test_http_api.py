@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
 from app.config import Settings
-from app.harness_adapter import HarnessAdapterError, HarnessRunResult, SKILL_COMMAND
+from app.harness_adapter import (
+    HarnessAdapterError,
+    HarnessRunResult,
+    SKILL_COMMAND,
+    harness_session_id,
+)
 from app.main import (
     _completed_conversation_history,
     _new_or_updated_output_formats,
@@ -41,6 +46,68 @@ class HttpApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
         self.temporary.cleanup()
+
+    @staticmethod
+    def _completed_checklist_run(run: object) -> object:
+        """Adapt legacy fake Harness runs to the native v0.1.1rc1 todo contract."""
+
+        async def wrapped(
+            conversation_id: str,
+            prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            expected_session_id = harness_session_id(
+                conversation_id,
+                run_id,
+                session_generation,
+            )
+
+            def observe(notification: object) -> None:
+                on_notification(notification)
+
+            def emit(seq: int, first_status: str, reply_status: str) -> None:
+                observe(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": expected_session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "time": seq,
+                                "data": {
+                                    "todos": [
+                                        {
+                                            "content": "任务｜完成测试研究",
+                                            "status": first_status,
+                                        },
+                                        {
+                                            "content": "成果回复｜返回测试结论",
+                                            "status": reply_status,
+                                        },
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+
+            emit(1, "in_progress", "pending")
+            result = await run(
+                conversation_id,
+                prompt,
+                observe,
+                run_id=run_id,
+                session_generation=session_generation,
+            )
+            emit(2, "completed", "in_progress")
+            emit(3, "completed", "completed")
+            return result
+
+        return wrapped
 
     def test_run_output_format_audit_ignores_unchanged_old_files(self) -> None:
         baseline = {"report.html": (100, 1)}
@@ -197,13 +264,94 @@ class HttpApiTests(unittest.TestCase):
         self.assertNotIn('"harness"', ready.text.lower())
         self.assertNotIn("harness", capabilities.text.lower())
 
+    def test_public_checklist_hides_internal_prefixes_runtime_names_and_paths(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        run_id = "9" * 32
+        store = self.app.state.store
+        user_message = store.append_message(
+            conversation_id,
+            role="user",
+            content="检查公开清单脱敏",
+        )
+        store.start_checklist(conversation_id, run_id)
+        store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=run_id,
+            event_seq=1,
+            todos=[
+                {
+                    "content": (
+                        "任务｜调用 @deepseek-ai/dsh-secret 于 "
+                        r"C:\Users\private\work\report.md"
+                    ),
+                    "status": "in_progress",
+                },
+                {
+                    "content": "成果文件(.md)｜保存到 /tmp/private/report.md",
+                    "status": "pending",
+                },
+                {
+                    "content": "成果回复｜Cordis 最终结论",
+                    "status": "pending",
+                },
+            ],
+        )
+        store.finalize_checklist(
+            conversation_id,
+            run_id=run_id,
+            status="failed",
+        )
+        terminal = store.append_message(
+            conversation_id,
+            role="assistant",
+            content="",
+            status="error",
+            metadata={
+                "finish_reason": "failed",
+                "reply_to": user_message["id"],
+                "run_id": run_id,
+                "public_error": "任务失败，可重试。",
+            },
+        )
+        store.write_run(
+            conversation_id,
+            status="failed",
+            run_id=run_id,
+            user_message_id=user_message["id"],
+            assistant_message_id=terminal["id"],
+            error_code="INTERNAL_ERROR",
+            retryable=True,
+        )
+
+        run_text = self.client.get(
+            f"/api/conversations/{conversation_id}/run"
+        ).text
+        messages_text = self.client.get(
+            f"/api/conversations/{conversation_id}/messages"
+        ).text
+        public_text = run_text + messages_text
+        for private_value in (
+            "任务｜",
+            "成果文件",
+            "成果回复｜",
+            "deepseek",
+            "dsh-secret",
+            "cordis",
+            r"C:\Users\private",
+            "/tmp/private",
+        ):
+            self.assertNotIn(private_value.lower(), public_text.lower())
+        self.assertIn("[内部路径]", public_text)
+        self.assertIn("（.md 文件）", public_text)
+        self.assertIn("回复：研究助手 最终结论", public_text)
+
     def test_health_responses_expose_current_slot_and_build_identity(self) -> None:
         live = self.client.get("/api/health/live")
         self.assertEqual(200, live.status_code)
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.3",
+                "version": "0.2.4",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -212,7 +360,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.3", ready.json()["version"])
+        self.assertEqual("0.2.4", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
@@ -491,7 +639,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = fake_run
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "研究这个项目", "attachment_ids": []},
@@ -574,7 +722,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = misplaced_run
+        self.app.state.harness.run = self._completed_checklist_run(misplaced_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "生成正式报告", "attachment_ids": []},
@@ -651,7 +799,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = incomplete_run
+        self.app.state.harness.run = self._completed_checklist_run(incomplete_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "生成双格式正式报告", "attachment_ids": []},
@@ -703,7 +851,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = empty_output_run
+        self.app.state.harness.run = self._completed_checklist_run(empty_output_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "生成正式报告", "attachment_ids": []},
@@ -759,7 +907,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = truncated_output_run
+        self.app.state.harness.run = self._completed_checklist_run(truncated_output_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "更新现有报告", "attachment_ids": []},
@@ -809,7 +957,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = missing_delivery_run
+        self.app.state.harness.run = self._completed_checklist_run(missing_delivery_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "生成正式报告", "attachment_ids": []},
@@ -871,7 +1019,9 @@ class HttpApiTests(unittest.TestCase):
                         session_id=f"web-{conversation_id}",
                     )
 
-                self.app.state.harness.run = inline_advisory_run
+                self.app.state.harness.run = self._completed_checklist_run(
+                    inline_advisory_run
+                )
                 response = self.client.post(
                     f"/api/conversations/{conversation_id}/messages",
                     json={"content": request_text, "attachment_ids": []},
@@ -938,7 +1088,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}",
             )
 
-        self.app.state.harness.run = persisted_run
+        self.app.state.harness.run = self._completed_checklist_run(persisted_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "生成正式报告", "attachment_ids": []},
@@ -958,6 +1108,862 @@ class HttpApiTests(unittest.TestCase):
             f"/api/conversations/{conversation_id}/files"
         ).json()["items"]
         self.assertEqual({"report.html", "report.md"}, {item["name"] for item in files})
+
+    def test_checklist_stream_refresh_and_terminal_format_verification(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        output_path = self.app.state.store.require(conversation_id).outputs / "report.md"
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            session_id = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+            contents = [
+                "任务｜核验项目数据",
+                "成果文件(.md)｜研究报告",
+                "成果文件(.html)｜可视化报告",
+                "成果回复｜结论摘要",
+            ]
+
+            def emit(seq: int, statuses: list[str]) -> None:
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "time": 123 + seq,
+                                "data": {
+                                    "todos": [
+                                        {"content": content, "status": status}
+                                        for content, status in zip(
+                                            contents,
+                                            statuses,
+                                            strict=True,
+                                        )
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+
+            emit(1, ["in_progress", "pending", "pending", "pending"])
+            output_path.write_text("# 已核验报告", encoding="utf-8")
+            emit(2, ["completed", "in_progress", "pending", "pending"])
+            emit(3, ["completed", "completed", "in_progress", "pending"])
+            emit(4, ["completed", "completed", "completed", "in_progress"])
+            emit(5, ["completed", "completed", "completed", "completed"])
+            await asyncio.sleep(0)
+            return HarnessRunResult(
+                final_response="结论摘要已完成。",
+                finish_reason="stop",
+                session_id=session_id,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "请研究并输出报告", "attachment_ids": []},
+        )
+        self.assertEqual(200, response.status_code)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        checklist_events = [event for event in events if event.get("type") == "checklist"]
+        self.assertGreaterEqual(len(checklist_events), 4)
+        self.assertEqual("planning", checklist_events[0]["checklist"]["phase"])
+        terminal = checklist_events[-1]["checklist"]
+        self.assertEqual(
+            {"version", "revision", "phase", "updated_at", "tasks", "deliverables"},
+            set(terminal),
+        )
+        self.assertEqual("succeeded", terminal["phase"])
+        self.assertEqual("completed", terminal["tasks"][0]["status"])
+        self.assertEqual("核验项目数据", terminal["tasks"][0]["text"])
+        deliverables = {item["text"]: item for item in terminal["deliverables"]}
+        self.assertEqual(
+            "completed",
+            deliverables["研究报告（.md 文件）"]["status"],
+        )
+        self.assertEqual(
+            "已检测到本轮新增或更新的 .md 成果",
+            deliverables["研究报告（.md 文件）"]["detail"],
+        )
+        self.assertEqual(
+            "incomplete",
+            deliverables["可视化报告（.html 文件）"]["status"],
+        )
+        self.assertEqual(
+            "未检测到本轮新增或更新的 .html 成果",
+            deliverables["可视化报告（.html 文件）"]["detail"],
+        )
+        self.assertEqual(
+            "completed",
+            deliverables["回复：结论摘要"]["status"],
+        )
+        terminal_index = max(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "checklist"
+        )
+        final_index = next(
+            index for index, event in enumerate(events) if event.get("type") == "final"
+        )
+        self.assertLess(terminal_index, final_index)
+
+        refreshed_run = self.client.get(
+            f"/api/conversations/{conversation_id}/run"
+        ).json()
+        self.assertEqual(terminal, refreshed_run["checklist"])
+        refreshed_messages = self.client.get(
+            f"/api/conversations/{conversation_id}/messages"
+        ).json()["items"]
+        assistant = next(item for item in refreshed_messages if item["role"] == "assistant")
+        self.assertEqual(terminal, assistant["checklist"])
+        run_id = self.app.state.store.read_run(conversation_id)["run_id"]
+        sidecar = self.app.state.store.require(conversation_id).checklists / f"{run_id}.json"
+        self.assertTrue(sidecar.is_file())
+        self.assertNotIn("checklist", self.app.state.store.read_run(conversation_id))
+
+    def test_missing_checklist_is_rejected_before_success_and_assistant_completion(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            _on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            return HarnessRunResult(
+                final_response="这段回复不能绕过清单门禁。",
+                finish_reason="stop",
+                session_id="fake-session",
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "无清单运行", "attachment_ids": []},
+        )
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        error_index = next(
+            index for index, event in enumerate(events) if event.get("type") == "error"
+        )
+        terminal_checklist_index = max(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "checklist"
+        )
+        self.assertLess(terminal_checklist_index, error_index)
+        self.assertEqual("AGENT_CHECKLIST_MISSING", events[error_index]["code"])
+        self.assertEqual(
+            "failed",
+            events[terminal_checklist_index]["checklist"]["phase"],
+        )
+        self.assertNotIn("这段回复不能绕过清单门禁。", response.text)
+        stored = self.app.state.store.list_messages(conversation_id)
+        assistant = next(item for item in stored if item["role"] == "assistant")
+        self.assertEqual("error", assistant["status"])
+        self.assertEqual("", assistant["content"])
+        self.assertEqual(
+            "failed",
+            self.app.state.store.read_run(conversation_id)["status"],
+        )
+
+    def test_pre_checklist_substantive_operation_rejects_otherwise_valid_run(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        private_marker = "PRIVATE-PRE-CHECKLIST-OPERATION-93d2"
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            session_id = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+            on_notification(
+                {
+                    "method": "session.event",
+                    "payload": {
+                        "sessionId": session_id,
+                        "event": {
+                            "type": "tool/call",
+                            "seq": 1,
+                            "data": {
+                                "name": "web_search",
+                                "arguments": {"query": private_marker},
+                            },
+                        },
+                    },
+                }
+            )
+            contents = ["任务｜先列清单再研究", "成果回复｜研究结论"]
+            for seq, statuses in enumerate(
+                (
+                    ("in_progress", "pending"),
+                    ("completed", "in_progress"),
+                    ("completed", "completed"),
+                ),
+                start=2,
+            ):
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "data": {
+                                    "todos": [
+                                        {"content": content, "status": status}
+                                        for content, status in zip(
+                                            contents,
+                                            statuses,
+                                            strict=True,
+                                        )
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+            return HarnessRunResult(
+                final_response="不得绕过首动作门禁",
+                finish_reason="stop",
+                session_id=session_id,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "先搜索后补清单", "attachment_ids": []},
+        )
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        error_index = next(
+            index for index, event in enumerate(events) if event.get("type") == "error"
+        )
+        checklist_index = max(
+            index for index, event in enumerate(events) if event.get("type") == "checklist"
+        )
+        self.assertEqual("AGENT_CHECKLIST_MISSING", events[error_index]["code"])
+        self.assertLess(checklist_index, error_index)
+        self.assertEqual("failed", events[checklist_index]["checklist"]["phase"])
+        self.assertFalse(any(event.get("type") == "final" for event in events))
+        raw_log = self.settings.operation_log_path.read_text(encoding="utf-8")
+        records = [json.loads(line) for line in raw_log.splitlines() if line]
+        violation = next(
+            item
+            for item in records
+            if item.get("event") == "agent.checklist.order_violation"
+        )
+        self.assertTrue(violation["checklist_order_violation"])
+        self.assertEqual(1, violation["operation_count"])
+        self.assertNotIn(private_marker, raw_log)
+
+    def test_todo_write_tool_call_is_not_a_pre_checklist_order_violation(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            session_id = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+            on_notification(
+                {
+                    "method": "session.event",
+                    "payload": {
+                        "sessionId": session_id,
+                        "event": {
+                            "type": "tool/call",
+                            "seq": 1,
+                            "data": {
+                                "name": "todo_write",
+                                "arguments": {"todos": "private-call-arguments"},
+                            },
+                        },
+                    },
+                }
+            )
+            contents = ["任务｜执行研究", "成果回复｜研究结论"]
+            for seq, statuses in enumerate(
+                (
+                    ("in_progress", "pending"),
+                    ("completed", "in_progress"),
+                    ("completed", "completed"),
+                ),
+                start=2,
+            ):
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "data": {
+                                    "todos": [
+                                        {"content": content, "status": status}
+                                        for content, status in zip(
+                                            contents,
+                                            statuses,
+                                            strict=True,
+                                        )
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+            return HarnessRunResult(
+                final_response="首个工具调用仅为清单自身",
+                finish_reason="stop",
+                session_id=session_id,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "合法首清单", "attachment_ids": []},
+        )
+        self.assertIn('"type":"final"', response.text)
+        self.assertNotIn("AGENT_CHECKLIST_MISSING", response.text)
+        self.assertEqual(
+            "succeeded",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+
+    def test_checklist_state_machine_rejects_completion_shortcuts(self) -> None:
+        cases = {
+            "initial_completed": (
+                ("completed", "completed"),
+            ),
+            "batch_completed": (
+                ("in_progress", "pending"),
+                ("completed", "completed"),
+            ),
+            "no_post_initial_completion": (
+                ("pending", "pending"),
+                ("pending", "pending"),
+            ),
+        }
+        for case_name, snapshots in cases.items():
+            with self.subTest(case=case_name):
+                conversation_id = self.client.post(
+                    "/api/conversations",
+                    json={},
+                ).json()["id"]
+
+                async def fake_run(
+                    current_conversation_id: str,
+                    _prompt: str,
+                    on_notification: object,
+                    *,
+                    run_id: str,
+                    session_generation: int = 0,
+                    current_snapshots: tuple[tuple[str, str], ...] = snapshots,
+                ) -> HarnessRunResult:
+                    session_id = harness_session_id(
+                        current_conversation_id,
+                        run_id,
+                        session_generation,
+                    )
+                    contents = ["任务｜逐项研究", "成果回复｜逐项结论"]
+                    for seq, statuses in enumerate(current_snapshots, start=1):
+                        on_notification(
+                            {
+                                "method": "session.event",
+                                "payload": {
+                                    "sessionId": session_id,
+                                    "event": {
+                                        "type": "todo/write",
+                                        "seq": seq,
+                                        "data": {
+                                            "todos": [
+                                                {
+                                                    "content": content,
+                                                    "status": status,
+                                                }
+                                                for content, status in zip(
+                                                    contents,
+                                                    statuses,
+                                                    strict=True,
+                                                )
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        )
+                    return HarnessRunResult(
+                        final_response="快捷完成不得通过",
+                        finish_reason="stop",
+                        session_id=session_id,
+                    )
+
+                self.app.state.harness.run = fake_run
+                response = self.client.post(
+                    f"/api/conversations/{conversation_id}/messages",
+                    json={"content": case_name, "attachment_ids": []},
+                )
+                events = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in response.text.splitlines()
+                    if line.startswith("data: ")
+                ]
+                error = next(event for event in events if event.get("type") == "error")
+                self.assertEqual("AGENT_CHECKLIST_MISSING", error["code"])
+                self.assertFalse(any(event.get("type") == "final" for event in events))
+                terminal = [
+                    event["checklist"]
+                    for event in events
+                    if event.get("type") == "checklist"
+                ][-1]
+                self.assertEqual("failed", terminal["phase"])
+
+    def test_success_commit_failure_is_compensated_before_error_streams(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            _on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            return HarnessRunResult(
+                final_response="不应在提交失败后写入的成功回复",
+                finish_reason="stop",
+                session_id="fake-session",
+            )
+
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
+        store = self.app.state.store
+        original_commit = store.commit_checklist_success
+
+        def fail_commit(*_args: object, **_kwargs: object) -> object:
+            raise OSError("simulated checklist commit failure")
+
+        store.commit_checklist_success = fail_commit
+        try:
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "测试清单提交故障", "attachment_ids": []},
+            )
+        finally:
+            store.commit_checklist_success = original_commit
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        error_index = next(
+            index for index, event in enumerate(events) if event.get("type") == "error"
+        )
+        terminal_index = max(
+            index for index, event in enumerate(events) if event.get("type") == "checklist"
+        )
+        self.assertLess(terminal_index, error_index)
+        self.assertEqual("failed", events[terminal_index]["checklist"]["phase"])
+        self.assertFalse(
+            any(
+                event.get("type") == "checklist"
+                and event["checklist"].get("phase") == "succeeded"
+                for event in events
+            )
+        )
+        self.assertFalse(any(event.get("type") == "final" for event in events))
+        run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
+        self.assertEqual("failed", run["status"])
+        self.assertEqual("failed", run["checklist"]["phase"])
+        assistants = [
+            item
+            for item in store.list_messages(conversation_id)
+            if item["role"] == "assistant"
+        ]
+        self.assertEqual(["error"], [item["status"] for item in assistants])
+
+    def test_assistant_append_failure_rechecks_success_sidecar_as_failed(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        final_response = "该成功回复必须模拟落盘失败"
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            _on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            return HarnessRunResult(
+                final_response=final_response,
+                finish_reason="stop",
+                session_id="fake-session",
+            )
+
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
+        store = self.app.state.store
+        original_append = store.append_message
+
+        def fail_complete_assistant(
+            current_conversation_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            if kwargs.get("role") == "assistant" and kwargs.get("content") == final_response:
+                raise OSError("simulated complete assistant append failure")
+            return original_append(current_conversation_id, **kwargs)
+
+        store.append_message = fail_complete_assistant
+        try:
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "测试成功回复持久化故障", "attachment_ids": []},
+            )
+        finally:
+            store.append_message = original_append
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertFalse(any(event.get("type") == "final" for event in events))
+        self.assertFalse(
+            any(
+                event.get("type") == "checklist"
+                and event["checklist"].get("phase") == "succeeded"
+                for event in events
+            )
+        )
+        error_index = next(
+            index for index, event in enumerate(events) if event.get("type") == "error"
+        )
+        terminal_index = max(
+            index for index, event in enumerate(events) if event.get("type") == "checklist"
+        )
+        self.assertLess(terminal_index, error_index)
+        terminal = events[terminal_index]["checklist"]
+        self.assertEqual("failed", terminal["phase"])
+        self.assertEqual("incomplete", terminal["deliverables"][0]["status"])
+        self.assertEqual(
+            "未检测到本轮非空成果回复",
+            terminal["deliverables"][0]["detail"],
+        )
+        run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
+        self.assertEqual(("failed", "failed"), (run["status"], run["checklist"]["phase"]))
+        assistants = [
+            item
+            for item in store.list_messages(conversation_id)
+            if item["role"] == "assistant"
+        ]
+        self.assertEqual(["error"], [item["status"] for item in assistants])
+        self.assertNotIn(final_response, response.text)
+
+    def test_run_success_write_retries_without_duplicate_terminal_messages(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            _on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            return HarnessRunResult(
+                final_response="提交重试后仍只有一条成功回复",
+                finish_reason="stop",
+                session_id="fake-session",
+            )
+
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
+        store = self.app.state.store
+        original_write_run = store.write_run
+        success_writes = 0
+
+        def fail_first_success_write(
+            current_conversation_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal success_writes
+            if kwargs.get("status") == "succeeded":
+                success_writes += 1
+                if success_writes == 1:
+                    raise OSError("simulated first succeeded run write failure")
+            return original_write_run(current_conversation_id, **kwargs)
+
+        store.write_run = fail_first_success_write
+        try:
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "测试run提交重试", "attachment_ids": []},
+            )
+        finally:
+            store.write_run = original_write_run
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertEqual(2, success_writes)
+        self.assertTrue(any(event.get("type") == "final" for event in events))
+        self.assertFalse(any(event.get("type") == "error" for event in events))
+        success_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "checklist"
+            and event["checklist"].get("phase") == "succeeded"
+        )
+        final_index = next(
+            index for index, event in enumerate(events) if event.get("type") == "final"
+        )
+        self.assertLess(success_index, final_index)
+        run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
+        self.assertEqual(("succeeded", "succeeded"), (run["status"], run["checklist"]["phase"]))
+        assistants = [
+            item
+            for item in store.list_messages(conversation_id)
+            if item["role"] == "assistant"
+        ]
+        self.assertEqual(1, len(assistants))
+        self.assertEqual("completed", assistants[0]["status"])
+
+    def test_post_commit_audit_failure_emits_success_events_exactly_once(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            _on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            return HarnessRunResult(
+                final_response="后置审计恢复成功",
+                finish_reason="stop",
+                session_id="fake-session",
+            )
+
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
+        store = self.app.state.store
+        original_list_files = store.list_files
+        calls = 0
+
+        def fail_first_list_files(current_conversation_id: str) -> list[dict[str, object]]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("simulated post-commit audit failure")
+            return original_list_files(current_conversation_id)
+
+        store.list_files = fail_first_list_files
+        try:
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "测试成功事件恰好一次", "attachment_ids": []},
+            )
+        finally:
+            store.list_files = original_list_files
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertEqual(1, sum(event.get("type") == "final" for event in events))
+        self.assertEqual(
+            1,
+            sum(
+                event.get("type") == "checklist"
+                and event["checklist"].get("phase") == "succeeded"
+                for event in events
+            ),
+        )
+        self.assertFalse(any(event.get("type") == "error" for event in events))
+        assistants = [
+            item
+            for item in store.list_messages(conversation_id)
+            if item["role"] == "assistant"
+        ]
+        self.assertEqual(1, len(assistants))
+
+    def test_run_success_write_recovers_after_two_worker_failures_and_one_get_failure(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+
+        async def fake_run(
+            _conversation_id: str,
+            _prompt: str,
+            _on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            del run_id, session_generation
+            return HarnessRunResult(
+                final_response="可由持久化成功回复恢复run终态",
+                finish_reason="stop",
+                session_id="fake-session",
+            )
+
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
+        store = self.app.state.store
+        original_write_run = store.write_run
+        success_writes = 0
+
+        def fail_three_success_writes(
+            current_conversation_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal success_writes
+            if kwargs.get("status") == "succeeded":
+                success_writes += 1
+                if success_writes <= 3:
+                    raise OSError(f"simulated succeeded run write failure {success_writes}")
+            return original_write_run(current_conversation_id, **kwargs)
+
+        store.write_run = fail_three_success_writes
+        try:
+            response = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                json={"content": "测试二次恢复", "attachment_ids": []},
+            )
+            events = [
+                json.loads(line.removeprefix("data: "))
+                for line in response.text.splitlines()
+                if line.startswith("data: ")
+            ]
+            self.assertTrue(
+                any(
+                    event.get("type") == "error"
+                    and event.get("code") == "RUN_COMMIT_PENDING"
+                    for event in events
+                )
+            )
+            self.assertFalse(any(event.get("type") == "final" for event in events))
+            self.assertFalse(
+                any(
+                    event.get("type") == "checklist"
+                    and event["checklist"].get("phase") == "succeeded"
+                    for event in events
+                )
+            )
+            pending_checklist = [
+                event["checklist"]
+                for event in events
+                if event.get("type") == "checklist"
+            ][-1]
+            self.assertEqual("running", pending_checklist["phase"])
+            pending_messages = self.client.get(
+                f"/api/conversations/{conversation_id}/messages"
+            ).json()["items"]
+            self.assertEqual(
+                ["user"],
+                [item["role"] for item in pending_messages],
+            )
+            self.assertNotIn(
+                "可由持久化成功回复恢复run终态",
+                json.dumps(pending_messages, ensure_ascii=False),
+            )
+            self.assertEqual(
+                1,
+                sum(
+                    item["role"] == "assistant"
+                    and item["status"] == "completed"
+                    for item in store.list_messages(conversation_id)
+                ),
+            )
+            with self.assertRaisesRegex(OSError, "failure 3"):
+                self.client.get(f"/api/conversations/{conversation_id}/run")
+            pending_run_id = store.read_run(conversation_id)["run_id"]
+            self.assertEqual(
+                pending_checklist["revision"],
+                store.read_checklist(
+                    conversation_id,
+                    pending_run_id,
+                )["revision"],
+            )
+            recovered = self.client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+            revision = recovered["checklist"]["revision"]
+            recovered_again = self.client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+            recovered_messages = self.client.get(
+                f"/api/conversations/{conversation_id}/messages"
+            ).json()["items"]
+        finally:
+            store.write_run = original_write_run
+
+        self.assertEqual(4, success_writes)
+        self.assertEqual(("succeeded", "succeeded"), (recovered["status"], recovered["checklist"]["phase"]))
+        self.assertGreater(recovered["checklist"]["revision"], pending_checklist["revision"])
+        self.assertEqual(revision, recovered_again["checklist"]["revision"])
+        assistants = [
+            item
+            for item in store.list_messages(conversation_id)
+            if item["role"] == "assistant"
+        ]
+        self.assertEqual(1, len(assistants))
+        self.assertEqual("completed", assistants[0]["status"])
+        self.assertEqual(
+            ["user", "assistant"],
+            [item["role"] for item in recovered_messages],
+        )
+        self.assertEqual("complete", recovered_messages[-1]["status"])
+        self.assertEqual(
+            "succeeded",
+            recovered_messages[-1]["checklist"]["phase"],
+        )
 
     def test_provider_usage_streams_and_persists_by_conversation(self) -> None:
         missing = self.client.get(
@@ -1100,7 +2106,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=root_session,
             )
 
-        self.app.state.harness.run = fake_run
+        self.app.state.harness.run = self._completed_checklist_run(fake_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "measure this", "attachment_ids": []},
@@ -1215,6 +2221,36 @@ class HttpApiTests(unittest.TestCase):
             call_index = len(calls)
             calls.append((session_generation, prompt))
             if call_index == 0:
+                root_session_id = harness_session_id(
+                    _conversation_id,
+                    run_id,
+                    session_generation,
+                )
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": root_session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": 1,
+                                "time": 1,
+                                "data": {
+                                    "todos": [
+                                        {
+                                            "content": "任务｜执行待取消研究",
+                                            "status": "in_progress",
+                                        },
+                                        {
+                                            "content": "成果回复｜研究结论",
+                                            "status": "pending",
+                                        },
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
                 on_notification(
                     {
                         "method": "session.event",
@@ -1245,10 +2281,48 @@ class HttpApiTests(unittest.TestCase):
                     finish_reason="stop",
                     session_id=f"web-{conversation_id}",
                 )
+            continued_session_id = harness_session_id(
+                _conversation_id,
+                run_id,
+                session_generation,
+            )
+            for seq, statuses in enumerate(
+                (
+                    ("in_progress", "pending"),
+                    ("completed", "in_progress"),
+                    ("completed", "completed"),
+                ),
+                start=1,
+            ):
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": continued_session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "time": seq,
+                                "data": {
+                                    "todos": [
+                                        {
+                                            "content": "任务｜继续研究",
+                                            "status": statuses[0],
+                                        },
+                                        {
+                                            "content": "成果回复｜续聊结论",
+                                            "status": statuses[1],
+                                        },
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
             return HarnessRunResult(
                 final_response="续聊成功",
                 finish_reason="stop",
-                session_id=f"web-{conversation_id}-g{session_generation}",
+                session_id=continued_session_id,
             )
 
         async def fake_cancel(_conversation_id: str, *, run_id: str) -> bool:
@@ -1280,6 +2354,32 @@ class HttpApiTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(200, first_responses[0].status_code)
+        cancelled_events = [
+            json.loads(line.removeprefix("data: "))
+            for line in first_responses[0].text.splitlines()
+            if line.startswith("data: ")
+        ]
+        terminal_checklist_index = max(
+            index
+            for index, event in enumerate(cancelled_events)
+            if event.get("type") == "checklist"
+        )
+        cancelled_event_index = next(
+            index
+            for index, event in enumerate(cancelled_events)
+            if event.get("type") == "cancelled"
+        )
+        self.assertLess(terminal_checklist_index, cancelled_event_index)
+        cancelled_checklist = cancelled_events[terminal_checklist_index]["checklist"]
+        self.assertEqual("cancelled", cancelled_checklist["phase"])
+        self.assertEqual(
+            "本轮结束时尚未完成或未完成复核",
+            cancelled_checklist["tasks"][0]["detail"],
+        )
+        self.assertEqual(
+            "incomplete",
+            cancelled_checklist["deliverables"][0]["status"],
+        )
 
         after_cancel = self.app.state.store.list_messages(conversation_id)
         self.assertEqual(
@@ -1287,9 +2387,11 @@ class HttpApiTests(unittest.TestCase):
             [item["content"] for item in after_cancel if item["role"] == "assistant"],
         )
         self.assertEqual("stopped", after_cancel[-1]["status"])
-        self.assertEqual("cancelled", self.client.get(
+        cancelled_run = self.client.get(
             f"/api/conversations/{conversation_id}/run"
-        ).json()["status"])
+        ).json()
+        self.assertEqual("cancelled", cancelled_run["status"])
+        self.assertEqual(cancelled_checklist, cancelled_run["checklist"])
         metadata = self.app.state.store.read_meta(conversation_id)
         self.assertEqual(1, metadata["agent_session_generation"])
         cancelled_usage = self.client.get(
@@ -1342,7 +2444,7 @@ class HttpApiTests(unittest.TestCase):
                 ),
             )
 
-        self.app.state.harness.run = first_run
+        self.app.state.harness.run = self._completed_checklist_run(first_run)
         first = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "第一轮问题", "attachment_ids": []},
@@ -1373,7 +2475,7 @@ class HttpApiTests(unittest.TestCase):
                 ),
             )
 
-        restarted_app.state.harness.run = restarted_run
+        restarted_app.state.harness.run = self._completed_checklist_run(restarted_run)
         with TestClient(restarted_app) as restarted_client:
             continued = restarted_client.post(
                 f"/api/conversations/{conversation_id}/messages",
@@ -1423,7 +2525,7 @@ class HttpApiTests(unittest.TestCase):
                 ),
             )
 
-        self.app.state.harness.run = slow_run
+        self.app.state.harness.run = self._completed_checklist_run(slow_run)
         first_responses = []
 
         def send_first() -> None:
@@ -1495,7 +2597,7 @@ class HttpApiTests(unittest.TestCase):
                 ),
             )
 
-        self.app.state.harness.run = slow_run
+        self.app.state.harness.run = self._completed_checklist_run(slow_run)
         responses = []
 
         def send() -> None:
@@ -1592,12 +2694,264 @@ class HttpApiTests(unittest.TestCase):
             recovered = restarted_client.get(
                 f"/api/conversations/{conversation_id}/run"
             )
+            recovered_again = restarted_client.get(
+                f"/api/conversations/{conversation_id}/run"
+            )
 
         self.assertEqual(200, recovered.status_code)
         self.assertEqual("interrupted", recovered.json()["status"])
+        self.assertEqual("interrupted", recovered_again.json()["status"])
+        self.assertEqual(
+            recovered.json()["updated_at"],
+            recovered_again.json()["updated_at"],
+        )
         self.assertFalse(recovered.json()["active"])
         self.assertTrue(recovered.json()["retryable"])
         self.assertEqual(user_message["id"], recovered.json()["user_message_id"])
+
+    def test_orphaned_complete_assistant_recovers_success_idempotently(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        run_id = "c" * 32
+        store = self.app.state.store
+        user_message = store.append_message(
+            conversation_id,
+            role="user",
+            content="提交run前服务退出的任务",
+        )
+        store.write_run(
+            conversation_id,
+            status="running",
+            run_id=run_id,
+            user_message_id=user_message["id"],
+        )
+        store.start_checklist(conversation_id, run_id)
+        contents = ["任务｜完成恢复研究", "成果回复｜恢复后的结论"]
+        for seq, statuses in enumerate(
+            (
+                ("in_progress", "pending"),
+                ("completed", "in_progress"),
+                ("completed", "completed"),
+            ),
+            start=1,
+        ):
+            store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=run_id,
+                event_seq=seq,
+                todos=[
+                    {"content": content, "status": status}
+                    for content, status in zip(contents, statuses, strict=True)
+                ],
+            )
+        store.prepare_checklist_success(
+            conversation_id,
+            run_id=run_id,
+            final_response="已持久化的完整成功回复",
+        )
+        store.commit_checklist_success(conversation_id, run_id=run_id)
+        assistant = store.append_message(
+            conversation_id,
+            role="assistant",
+            content="已持久化的完整成功回复",
+            metadata={
+                "finish_reason": "stop",
+                "reply_to": user_message["id"],
+                "run_id": run_id,
+            },
+        )
+
+        restarted_app = create_app(self.settings)
+        with TestClient(restarted_app) as restarted_client:
+            recovered = restarted_client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+            first_revision = recovered["checklist"]["revision"]
+            recovered_again = restarted_client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+            messages = restarted_client.get(
+                f"/api/conversations/{conversation_id}/messages"
+            ).json()["items"]
+
+        self.assertEqual(("succeeded", "succeeded"), (recovered["status"], recovered["checklist"]["phase"]))
+        self.assertNotIn("assistant_message_id", recovered)
+        self.assertEqual(
+            assistant["id"],
+            store.read_run(conversation_id)["assistant_message_id"],
+        )
+        self.assertEqual(first_revision, recovered_again["checklist"]["revision"])
+        self.assertEqual(
+            ["user", "assistant"],
+            [item["role"] for item in messages],
+        )
+        self.assertEqual("complete", messages[-1]["status"])
+
+    def test_orphaned_success_sidecar_without_assistant_is_rechecked_as_interrupted(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        run_id = "d" * 32
+        store = self.app.state.store
+        user_message = store.append_message(
+            conversation_id,
+            role="user",
+            content="成功sidecar后服务退出的任务",
+        )
+        store.write_run(
+            conversation_id,
+            status="running",
+            run_id=run_id,
+            user_message_id=user_message["id"],
+        )
+        store.start_checklist(conversation_id, run_id)
+        contents = ["任务｜完成研究", "成果回复｜最终结论"]
+        for seq, statuses in enumerate(
+            (
+                ("in_progress", "pending"),
+                ("completed", "in_progress"),
+                ("completed", "completed"),
+            ),
+            start=1,
+        ):
+            store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=run_id,
+                event_seq=seq,
+                todos=[
+                    {"content": content, "status": status}
+                    for content, status in zip(contents, statuses, strict=True)
+                ],
+            )
+        store.prepare_checklist_success(
+            conversation_id,
+            run_id=run_id,
+            final_response="尚未落盘的回复",
+        )
+        store.commit_checklist_success(conversation_id, run_id=run_id)
+
+        restarted_app = create_app(self.settings)
+        with TestClient(restarted_app) as restarted_client:
+            recovered = restarted_client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+            recovered_again = restarted_client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+
+        self.assertEqual(("interrupted", "interrupted"), (recovered["status"], recovered["checklist"]["phase"]))
+        self.assertEqual(
+            ("interrupted", recovered["checklist"]["revision"]),
+            (
+                recovered_again["status"],
+                recovered_again["checklist"]["revision"],
+            ),
+        )
+        deliverable = recovered["checklist"]["deliverables"][0]
+        self.assertEqual("incomplete", deliverable["status"])
+        self.assertEqual("未检测到本轮非空成果回复", deliverable["detail"])
+        stored_assistants = [
+            item
+            for item in store.list_messages(conversation_id)
+            if item["role"] == "assistant"
+        ]
+        self.assertEqual(1, len(stored_assistants))
+        self.assertEqual("error", stored_assistants[0]["status"])
+
+    def test_explicit_failed_run_is_not_promoted_by_complete_assistant(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        run_id = "f" * 32
+        store = self.app.state.store
+        user_message = store.append_message(
+            conversation_id,
+            role="user",
+            content="显式失败的任务",
+        )
+        assistant = store.append_message(
+            conversation_id,
+            role="assistant",
+            content="更早写入但不得晋升终态的回复",
+            metadata={
+                "finish_reason": "stop",
+                "reply_to": user_message["id"],
+                "run_id": run_id,
+            },
+        )
+        store.start_checklist(conversation_id, run_id)
+        store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=run_id,
+            event_seq=1,
+            todos=[
+                {"content": "任务｜失败研究", "status": "in_progress"},
+                {"content": "成果回复｜失败结论", "status": "pending"},
+            ],
+        )
+        store.finalize_checklist(
+            conversation_id,
+            run_id=run_id,
+            status="failed",
+        )
+        store.write_run(
+            conversation_id,
+            status="failed",
+            run_id=run_id,
+            user_message_id=user_message["id"],
+            assistant_message_id=assistant["id"],
+            error_code="EXPLICIT_FAILURE",
+            retryable=True,
+        )
+
+        restarted_app = create_app(self.settings)
+        restarted_store = restarted_app.state.store
+        original_write_run = restarted_store.write_run
+        failed_writes = 0
+
+        def fail_first_repair_write(
+            current_conversation_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal failed_writes
+            if kwargs.get("status") == "failed":
+                failed_writes += 1
+                if failed_writes == 1:
+                    raise OSError("simulated explicit failure repair write")
+            return original_write_run(current_conversation_id, **kwargs)
+
+        restarted_store.write_run = fail_first_repair_write
+        with TestClient(restarted_app) as restarted_client:
+            try:
+                with self.assertRaisesRegex(OSError, "explicit failure repair"):
+                    restarted_client.get(
+                        f"/api/conversations/{conversation_id}/run"
+                    )
+                self.assertEqual(
+                    1,
+                    sum(
+                        item["role"] == "assistant" and item["status"] == "error"
+                        for item in store.list_messages(conversation_id)
+                    ),
+                )
+                recovered = restarted_client.get(
+                    f"/api/conversations/{conversation_id}/run"
+                ).json()
+                public_messages = restarted_client.get(
+                    f"/api/conversations/{conversation_id}/messages"
+                ).json()["items"]
+            finally:
+                restarted_store.write_run = original_write_run
+
+        self.assertEqual(("failed", "failed"), (recovered["status"], recovered["checklist"]["phase"]))
+        durable = store.read_run(conversation_id)
+        self.assertEqual("failed", durable["status"])
+        self.assertEqual("EXPLICIT_FAILURE", durable["error_code"])
+        self.assertEqual("error", public_messages[-1]["status"])
+        self.assertEqual("", public_messages[-1]["content"])
+        self.assertNotEqual(assistant["id"], durable["assistant_message_id"])
+        self.assertEqual(
+            1,
+            sum(
+                item["role"] == "assistant" and item["status"] == "error"
+                for item in store.list_messages(conversation_id)
+            ),
+        )
 
     def test_orphaned_retry_run_ignores_previous_terminal_reply_after_restart(self) -> None:
         """A stale reply for the same user turn must not complete the newer retry run."""
@@ -1741,6 +3095,67 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual("running", snapshot["status"])
         self.assertNotIn("user_message_id", snapshot)
 
+    def test_active_projection_hides_durable_success_until_run_commit(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        run_id = "e" * 32
+        store = self.app.state.store
+        user_message = store.append_message(
+            conversation_id,
+            role="user",
+            content="成功提交窗口中的任务",
+        )
+        store.write_run(
+            conversation_id,
+            status="running",
+            run_id=run_id,
+            user_message_id=user_message["id"],
+        )
+        store.start_checklist(conversation_id, run_id)
+        contents = ["任务｜提交研究", "成果回复｜提交结论"]
+        for seq, statuses in enumerate(
+            (
+                ("in_progress", "pending"),
+                ("completed", "in_progress"),
+                ("completed", "completed"),
+            ),
+            start=1,
+        ):
+            store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=run_id,
+                event_seq=seq,
+                todos=[
+                    {"content": content, "status": status}
+                    for content, status in zip(contents, statuses, strict=True)
+                ],
+            )
+        store.prepare_checklist_success(
+            conversation_id,
+            run_id=run_id,
+            final_response="提交结论",
+        )
+        store.commit_checklist_success(conversation_id, run_id=run_id)
+
+        class CommittingRun:
+            cancel_event = asyncio.Event()
+            client_request_id = None
+            user_message_id = user_message["id"]
+
+            def __init__(self) -> None:
+                self.run_id = run_id
+
+        self.app.state.active_runs[conversation_id] = CommittingRun()
+        try:
+            snapshot = self.client.get(
+                f"/api/conversations/{conversation_id}/run"
+            ).json()
+        finally:
+            self.app.state.active_runs.pop(conversation_id, None)
+
+        self.assertEqual("succeeded", store.read_checklist(conversation_id, run_id)["phase"])
+        self.assertEqual("running", snapshot["status"])
+        self.assertEqual("running", snapshot["checklist"]["phase"])
+
     def test_running_state_persistence_failure_prevents_model_start(self) -> None:
         """The API must not accept work that a refreshed page cannot rediscover."""
 
@@ -1772,7 +3187,7 @@ class HttpApiTests(unittest.TestCase):
                 raise OSError("simulated run-state write failure")
             return original_write_run(*args, **kwargs)
 
-        self.app.state.harness.run = model_run
+        self.app.state.harness.run = self._completed_checklist_run(model_run)
         self.app.state.store.write_run = fail_running_state
         try:
             with self.assertRaisesRegex(OSError, "simulated run-state write failure"):
@@ -1837,7 +3252,7 @@ class HttpApiTests(unittest.TestCase):
             del run_id, session_generation
             raise HarnessAdapterError("AGENT_RUN_FAILED", "private provider detail")
 
-        self.app.state.harness.run = failed_run
+        self.app.state.harness.run = self._completed_checklist_run(failed_run)
         failed = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={"content": "请读取原附件并继续", "attachment_ids": []},
@@ -1874,7 +3289,7 @@ class HttpApiTests(unittest.TestCase):
                 session_id=f"web-{conversation_id}-retry",
             )
 
-        self.app.state.harness.run = successful_retry
+        self.app.state.harness.run = self._completed_checklist_run(successful_retry)
         retried = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={

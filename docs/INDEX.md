@@ -7,12 +7,13 @@
 | 版本轴 | 当前值 |
 |---|---|
 | 产品线 | V2 |
-| Application | `0.2.3` |
-| Build | `v0.2.3-output-persistence-20260828T040220Z` |
-| System Prompt | `real-estate-system-v0.2.2` |
+| Application | `0.2.4`（候选；线上仍为 `0.2.3`） |
+| Build | `v0.2.4-task-checklist-20260828T043537Z`（候选） |
+| System Prompt | `real-estate-system-v0.2.3` |
 | Skill bundle | `2.3.1` |
 | Project state Schema | `2.1.0` |
 | Conversation usage sidecar Schema | `1` |
+| Run checklist sidecar Schema | `1` |
 
 当前核心行为契约：
 
@@ -23,6 +24,7 @@
 - 是否完成以真实操作记录和实际文件为准，不以模型在文本中的自述为准。
 - 文件工具的唯一正式交付根是当前会话顶层 `workspace/outputs`；临时目录或嵌套 `outputs` 不构成交付，缺失时不能进入成功终态。
 - 当前对话的可观察 Provider Token 用量按 conversation 累计，通过 SSE 更新并保存在可选 `usage.json` sidecar；reasoning 是 output 子集，不重复计入总量。
+- 每轮根 Agent 使用原生 `todo_write` 整表协议生成任务与成果要求；应用只接受成功的 `todo/write` 事件，并按 run 持久化、复核和恢复完整快照。
 
 ## 文档地图
 
@@ -45,6 +47,7 @@
 - [版本与升级指南](VERSIONING-AND-UPGRADES.md)：独立版本轴、升级要素、兼容性、迁移和回滚要求。
 - [迭代原则](ITERATION-PRINCIPLES.md)：长期不变量、发布分级和 Definition of Done。
 - [更新记录](../CHANGELOG.md)：按版本和 Build 记录已经发布与尚未发布的变化。
+- [V0.2.4 候选说明](releases/v0.2.4/RELEASE-NOTES.md)：任务拆解、成果要求、逐项复核、持久化与上线边界。
 - [V0.2.3 发布说明](releases/v0.2.3/RELEASE-NOTES.md)：唯一成果目录、成功前持久化门禁与兼容性说明。
 - [V0.2.2 发布说明](releases/v0.2.2/RELEASE-NOTES.md)：对话 Token 消耗统计、实时显示、持久化与兼容性说明。
 - [V0.2.1 发布说明](releases/v0.2.1/RELEASE-NOTES.md)：生产源码归档、版本身份修复和页面版本信息的公开摘要。
@@ -83,7 +86,7 @@
 
 以下任一项变化时，必须在同一迭代更新对应文档：
 
-- Application、System Prompt、Skill bundle、Project state Schema、Conversation usage sidecar Schema 或 Build ID；
+- Application、System Prompt、Skill bundle、Project state Schema、Conversation usage sidecar Schema、Run checklist sidecar Schema 或 Build ID；
 - 总控路由、默认输出、交付链或 fail-closed 条件；
 - API、配置项、依赖、数据布局或部署拓扑；
 - 测试基线、验收门槛、迁移方式或回滚方法；

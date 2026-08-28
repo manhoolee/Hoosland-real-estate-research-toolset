@@ -23,7 +23,7 @@ const inferredBaseUrl = inferPublicBaseUrl(window.location.pathname);
 
 export const API_BASE_URL = configuredBaseUrl || inferredBaseUrl;
 export const DEPLOYMENT_SLOT = clean(import.meta.env.VITE_DEPLOYMENT_SLOT) || inferSlot(API_BASE_URL);
-export const APP_VERSION = (clean(import.meta.env.VITE_APP_VERSION) || "0.2.3").replace(/^v/i, "");
+export const APP_VERSION = (clean(import.meta.env.VITE_APP_VERSION) || "0.2.4").replace(/^v/i, "");
 export const APP_TITLE = "Hoosland 地产研究工作台";
 export const GITHUB_REPOSITORY_URL =
   "https://github.com/manhoolee/Hoosland-real-estate-research-toolset";

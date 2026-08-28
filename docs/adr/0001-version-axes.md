@@ -14,7 +14,7 @@
 
 ## 决策
 
-项目独立维护六个版本轴：
+项目独立维护七个版本轴：
 
 | 版本轴 | 表达内容 | 何时升级 |
 |---|---|---|
@@ -23,6 +23,7 @@
 | Skill bundle SemVer | Skill manifest、领域方法和交接契约 | Skill 内容或套件接口变化时升级 |
 | Project state Schema version | 持久化项目/案例数据契约 | 只有持久化 Schema 变化时升级 |
 | Conversation usage sidecar Schema | 对话 Token accounting projection | `usage.json` 字段或计数语义变化时升级 |
+| Run checklist sidecar Schema | 每次运行的任务与成果复核快照 | `checklists/<run_id>.json` 字段或复核语义变化时升级 |
 | Build ID | 一次不可变构建及其部署身份 | 每次可部署构建均生成唯一值 |
 
 Build ID 必须能够关联构建清单、文件校验值和源代码修订。它不是 API 版本，也不能替代 SemVer。
@@ -31,11 +32,12 @@ Build ID 必须能够关联构建清单、文件校验值和源代码修订。�
 
 | 轴 | V0.2 当前值 | 说明 |
 |---|---:|---|
-| Application | `0.2.0` | 发布事实；热修改变运行编排、Ready 状态和默认交付行为但未提升 patch，形成版本债务 |
-| System Prompt | `real-estate-system-v0.2.1` | 新增总控优先与默认报告交付契约 |
-| Skill bundle | `2.3.0` | 本次以构建绑定的版本化 Skill 内容修订上线 |
+| Application | `0.2.4`（候选） | 从当前线上 V0.2.3 精确派生；完成验收与切换前不代表线上版本 |
+| System Prompt | `real-estate-system-v0.2.3` | 新增任务拆解、逐项更新与成果复核契约 |
+| Skill bundle | `2.3.1` | 本次未修改 Skill 内容或套件接口 |
 | Project state Schema | `2.1.0` | 无数据结构变化，无迁移 |
-| Conversation usage sidecar Schema | 未引入 | V0.2.0/V0.2.1 没有该 sidecar |
+| Conversation usage sidecar Schema | `1` | 字段与计数语义未变化 |
+| Run checklist sidecar Schema | `1`（候选新增） | 按 run 惰性创建；旧应用忽略，不回填历史运行 |
 | Build ID | 每个构建唯一 | 由发布清单记录，不在本文固定具体值 |
 
 V0.2 热修改变了应用运行编排、Ready 状态和用户可见默认交付行为，却仍沿用 Application `0.2.0`；Skill 内容也发生修订但 manifest 仍为 `2.3.0`。这两项都是已记录的发布事实与版本债务，不应成为后续惯例。下一次 canonical release 应至少升级 Application 到 `0.2.1`、Skill bundle 到 `2.3.1`。
@@ -46,10 +48,13 @@ V0.2.2 新增每个 conversation 可选的 `usage.json` Token accounting sidecar
 
 V0.2.3 修改了运行编排、成功终态条件与全局工作区规则，因此 Application 升至 `0.2.3`，System Prompt 升至 `real-estate-system-v0.2.2`。Skill 内容、Project state Schema 和 usage sidecar 计数语义均未变化，继续使用 `2.3.1`、`2.1.0` 和 sidecar Schema `1`。
 
+V0.2.4 候选从线上 V0.2.3 对应 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 直接派生。Application 升至 `0.2.4`，System Prompt 升至 `real-estate-system-v0.2.3`，新增按 run 隔离的 checklist sidecar Schema `1`；Skill bundle、Project state Schema 与 usage sidecar Schema 均不变化。该 sidecar 只为新运行惰性创建，不回填旧对话；回滚到 V0.2.3 时文件可保留并由旧代码忽略。
+
 ## 兼容性规则
 
 - Application 或 Prompt 升级不得自动改写 Project state Schema。
 - Conversation usage sidecar 的变化不得借用 Project state Schema 或 Skill bundle 版本表达；必须记录独立 sidecar Schema 的兼容性。
+- Run checklist sidecar 的变化不得写入 content-free 的 `run.json`，也不得借用 Project state Schema、usage sidecar 或 Skill bundle 版本表达。
 - Schema 升级必须提供兼容范围、备份、迁移或重新初始化说明。
 - Skill bundle 与应用必须在发布清单中记录已验证的组合。
 - 只要应用与 Skill 的编排契约共同变化，回滚时必须恢复经过验证的成对组合。
@@ -83,7 +88,7 @@ V0.2.3 修改了运行编排、成功终态条件与全局工作区规则，因�
 
 每次发布至少记录：
 
-- 五轴版本矩阵；
+- 七轴版本矩阵；
 - 兼容性和数据迁移结论；
 - 应用与 Skill 的构建绑定；
 - 构建清单和 SHA-256；

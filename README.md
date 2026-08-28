@@ -24,19 +24,21 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
-| 工作台应用 | `0.2.3` | FastAPI、React、API、文件、长任务恢复与管理配置 |
-| 当前 Build | `v0.2.3-output-persistence-20260828T040220Z` | 本次不可变发布构建标识 |
-| System Prompt | `real-estate-system-v0.2.2` | 全局身份、安全、证据、权限和交付规则 |
+| 工作台应用 | `0.2.4`（候选） | FastAPI、React、API、文件、长任务恢复、任务清单与管理配置 |
+| 候选 Build | `v0.2.4-task-checklist-20260828T043537Z` | 从当前线上 V0.2.3 精确派生，尚未切换线上 |
+| System Prompt | `real-estate-system-v0.2.3` | 全局身份、安全、证据、权限、任务复核和交付规则 |
 | Skill 套件 | `2.3.1` | 1 个总控 + 10 个专项 Skill |
 | 项目状态 Schema | `2.1.0` | Skill 使用的 project_state / case payload 契约，本次不变 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection；兼容、惰性创建 |
+| Run checklist sidecar Schema | `1` | 按新 run 惰性创建；旧对话无需迁移 |
 
-V0.2.3 修复最终文件可能被写入临时目录或嵌套 `outputs` 后仍误报成功的问题：运行 Prompt 注入唯一会话工作区，恢复 Harness 动态运行上下文，并在成功状态前核验本轮成果真实写入顶层 `workspace/outputs`。V0.2.2 的对话 Token 实时统计和 usage sidecar Schema `1` 保持不变；无需数据迁移。
+V0.2.4 候选直接基于当前线上 V0.2.3 Build `v0.2.3-output-persistence-20260828T040220Z`：复用 Harness 原生任务整表事件，把用户需求拆成任务与成果要求，运行中逐项更新，终态将未完成或未复核项目明确收口；文件成果仍与本轮顶层 `workspace/outputs` 的真实变化核对。线上 V2 / slot-b 在完成候选验收和原子切换前继续运行 V0.2.3。
 
 ## 核心能力
 
 - 项目、多对话、附件、历史记录和成果文件管理；
 - REST + SSE 长任务，支持取消、失败重试和页面刷新后的后台任务恢复；
+- 每轮把需求拆成任务与成果要求，执行中逐项同步，终态同时保留已完成与未完成的复核结果；
 - 按 conversation 累计并实时展示主 Agent、子 Agent、重试与压缩步骤中可观察到的 Provider Token 用量；
 - 每个对话独立使用 `inputs / work / outputs` 工作区；
 - 服务端在每轮 Prompt 首行确定性提交 `comprehensive-real-estate-expert` 总控命令，再由总控依据 Skill 描述调用所需子 Skill；用户不需要记忆 slash command；
@@ -51,7 +53,7 @@ V0.2.3 修复最终文件可能被写入临时目录或嵌套 `outputs` 后仍�
 flowchart TD
   U[用户] --> SPA[React / TypeScript SPA]
   SPA -->|REST + SSE| API[FastAPI Orchestrator]
-  API --> STORE[Conversation Store\nmessages / files / run state / usage sidecar]
+  API --> STORE[Conversation Store\nmessages / files / run state\nusage + checklist sidecar]
   API --> RUNTIME[Agent Runtime]
   RUNTIME --> LLM[LLM]
   RUNTIME --> H[DeepSeek Harness + Cordis\n沙箱 / 会话 / 工具 / 取消恢复]
@@ -183,12 +185,13 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-V0.2.3 已上线 V2 / slot-b，并通过 102 个后端单元/HTTP 测试、Python 编译、前端类型检查、生产构建，以及隔离候选和生产真实成果持久化 E2E；同名 Markdown/HTML 更新后，API、磁盘与服务重启后的字节哈希一致。V1 未变更，Skill v2.3.1 未变化。
+当前线上 V2 / slot-b 仍为 V0.2.3，并已通过 102 个后端单元/HTTP 测试及真实成果持久化 E2E。V0.2.4 是从该线上源码直接创建的候选分支，现已通过 124 项后端回归、Python 编译、前端检查与构建、Skill smoke 和本地响应式浏览器复核；真实 Provider 流式 E2E、隔离候选部署与原子切换尚未执行。V1 和 Skill v2.3.1 均不在本次变更范围。
 
 ## 数据与安全边界
 
 - 对话、附件、过程文件、成品和 Harness session 按 conversation 隔离；
 - `usage.json` 是每个 conversation 下独立、可选的统计 sidecar，不包含消息正文；其独立 Schema 为 `1`，缺失时按 0 处理，不改变 project_state Schema `2.1.0`；
+- 运行清单按 `run_id` 保存为独立 sidecar Schema `1`，不写入 content-free 的 `run.json`；V0.2.3 回滚代码会忽略它；
 - 管理配置中的 API 密钥加密保存，但业务消息和附件本身不是应用层全量加密；
 - 管理员登录保护历史列表和配置后台，不构成完整的多租户 IAM；
 - `/mcp` 仅供内部 Harness 使用，生产反向代理应阻断公网访问；
@@ -228,6 +231,7 @@ V0.2.3 已上线 V2 / slot-b，并通过 102 个后端单元/HTTP 测试、Pytho
 - [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
+- [V0.2.4 候选说明](docs/releases/v0.2.4/RELEASE-NOTES.md)
 - [V0.2.3 发布说明](docs/releases/v0.2.3/RELEASE-NOTES.md)
 - [V0.2.2 发布说明](docs/releases/v0.2.2/RELEASE-NOTES.md)
 - [V0.2.1 发布说明](docs/releases/v0.2.1/RELEASE-NOTES.md)

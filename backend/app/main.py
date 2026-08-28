@@ -30,6 +30,8 @@ from .harness_adapter import (
     HarnessAdapterError,
     HarnessManager,
     build_harness_prompt,
+    harness_session_id,
+    notification_to_checklist_snapshot,
     notification_to_operation_event,
     notification_to_output_write_attempt,
     notification_to_stream_event,
@@ -104,6 +106,7 @@ class ActiveRun:
     rotate_session_on_exit: bool = False
     user_message_id: str | None = None
     client_request_id: str | None = None
+    session_id: str | None = None
 
 
 class SpaStaticFiles(StaticFiles):
@@ -293,6 +296,21 @@ def _new_or_updated_output_formats(
     )
 
 
+def _new_or_updated_output_extensions(
+    baseline: dict[str, tuple[int, int]],
+    current: dict[str, tuple[int, int]],
+) -> list[str]:
+    """Return real lowercase suffixes for non-empty outputs changed this run."""
+
+    return sorted(
+        {
+            Path(name).suffix.lower()
+            for name, metadata in current.items()
+            if metadata[0] > 0 and baseline.get(name) != metadata and Path(name).suffix
+        }
+    )
+
+
 def _public_run_error_message(code: str) -> str:
     if code == "AGENT_CANCELLED":
         return "本次研究已终止，可以继续发送消息"
@@ -308,7 +326,11 @@ def _public_run_error_message(code: str) -> str:
     return "本轮研究暂未完成，请重试；详细原因已记录在后台。"
 
 
-def _public_message(message: dict[str, Any]) -> dict[str, Any]:
+def _public_message(
+    message: dict[str, Any],
+    *,
+    checklist: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     result = dict(message)
     if result.get("role") == "assistant" and isinstance(result.get("content"), str):
         result["content"] = _research_assistant_text(result["content"])
@@ -331,6 +353,8 @@ def _public_message(message: dict[str, Any]) -> dict[str, Any]:
         if result["status"] in {"error", "stopped"} and isinstance(public_error, str):
             result["error_message"] = _research_assistant_text(public_error)[:500]
             result["retryable"] = True
+        if checklist is not None:
+            result["checklist"] = _public_checklist(checklist)
     return result
 
 
@@ -385,6 +409,84 @@ def _public_token_usage(record: dict[str, Any]) -> dict[str, Any]:
         "updated_at": record.get("updated_at"),
         "includes_subagents": True,
         "source": "provider_reported",
+    }
+
+
+def _public_checklist(
+    record: dict[str, Any],
+    *,
+    phase_override: str | None = None,
+) -> dict[str, Any]:
+    """Return the validated application checklist without Harness event internals."""
+
+    def safe_text(value: object) -> str:
+        text = _research_assistant_text(str(value or ""))
+        text = re.sub(
+            r"(?i)@deepseek-ai/[A-Za-z0-9._/-]+|\bdsh-[A-Za-z0-9_-]+\b|\bcordis\b",
+            "研究助手",
+            text,
+        )
+        text = re.sub(
+            r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/])[^｜\r\n,，;；。()（）]+",
+            "[内部路径]",
+            text,
+        )
+        text = re.sub(
+            r"(?<![:A-Za-z0-9_])/(?:[^/\s｜,，;；。()（）]+/)+[^｜\r\n,，;；。()（）]*",
+            "[内部路径]",
+            text,
+        )
+        return " ".join(text.split())[:500]
+
+    def public_item(item: dict[str, Any]) -> dict[str, Any]:
+        detail = item.get("detail")
+        content = str(item.get("content") or "")
+        if item.get("kind") == "task":
+            label = content.removeprefix("任务｜").strip()
+        elif item.get("kind") == "reply":
+            label = f"回复：{content.removeprefix('成果回复｜').strip()}"
+        elif item.get("kind") == "file":
+            description = content.partition("｜")[2].strip()
+            label = f"{description}（{item.get('extension')} 文件）"
+        else:
+            label = content
+        return {
+            "id": item["id"],
+            "text": safe_text(label),
+            "status": item["status"],
+            **(
+                {"detail": safe_text(detail)}
+                if isinstance(detail, str) and detail
+                else {}
+            ),
+        }
+
+    items = [item for item in record.get("items", []) if isinstance(item, dict)]
+    phase = phase_override or record.get("phase", "planning")
+    return {
+        "version": 1,
+        "revision": record.get("revision", 0),
+        "phase": "running" if phase == "committing" else phase,
+        **(
+            {"updated_at": record["updated_at"]}
+            if isinstance(record.get("updated_at"), str)
+            else {}
+        ),
+        "tasks": [public_item(item) for item in items if item.get("kind") == "task"],
+        "deliverables": [
+            public_item(item) for item in items if item.get("kind") in {"file", "reply"}
+        ],
+    }
+
+
+def _checklist_event(
+    record: dict[str, Any],
+    *,
+    phase_override: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "type": "checklist",
+        "checklist": _public_checklist(record, phase_override=phase_override),
     }
 
 
@@ -779,53 +881,126 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         conversation_id: str,
         record: dict[str, Any],
     ) -> dict[str, Any]:
-        """Persist legacy projections and repair orphaned running records."""
+        """Repair run/checklist commit state from matching durable assistants."""
 
         is_legacy = record.get("legacy") is True
-        if not is_legacy and record.get("status") != "running":
+        if not is_legacy and record.get("status") == "idle":
             return record
         user_message_id = record.get("user_message_id")
-        reply = (
-            _assistant_reply_for(store.list_messages(conversation_id), user_message_id)
-            if isinstance(user_message_id, str)
-            else None
+        record_run_id = record.get("run_id")
+        candidates: list[dict[str, Any]] = []
+        if isinstance(user_message_id, str):
+            for item in store.list_messages(conversation_id):
+                metadata = item.get("metadata")
+                if (
+                    item.get("role") != "assistant"
+                    or not isinstance(metadata, dict)
+                    or metadata.get("reply_to") != user_message_id
+                ):
+                    continue
+                reply_run_id = metadata.get("run_id")
+                if isinstance(record_run_id, str):
+                    if isinstance(reply_run_id, str):
+                        if reply_run_id != record_run_id:
+                            continue
+                    else:
+                        reply_created_at = item.get("created_at")
+                        run_started_at = record.get("started_at")
+                        if (
+                            not isinstance(reply_created_at, str)
+                            or not isinstance(run_started_at, str)
+                            or reply_created_at < run_started_at
+                        ):
+                            continue
+                elif isinstance(reply_run_id, str):
+                    continue
+                candidates.append(item)
+        record_status = str(record.get("status") or "")
+        terminal_statuses = {"succeeded", "failed", "cancelled", "interrupted"}
+        authoritative_terminal = (
+            not is_legacy and record_status in terminal_statuses
         )
-        if reply is not None and not is_legacy:
-            reply_metadata = reply.get("metadata")
-            reply_run_id = (
-                reply_metadata.get("run_id")
-                if isinstance(reply_metadata, dict)
-                else None
+        # Once run.json is terminal it is the durable commit marker. Re-reading
+        # history must not promote an explicit failure merely because an older
+        # complete assistant for the same turn is also present. Prefer the
+        # assistant id committed by run.json when one exists.
+        committed_assistant_id = record.get("assistant_message_id")
+        committed_reply = next(
+            (
+                item
+                for item in candidates
+                if isinstance(committed_assistant_id, str)
+                and item.get("id") == committed_assistant_id
+            ),
+            None,
+        )
+
+        def assistant_matches_status(
+            item: dict[str, Any] | None,
+            status: str,
+        ) -> bool:
+            if not isinstance(item, dict):
+                return False
+            item_status = str(item.get("status") or "").lower()
+            metadata = item.get("metadata")
+            if status == "succeeded":
+                return item_status in {"complete", "completed", "succeeded"}
+            if status == "failed":
+                return item_status in {"error", "failed"}
+            if status == "cancelled":
+                return item_status in {"stopped", "cancelled", "canceled"}
+            return (
+                status == "interrupted"
+                and item_status in {"error", "failed"}
+                and isinstance(metadata, dict)
+                and metadata.get("finish_reason") == "interrupted"
             )
-            record_run_id = record.get("run_id")
-            reply_created_at = reply.get("created_at")
-            run_started_at = record.get("started_at")
-            if (
-                isinstance(reply_run_id, str)
-                and isinstance(record_run_id, str)
-                and reply_run_id != record_run_id
-            ) or (
-                not isinstance(reply_run_id, str)
-                and isinstance(reply_created_at, str)
-                and isinstance(run_started_at, str)
-                and reply_created_at < run_started_at
-            ):
-                reply = None
+
+        latest_compatible_reply = next(
+            (
+                item
+                for item in reversed(candidates)
+                if assistant_matches_status(item, record_status)
+            ),
+            None,
+        )
+        if authoritative_terminal:
+            reply = (
+                committed_reply
+                if assistant_matches_status(committed_reply, record_status)
+                else latest_compatible_reply or committed_reply
+            )
+        else:
+            reply = candidates[-1] if candidates else None
         reply_status = str(reply.get("status") or "").lower() if reply else ""
         if is_legacy and record.get("status") == "idle":
             repaired_status, retryable = "idle", False
+        elif authoritative_terminal:
+            repaired_status = record_status
+            retryable = bool(record.get("retryable", record_status != "succeeded"))
         elif reply_status in {"complete", "completed", "succeeded"}:
             repaired_status, retryable = "succeeded", False
         elif reply_status in {"error", "failed"}:
-            repaired_status, retryable = "failed", True
+            metadata = reply.get("metadata") if isinstance(reply, dict) else None
+            repaired_status = (
+                "interrupted"
+                if isinstance(metadata, dict)
+                and metadata.get("finish_reason") == "interrupted"
+                else "failed"
+            )
+            retryable = True
         elif reply_status in {"stopped", "cancelled", "canceled"}:
             repaired_status, retryable = "cancelled", True
+        elif record.get("status") in {"failed", "cancelled", "interrupted"}:
+            repaired_status = str(record["status"])
+            retryable = bool(record.get("retryable", True))
         else:
             repaired_status, retryable = "interrupted", True
 
+        reply_matches_terminal = assistant_matches_status(reply, repaired_status)
         if (
-            repaired_status == "interrupted"
-            and reply is None
+            repaired_status in {"failed", "cancelled", "interrupted"}
+            and not reply_matches_terminal
             and isinstance(user_message_id, str)
         ):
             try:
@@ -833,9 +1008,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     conversation_id,
                     role="assistant",
                     content="",
-                    status="error",
+                    status=("stopped" if repaired_status == "cancelled" else "error"),
                     metadata={
-                        "finish_reason": "interrupted",
+                        "finish_reason": repaired_status,
                         "reply_to": user_message_id,
                         **(
                             {"run_id": record["run_id"]}
@@ -844,6 +1019,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         ),
                         "public_error": (
                             "上次后台任务因服务重启未能完成，可以从原请求继续重试。"
+                            if repaired_status == "interrupted"
+                            else _public_run_error_message(
+                                "AGENT_CANCELLED"
+                                if repaired_status == "cancelled"
+                                else str(record.get("error_code") or "INTERNAL_ERROR")
+                            )
                         ),
                     },
                 )
@@ -852,10 +1033,73 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "Failed to persist interrupted terminal state conversation=%s",
                     conversation_id,
                 )
-        return store.write_run(
+        checklist: dict[str, Any] | None = None
+        if isinstance(record_run_id, str):
+            checklist = store.read_checklist(conversation_id, record_run_id)
+            if checklist is not None and checklist.get("phase") != repaired_status:
+                final_response = (
+                    str(reply.get("content"))
+                    if repaired_status == "succeeded"
+                    and isinstance(reply, dict)
+                    and isinstance(reply.get("content"), str)
+                    else None
+                )
+                phase = checklist.get("phase")
+                if repaired_status == "succeeded" and phase == "committing":
+                    store.commit_checklist_success(
+                        conversation_id,
+                        run_id=record_run_id,
+                    )
+                elif phase in {"succeeded", "failed", "cancelled", "interrupted"}:
+                    store.correct_checklist_terminal_phase(
+                        conversation_id,
+                        run_id=record_run_id,
+                        status=repaired_status,
+                        # A restart has no trustworthy output baseline. File
+                        # deliverables are therefore conservatively rechecked
+                        # without carrying forward inferred format evidence.
+                        output_extensions=(),
+                        final_response=final_response,
+                    )
+                elif repaired_status == "succeeded":
+                    store.prepare_checklist_success(
+                        conversation_id,
+                        run_id=record_run_id,
+                        output_extensions=(),
+                        final_response=final_response,
+                    )
+                    store.commit_checklist_success(
+                        conversation_id,
+                        run_id=record_run_id,
+                    )
+                else:
+                    store.finalize_checklist(
+                        conversation_id,
+                        run_id=record_run_id,
+                        status=repaired_status,
+                    )
+
+        needs_run_write = (
+            is_legacy
+            or record.get("status") != repaired_status
+            or (
+                isinstance(reply, dict)
+                and record.get("assistant_message_id") != reply.get("id")
+            )
+        )
+        if not needs_run_write:
+            return record
+        confirm_success_revision = (
+            repaired_status == "succeeded"
+            and record.get("status") != "succeeded"
+            and isinstance(record_run_id, str)
+            and checklist is not None
+            and checklist.get("phase") == "succeeded"
+        )
+        repaired = store.write_run(
             conversation_id,
             status=repaired_status,
-            run_id=(record.get("run_id") if isinstance(record.get("run_id"), str) else None),
+            run_id=record_run_id if isinstance(record_run_id, str) else None,
             client_request_id=(
                 record.get("client_request_id")
                 if isinstance(record.get("client_request_id"), str)
@@ -865,9 +1109,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 user_message_id if isinstance(user_message_id, str) else None
             ),
             assistant_message_id=(reply.get("id") if isinstance(reply, dict) else None),
-            error_code=("RUN_INTERRUPTED" if repaired_status == "interrupted" else None),
+            error_code=(
+                record.get("error_code")
+                if authoritative_terminal
+                and isinstance(record.get("error_code"), str)
+                else "RUN_INTERRUPTED" if repaired_status == "interrupted" else None
+            ),
             retryable=retryable,
         )
+        if confirm_success_revision:
+            # A RUN_COMMIT_PENDING stream projected this durable sidecar as
+            # running. Advance only after run.json is durable so failed retry
+            # reads do not mutate the sidecar or grow revisions without bound.
+            store.confirm_checklist_success(
+                conversation_id,
+                run_id=record_run_id,
+            )
+        return repaired
 
     if app_settings.cors_origins:
         app.add_middleware(
@@ -1294,8 +1552,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/conversations/{conversation_id}/messages")
     async def list_messages(conversation_id: str) -> dict[str, Any]:
-        messages = _visible_messages(store.list_messages(conversation_id))
-        return {"items": [_public_message(item) for item in messages]}
+        durable_run = store.read_run(conversation_id)
+        pending_run_id = (
+            durable_run.get("run_id")
+            if durable_run.get("status") == "running"
+            and isinstance(durable_run.get("run_id"), str)
+            else None
+        )
+        stored_messages = store.list_messages(conversation_id)
+        if pending_run_id is not None:
+            # A complete assistant can be durable before the matching run.json
+            # success commit. Keep that prepared reply (and its succeeded
+            # sidecar) private until the run commit is authoritative.
+            stored_messages = [
+                item
+                for item in stored_messages
+                if not (
+                    item.get("role") == "assistant"
+                    and str(item.get("status") or "completed").lower()
+                    in {"complete", "completed", "succeeded"}
+                    and isinstance(item.get("metadata"), dict)
+                    and item["metadata"].get("run_id") == pending_run_id
+                )
+            ]
+        messages = _visible_messages(stored_messages)
+        result: list[dict[str, Any]] = []
+        for item in messages:
+            checklist: dict[str, Any] | None = None
+            metadata = item.get("metadata")
+            run_id = metadata.get("run_id") if isinstance(metadata, dict) else None
+            if item.get("role") == "assistant" and isinstance(run_id, str):
+                checklist = store.read_checklist(conversation_id, run_id)
+            result.append(_public_message(item, checklist=checklist))
+        return {"items": result}
 
     @app.get("/api/conversations/{conversation_id}/run")
     async def get_conversation_run(conversation_id: str) -> dict[str, Any]:
@@ -1318,12 +1607,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     record["client_request_id"] = active_client_request_id
                 if active.user_message_id:
                     record["user_message_id"] = active.user_message_id
-                return _public_run_state(record, active=True)
+                result = _public_run_state(record, active=True)
+                checklist = store.read_checklist(conversation_id, active.run_id)
+                if checklist is not None:
+                    checklist_phase = checklist.get("phase")
+                    result["checklist"] = _public_checklist(
+                        checklist,
+                        phase_override=(
+                            "running"
+                            if checklist_phase
+                            in {"committing", "succeeded", "failed", "cancelled", "interrupted"}
+                            else None
+                        ),
+                    )
+                return result
 
             record = store.read_run(conversation_id)
-            if record.get("status") == "running" or record.get("legacy") is True:
-                record = reconcile_inactive_run(conversation_id, record)
-            return _public_run_state(record, active=False)
+            record = reconcile_inactive_run(conversation_id, record)
+            result = _public_run_state(record, active=False)
+            run_id = record.get("run_id")
+            if isinstance(run_id, str):
+                checklist = store.read_checklist(conversation_id, run_id)
+                if checklist is not None:
+                    result["checklist"] = _public_checklist(checklist)
+            return result
 
     @app.get("/api/conversations/{conversation_id}/usage")
     async def get_conversation_usage(conversation_id: str) -> dict[str, Any]:
@@ -1425,6 +1732,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             project_id = str(metadata["project_id"])
             active.project_id = project_id
             active.session_generation = session_generation
+            active.session_id = harness_session_id(
+                conversation_id,
+                active.run_id,
+                session_generation,
+            )
             # Web turns are deliberately stateless at the SDK-session layer.
             # Each run receives bounded successful persisted history. The API
             # deterministically activates the comprehensive controller; that
@@ -1444,6 +1756,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             )
             active.user_message_id = str(user_message["id"])
+            initial_checklist = store.start_checklist(conversation_id, active.run_id)
             write_run_state(
                 conversation_id,
                 status="running",
@@ -1482,6 +1795,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except Exception:
             if active.user_message_id:
+                try:
+                    if store.read_checklist(conversation_id, active.run_id) is not None:
+                        store.finalize_checklist(
+                            conversation_id,
+                            run_id=active.run_id,
+                            status="failed",
+                        )
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to finalize setup checklist conversation=%s run=%s",
+                        conversation_id,
+                        active.run_id,
+                    )
                 terminal_message = append_terminal_assistant(
                     conversation_id,
                     active=active,
@@ -1513,8 +1839,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         attempted_output_formats: set[str] = set()
         attempted_output_target_ids: set[str] = set()
         output_delivery_skill_invoked = False
+        checklist_initialized = False
+        checklist_order_violation = False
+        pre_checklist_operation_count = 0
         highest_progress_step = 1
         output_baseline = _output_fingerprint(conversation_paths.outputs)
+        initial_checklist_event = _checklist_event(initial_checklist)
         initial_usage_event = _token_usage_event(
             conversation_id,
             read_token_usage_safely(conversation_id),
@@ -1522,9 +1852,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         def on_notification(notification: object) -> None:
             nonlocal highest_progress_step
+            nonlocal checklist_initialized
+            nonlocal checklist_order_violation
             nonlocal misplaced_output_write_attempt_count
             nonlocal output_delivery_skill_invoked
             nonlocal output_write_attempt_count
+            nonlocal pre_checklist_operation_count
+            operation_event = notification_to_operation_event(notification)
+            checklist_snapshot = notification_to_checklist_snapshot(
+                notification,
+                expected_session_id=active.session_id or "",
+            )
+            if checklist_snapshot is not None:
+                try:
+                    checklist_record, checklist_changed = store.apply_checklist_snapshot(
+                        conversation_id,
+                        run_id=active.run_id,
+                        event_seq=checklist_snapshot.event_seq,
+                        todos=checklist_snapshot.todo_dicts(),
+                    )
+                except Exception:
+                    operation_log.record(
+                        "agent.checklist.rejected",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        event_seq=checklist_snapshot.event_seq,
+                        item_count=len(checklist_snapshot.todos),
+                        error_code="CHECKLIST_SNAPSHOT_REJECTED",
+                    )
+                    LOGGER.exception(
+                        "Rejected checklist snapshot conversation=%s run=%s seq=%s",
+                        conversation_id,
+                        active.run_id,
+                        checklist_snapshot.event_seq,
+                    )
+                else:
+                    if checklist_record.get("items"):
+                        checklist_initialized = True
+                    if checklist_changed:
+                        operation_log.record(
+                            "agent.checklist.updated",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            event_seq=checklist_snapshot.event_seq,
+                            revision=checklist_record["revision"],
+                            item_count=len(checklist_record["items"]),
+                        )
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait,
+                            _checklist_event(checklist_record),
+                        )
+            if (
+                operation_event is not None
+                and operation_event.get("tool_name") != "checklist"
+                and not checklist_initialized
+            ):
+                pre_checklist_operation_count += 1
+                if not checklist_order_violation:
+                    checklist_order_violation = True
+                    operation_log.record(
+                        "agent.checklist.order_violation",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        checklist_order_violation=True,
+                        operation_count=pre_checklist_operation_count,
+                    )
             output_attempt = notification_to_output_write_attempt(
                 notification,
                 conversation_paths.workspace,
@@ -1590,7 +1991,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         )
             if active.cancel_event.is_set():
                 return
-            operation_event = notification_to_operation_event(notification)
             if operation_event is not None:
                 if operation_event.get("skill_id") in _OUTPUT_DELIVERY_SKILLS:
                     output_delivery_skill_invoked = True
@@ -1637,8 +2037,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     and not active.cancel_event.is_set()
                 )
 
+        def changed_output_extensions() -> list[str]:
+            return _new_or_updated_output_extensions(
+                output_baseline,
+                _output_fingerprint(conversation_paths.outputs),
+            )
+
+        def finalize_terminal_checklist_safely(
+            phase: str,
+            *,
+            final_response: str | None = None,
+        ) -> dict[str, Any] | None:
+            try:
+                record, _changed = store.finalize_checklist(
+                    conversation_id,
+                    run_id=active.run_id,
+                    status=phase,
+                    output_extensions=changed_output_extensions(),
+                    final_response=final_response,
+                )
+                return record
+            except Exception:
+                operation_log.record(
+                    "agent.checklist.failed",
+                    source="backend",
+                    request_id=request.state.request_id,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    run_id=active.run_id,
+                    error_code="CHECKLIST_FINALIZE_FAILED",
+                )
+                LOGGER.exception(
+                    "Failed to finalize checklist conversation=%s run=%s phase=%s",
+                    conversation_id,
+                    active.run_id,
+                    phase,
+                )
+                return None
+
         async def worker() -> None:
             run_started_at = perf_counter()
+            assistant_message: dict[str, Any] | None = None
             operation_log.record(
                 "agent.run.started",
                 source="harness",
@@ -1705,6 +2144,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         agent_session_seeded_generation=active.session_generation,
                     )
                 final_response = _research_assistant_text(result.final_response)
+                checklist_before_success = store.read_checklist(
+                    conversation_id,
+                    active.run_id,
+                )
+                if (
+                    checklist_before_success is None
+                    or checklist_before_success.get("phase") != "running"
+                    or not checklist_before_success.get("items")
+                    or checklist_order_violation
+                    or int(
+                        checklist_before_success.get("completion_revisions", 0)
+                    ) < 1
+                    or any(
+                        item.get("status") == "in_progress"
+                        for item in checklist_before_success.get("items", [])
+                        if isinstance(item, dict)
+                    )
+                ):
+                    operation_log.record(
+                        "agent.checklist.missing",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        error_code="AGENT_CHECKLIST_MISSING",
+                        checklist_order_violation=checklist_order_violation,
+                        pre_checklist_operation_count=pre_checklist_operation_count,
+                    )
+                    raise HarnessAdapterError(
+                        "AGENT_CHECKLIST_MISSING",
+                        "研究助手没有提交可终态复核的任务与成果清单",
+                    )
+                store.prepare_checklist_success(
+                    conversation_id,
+                    run_id=active.run_id,
+                    output_extensions=_new_or_updated_output_extensions(
+                        output_baseline,
+                        output_current,
+                    ),
+                    final_response=final_response,
+                )
+                checklist_record, _checklist_changed = store.commit_checklist_success(
+                    conversation_id,
+                    run_id=active.run_id,
+                )
                 assistant_message = store.append_message(
                     conversation_id,
                     role="assistant",
@@ -1721,12 +2206,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     status="succeeded",
                     active=active,
                     assistant_message_id=str(assistant_message["id"]),
-                )
-                await queue.put(
-                    {
-                        "type": "final",
-                        "message": _public_message(assistant_message),
-                    }
+                    required=True,
                 )
                 outputs = [
                     item for item in store.list_files(conversation_id)
@@ -1756,6 +2236,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         DEFAULT_OUTPUT_FORMATS
                     ).issubset(run_output_formats),
                 )
+                # Only publish terminal success after every fallible durable
+                # and audit step has completed. The recovery branch can then
+                # emit this pair exactly once if a post-assistant step fails.
+                await queue.put(_checklist_event(checklist_record))
+                await queue.put(
+                    {
+                        "type": "final",
+                        "message": _public_message(assistant_message),
+                    }
+                )
             except asyncio.CancelledError:
                 public_error = _public_run_error_message("AGENT_CANCELLED")
                 terminal_message = append_terminal_assistant(
@@ -1765,6 +2255,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     public_error=public_error,
                     finish_reason="cancelled",
                 )
+                checklist_record = finalize_terminal_checklist_safely("cancelled")
+                if checklist_record is not None:
+                    await queue.put(_checklist_event(checklist_record))
                 write_run_state(
                     conversation_id,
                     status="cancelled",
@@ -1810,6 +2303,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "cancelled" if exc.code == "AGENT_CANCELLED" else "failed"
                     ),
                 )
+                checklist_record = finalize_terminal_checklist_safely(durable_status)
+                if checklist_record is not None:
+                    await queue.put(_checklist_event(checklist_record))
                 write_run_state(
                     conversation_id,
                     status=durable_status,
@@ -1838,6 +2334,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "AGENT_PROTOCOL_ERROR",
                     "AGENT_RESPONSE_ERROR",
                     "AGENT_EMPTY_RESPONSE",
+                    "AGENT_CHECKLIST_MISSING",
                 }:
                     active.rotate_session_on_exit = True
                 await queue.put(
@@ -1850,6 +2347,88 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except Exception:
                 LOGGER.exception("Unexpected run failure conversation=%s", conversation_id)
+                if assistant_message is not None:
+                    try:
+                        checklist_record = store.read_checklist(
+                            conversation_id,
+                            active.run_id,
+                        )
+                        if (
+                            checklist_record is not None
+                            and checklist_record.get("phase") == "committing"
+                        ):
+                            checklist_record, _changed = (
+                                store.commit_checklist_success(
+                                    conversation_id,
+                                    run_id=active.run_id,
+                                )
+                            )
+                        if (
+                            checklist_record is None
+                            or checklist_record.get("phase") != "succeeded"
+                        ):
+                            raise RuntimeError("success checklist commit is pending")
+                        write_run_state(
+                            conversation_id,
+                            status="succeeded",
+                            active=active,
+                            assistant_message_id=str(assistant_message["id"]),
+                            required=True,
+                        )
+                        await queue.put(_checklist_event(checklist_record))
+                        await queue.put(
+                            {
+                                "type": "final",
+                                "message": _public_message(assistant_message),
+                            }
+                        )
+                        operation_log.record(
+                            "agent.run.commit_recovered",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            outcome="succeeded",
+                        )
+                        return
+                    except Exception:
+                        LOGGER.exception(
+                            "Success commit remains pending conversation=%s run=%s",
+                            conversation_id,
+                            active.run_id,
+                        )
+                        checklist_record = store.read_checklist(
+                            conversation_id,
+                            active.run_id,
+                        )
+                        if checklist_record is not None:
+                            await queue.put(
+                                _checklist_event(
+                                    checklist_record,
+                                    phase_override="running",
+                                )
+                            )
+                        await queue.put(
+                            {
+                                "type": "error",
+                                "code": "RUN_COMMIT_PENDING",
+                                "message": _public_run_error_message(
+                                    "RUN_COMMIT_PENDING"
+                                ),
+                                "reply_to": active.user_message_id,
+                            }
+                        )
+                        operation_log.record(
+                            "agent.run.commit_pending",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            outcome="pending",
+                        )
+                        return
                 active.rotate_session_on_exit = True
                 public_error = _public_run_error_message("INTERNAL_ERROR")
                 terminal_message = append_terminal_assistant(
@@ -1859,6 +2438,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     public_error=public_error,
                     finish_reason="failed",
                 )
+                checklist_record = finalize_terminal_checklist_safely("failed")
+                if checklist_record is not None:
+                    await queue.put(_checklist_event(checklist_record))
                 write_run_state(
                     conversation_id,
                     status="failed",
@@ -1924,6 +2506,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         task.add_done_callback(app.state.background_tasks.discard)
 
         async def event_stream() -> AsyncIterator[bytes]:
+            yield _sse(initial_checklist_event)
             yield _sse(initial_usage_event)
             yield _sse(research_progress_event("brief"))
             while True:

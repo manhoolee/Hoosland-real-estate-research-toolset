@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from app.storage import (
+    ChecklistError,
     ConversationStore,
     InvalidIdentifier,
     ProjectConflict,
@@ -91,6 +92,283 @@ class ConversationStoreTests(unittest.TestCase):
                 run_id="a" * 32,
                 client_request_id="not-a-canonical-uuid",
             )
+
+    def test_checklist_is_per_run_monotonic_atomic_and_terminally_verified(self) -> None:
+        conversation_id = "conversation_checklist_001"
+        first_run = "a" * 32
+        second_run = "b" * 32
+        self.store.create_or_reuse(conversation_id)
+
+        planning = self.store.start_checklist(conversation_id, first_run)
+        self.assertEqual(0, planning["revision"])
+        self.assertEqual("planning", planning["phase"])
+        self.assertEqual([], planning["items"])
+
+        todos = [
+            {"content": "任务｜核验市场数据", "status": "in_progress"},
+            {"content": "成果文件(.md)｜研究报告", "status": "pending"},
+            {"content": "成果文件(.html)｜可视化报告", "status": "pending"},
+            {"content": "成果回复｜结论摘要", "status": "pending"},
+        ]
+        first, changed = self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=first_run,
+            event_seq=10,
+            todos=todos,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(1, first["revision"])
+        self.assertEqual(
+            ["task", "file", "file", "reply"],
+            [item["kind"] for item in first["items"]],
+        )
+        stable_ids = [item["id"] for item in first["items"]]
+
+        stale, changed = self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=first_run,
+            event_seq=9,
+            todos=todos,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(first, stale)
+
+        completed = first
+        for event_seq, statuses in enumerate(
+            (
+                ("completed", "in_progress", "pending", "pending"),
+                ("completed", "completed", "in_progress", "pending"),
+                ("completed", "completed", "completed", "in_progress"),
+                ("completed", "completed", "completed", "completed"),
+            ),
+            start=11,
+        ):
+            completed, changed = self.store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=first_run,
+                event_seq=event_seq,
+                todos=[
+                    {"content": item["content"], "status": status}
+                    for item, status in zip(todos, statuses, strict=True)
+                ],
+            )
+            self.assertTrue(changed)
+        self.assertEqual(stable_ids, [item["id"] for item in completed["items"]])
+        self.assertEqual(4, completed["completion_revisions"])
+
+        non_regressed, changed = self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=first_run,
+            event_seq=15,
+            todos=[
+                {"content": item["content"], "status": "pending"}
+                for item in completed["items"]
+            ],
+        )
+        self.assertTrue(changed)
+        self.assertTrue(
+            all(item["status"] == "completed" for item in non_regressed["items"])
+        )
+
+        with self.assertRaisesRegex(ChecklistError, "cannot be renamed"):
+            self.store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=first_run,
+                event_seq=16,
+                todos=[
+                    {"content": "任务｜改名", "status": "completed"},
+                    *[
+                        {"content": item["content"], "status": "completed"}
+                        for item in completed["items"][1:]
+                    ],
+                ],
+            )
+
+        terminal, changed = self.store.finalize_checklist(
+            conversation_id,
+            run_id=first_run,
+            status="succeeded",
+            output_extensions=[".md"],
+            final_response="",
+        )
+        self.assertTrue(changed)
+        self.assertEqual("succeeded", terminal["phase"])
+        self.assertEqual(
+            ["completed", "completed", "incomplete", "incomplete"],
+            [item["status"] for item in terminal["items"]],
+        )
+        self.assertEqual(
+            "已检测到本轮新增或更新的 .md 成果",
+            terminal["items"][1]["detail"],
+        )
+        self.assertEqual(
+            "未检测到本轮新增或更新的 .html 成果",
+            terminal["items"][2]["detail"],
+        )
+        self.assertEqual(
+            "未检测到本轮非空成果回复",
+            terminal["items"][3]["detail"],
+        )
+
+        self.store.start_checklist(conversation_id, second_run)
+        self.assertEqual(terminal, self.store.read_checklist(conversation_id, first_run))
+        self.assertEqual(
+            "planning",
+            self.store.read_checklist(conversation_id, second_run)["phase"],
+        )
+        checklist_files = sorted(self.store.require(conversation_id).checklists.glob("*.json"))
+        self.assertEqual([f"{first_run}.json", f"{second_run}.json"], [path.name for path in checklist_files])
+        for path in checklist_files:
+            self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
+
+    def test_checklist_legacy_missing_directory_is_lazy_and_unsafe_directory_is_rejected(self) -> None:
+        conversation_id = "conversation_checklist_002"
+        run_id = "c" * 32
+        self.store.create_or_reuse(conversation_id)
+        paths = self.store.require(conversation_id)
+        paths.checklists.rmdir()
+
+        self.assertIsNone(self.store.read_checklist(conversation_id, run_id))
+        self.assertFalse(paths.checklists.exists())
+        self.store.start_checklist(conversation_id, run_id)
+        self.assertTrue(paths.checklists.is_dir())
+
+        paths.checklists.joinpath(f"{run_id}.json").unlink()
+        paths.checklists.rmdir()
+        paths.checklists.write_text("not a directory", encoding="utf-8")
+        with self.assertRaisesRegex(StorageError, "checklists directory is unsafe"):
+            self.store.require(conversation_id)
+
+    def test_checklist_rejects_precompleted_initial_and_batch_completion(self) -> None:
+        conversation_id = "conversation_checklist_004"
+        run_id = "d" * 32
+        self.store.create_or_reuse(conversation_id)
+        self.store.start_checklist(conversation_id, run_id)
+        contents = ["任务｜逐项执行", "成果回复｜逐项结论"]
+
+        with self.assertRaisesRegex(ChecklistError, "cannot already be completed"):
+            self.store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=run_id,
+                event_seq=1,
+                todos=[
+                    {"content": content, "status": "completed"}
+                    for content in contents
+                ],
+            )
+        self.assertEqual(
+            "planning",
+            self.store.read_checklist(conversation_id, run_id)["phase"],
+        )
+
+        initial, changed = self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=run_id,
+            event_seq=2,
+            todos=[
+                {"content": contents[0], "status": "in_progress"},
+                {"content": contents[1], "status": "pending"},
+            ],
+        )
+        self.assertTrue(changed)
+        with self.assertRaisesRegex(ChecklistError, "cannot complete multiple"):
+            self.store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=run_id,
+                event_seq=3,
+                todos=[
+                    {"content": content, "status": "completed"}
+                    for content in contents
+                ],
+            )
+        self.assertEqual(initial, self.store.read_checklist(conversation_id, run_id))
+
+        one, changed = self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=run_id,
+            event_seq=4,
+            todos=[
+                {"content": contents[0], "status": "completed"},
+                {"content": contents[1], "status": "in_progress"},
+            ],
+        )
+        self.assertTrue(changed)
+        self.assertEqual(1, one["completion_revisions"])
+
+    def test_checklists_symbolic_link_is_rejected_when_platform_supports_it(self) -> None:
+        conversation_id = "conversation_checklist_003"
+        self.store.create_or_reuse(conversation_id)
+        paths = self.store.require(conversation_id)
+        paths.checklists.rmdir()
+        outside = Path(self.temporary.name) / "outside-checklists"
+        outside.mkdir()
+        try:
+            paths.checklists.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"symbolic links are unavailable: {exc}")
+        with self.assertRaisesRegex(StorageError, "checklists directory is unsafe"):
+            self.store.require(conversation_id)
+
+    def test_success_prepare_can_be_corrected_with_terminal_evidence_recheck(self) -> None:
+        conversation_id = "conversation_checklist_005"
+        run_id = "e" * 32
+        self.store.create_or_reuse(conversation_id)
+        self.store.start_checklist(conversation_id, run_id)
+        contents = ["任务｜生成结论", "成果回复｜交付结论"]
+        snapshots = (
+            ("in_progress", "pending"),
+            ("completed", "in_progress"),
+            ("completed", "completed"),
+        )
+        for seq, statuses in enumerate(snapshots, start=1):
+            self.store.apply_checklist_snapshot(
+                conversation_id,
+                run_id=run_id,
+                event_seq=seq,
+                todos=[
+                    {"content": content, "status": status}
+                    for content, status in zip(contents, statuses, strict=True)
+                ],
+            )
+
+        prepared, changed = self.store.prepare_checklist_success(
+            conversation_id,
+            run_id=run_id,
+            final_response="持久化前的候选回复",
+        )
+        self.assertTrue(changed)
+        self.assertEqual("committing", prepared["phase"])
+        frozen, changed = self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=run_id,
+            event_seq=4,
+            todos=[
+                {"content": contents[0], "status": "completed"},
+                {"content": contents[1], "status": "completed"},
+            ],
+        )
+        self.assertFalse(changed)
+        self.assertEqual(prepared, frozen)
+        committed, changed = self.store.commit_checklist_success(
+            conversation_id,
+            run_id=run_id,
+        )
+        self.assertTrue(changed)
+        self.assertEqual("succeeded", committed["phase"])
+
+        corrected, changed = self.store.correct_checklist_terminal_phase(
+            conversation_id,
+            run_id=run_id,
+            status="failed",
+            final_response=None,
+        )
+        self.assertTrue(changed)
+        self.assertEqual("failed", corrected["phase"])
+        self.assertEqual("incomplete", corrected["items"][1]["status"])
+        self.assertEqual(
+            "未检测到本轮非空成果回复",
+            corrected["items"][1]["detail"],
+        )
 
     def test_token_usage_replaces_same_attempt_and_accumulates_retries(self) -> None:
         conversation_id = "conversation_usage_001"

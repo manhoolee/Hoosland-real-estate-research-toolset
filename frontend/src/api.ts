@@ -1,4 +1,13 @@
-import type { AssistantProgress, ChatMessage, TokenUsage, WorkspaceFile } from "./types";
+import type {
+  AssistantProgress,
+  ChatMessage,
+  ChecklistItem,
+  ChecklistItemStatus,
+  ChecklistPhase,
+  RunChecklist,
+  TokenUsage,
+  WorkspaceFile,
+} from "./types";
 import { createClientId } from "./clientId";
 import { API_BASE_URL } from "./deployment";
 
@@ -70,6 +79,7 @@ interface ApiMessage {
   reply_to?: string;
   error_message?: string;
   retryable?: boolean;
+  checklist?: unknown;
 }
 
 export interface ConversationRunState {
@@ -81,6 +91,7 @@ export interface ConversationRunState {
   startedAt?: string;
   updatedAt?: string;
   completedAt?: string;
+  checklist?: RunChecklist;
 }
 
 interface ApiFile {
@@ -149,6 +160,7 @@ export interface ReleaseIdentity {
 export interface StreamCallbacks {
   onReplace: (content: string) => void;
   onProgress: (progress: AssistantProgress) => void;
+  onChecklist: (checklist: RunChecklist) => void;
   onUsage: (usage: TokenUsage) => void;
 }
 
@@ -437,6 +449,7 @@ export async function listMessages(
         replyTo: item.reply_to,
         errorMessage: item.error_message,
         retryable: item.retryable,
+        checklist: normaliseRunChecklist(item.checklist),
       } satisfies ChatMessage;
     });
 }
@@ -460,6 +473,7 @@ export async function getConversationRun(
     started_at?: string;
     updated_at?: string;
     completed_at?: string;
+    checklist?: unknown;
   };
   return {
     status: payload.status || "idle",
@@ -470,6 +484,7 @@ export async function getConversationRun(
     startedAt: payload.started_at,
     updatedAt: payload.updated_at,
     completedAt: payload.completed_at,
+    checklist: normaliseRunChecklist(payload.checklist),
   };
 }
 
@@ -477,6 +492,85 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+const CHECKLIST_PHASES: ReadonlySet<ChecklistPhase> = new Set([
+  "planning",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+
+const CHECKLIST_ITEM_STATUSES: ReadonlySet<ChecklistItemStatus> = new Set([
+  "pending",
+  "in_progress",
+  "completed",
+  "incomplete",
+]);
+
+function normaliseChecklistItem(value: unknown): ChecklistItem | undefined {
+  const item = objectValue(value);
+  if (!item) return undefined;
+  const id = typeof item.id === "string" ? item.id.trim() : "";
+  const text = typeof item.text === "string" ? item.text.trim() : "";
+  const status = typeof item.status === "string" ? item.status : "";
+  if (
+    !id ||
+    !text ||
+    !CHECKLIST_ITEM_STATUSES.has(status as ChecklistItemStatus) ||
+    (item.detail != null && typeof item.detail !== "string")
+  ) return undefined;
+  const detail = typeof item.detail === "string" ? item.detail.trim() : "";
+  return {
+    id,
+    text,
+    status: status as ChecklistItemStatus,
+    ...(detail ? { detail } : {}),
+  };
+}
+
+function normaliseChecklistItems(value: unknown): ChecklistItem[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items: ChecklistItem[] = [];
+  const ids = new Set<string>();
+  for (const entry of value) {
+    const item = normaliseChecklistItem(entry);
+    if (!item || ids.has(item.id)) return undefined;
+    ids.add(item.id);
+    items.push(item);
+  }
+  return items;
+}
+
+export function normaliseRunChecklist(value: unknown): RunChecklist | undefined {
+  const checklist = objectValue(value);
+  if (!checklist || checklist.version !== 1) return undefined;
+  const revision = checklist.revision;
+  const phase = typeof checklist.phase === "string" ? checklist.phase : "";
+  const tasks = normaliseChecklistItems(checklist.tasks);
+  const deliverables = normaliseChecklistItems(checklist.deliverables);
+  if (
+    typeof revision !== "number" ||
+    !Number.isInteger(revision) ||
+    revision < 0 ||
+    !CHECKLIST_PHASES.has(phase as ChecklistPhase) ||
+    !tasks ||
+    !deliverables ||
+    (checklist.updated_at != null && typeof checklist.updated_at !== "string")
+  ) return undefined;
+  const updatedAt = typeof checklist.updated_at === "string"
+    ? checklist.updated_at.trim()
+    : "";
+  return {
+    version: 1,
+    revision,
+    phase: phase as ChecklistPhase,
+    ...(updatedAt ? { updated_at: updatedAt } : {}),
+    tasks,
+    deliverables,
+  };
 }
 
 function tokenNumber(
@@ -590,9 +684,10 @@ export async function getConversationUsage(
 }
 
 function extractStreamValue(payload: unknown): {
-  kind: "delta" | "replace" | "progress" | "usage" | "error" | "none";
+  kind: "delta" | "replace" | "progress" | "checklist" | "usage" | "error" | "none";
   value: string;
   progress?: AssistantProgress;
+  checklist?: RunChecklist;
   usage?: TokenUsage;
 } {
   if (typeof payload === "string") return { kind: "delta", value: payload };
@@ -600,6 +695,15 @@ function extractStreamValue(payload: unknown): {
 
   const data = payload as Record<string, unknown>;
   const type = String(data.type || data.event || "").toLowerCase();
+  const message = objectValue(data.message);
+  const checklist = normaliseRunChecklist(
+    type === "checklist" ? data.checklist : message?.checklist ?? data.checklist,
+  );
+  if (type === "checklist") {
+    return checklist
+      ? { kind: "checklist", value: "", checklist }
+      : { kind: "none", value: "" };
+  }
   if (type === "usage" || type === "token_usage" || type === "token-usage") {
     return {
       kind: "usage",
@@ -607,7 +711,7 @@ function extractStreamValue(payload: unknown): {
       usage: normaliseTokenUsage(data),
     };
   }
-  if (type === "error") {
+  if (type === "error" || type === "cancelled") {
     return {
       kind: "error",
       value: presentResearchAssistantCopy(String(data.message || data.error || "生成失败。")),
@@ -631,26 +735,34 @@ function extractStreamValue(payload: unknown): {
       progress,
     };
   }
-  if (typeof data.delta === "string") return { kind: "delta", value: data.delta };
+  if (typeof data.delta === "string") {
+    return { kind: "delta", value: data.delta, checklist };
+  }
   if (data.delta && typeof data.delta === "object") {
     const delta = data.delta as Record<string, unknown>;
     const value = delta.content || delta.text;
-    if (typeof value === "string") return { kind: "delta", value };
+    if (typeof value === "string") return { kind: "delta", value, checklist };
   }
 
   const choices = data.choices;
   if (Array.isArray(choices) && choices[0] && typeof choices[0] === "object") {
     const choice = choices[0] as Record<string, unknown>;
     const delta = choice.delta as Record<string, unknown> | undefined;
-    if (typeof delta?.content === "string") return { kind: "delta", value: delta.content };
+    if (typeof delta?.content === "string") {
+      return { kind: "delta", value: delta.content, checklist };
+    }
   }
 
-  if (data.message && typeof data.message === "object") {
-    const message = data.message as Record<string, unknown>;
-    if (typeof message.content === "string") return { kind: "replace", value: message.content };
+  if (typeof message?.content === "string") {
+    return { kind: "replace", value: message.content, checklist };
   }
-  if (typeof data.content === "string") return { kind: "replace", value: data.content };
-  if (typeof data.text === "string") return { kind: "replace", value: data.text };
+  if (typeof data.content === "string") {
+    return { kind: "replace", value: data.content, checklist };
+  }
+  if (typeof data.text === "string") {
+    return { kind: "replace", value: data.text, checklist };
+  }
+  if (checklist) return { kind: "checklist", value: "", checklist };
   return { kind: "none", value: "" };
 }
 
@@ -660,11 +772,18 @@ function applyStreamPayload(
   state: { content: string },
 ): void {
   const event = extractStreamValue(payload);
+  if (event.checklist) callbacks.onChecklist(event.checklist);
+  if (event.kind === "checklist") return;
   if (event.kind === "error") {
     const data = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+    const streamType = String(data.type || data.event || "").toLowerCase();
     const error = new Error(event.value);
     Object.assign(error, {
-      code: typeof data.code === "string" ? data.code : undefined,
+      code: typeof data.code === "string"
+        ? data.code
+        : streamType === "cancelled"
+          ? "AGENT_CANCELLED"
+          : undefined,
       replyTo: typeof data.reply_to === "string" ? data.reply_to : undefined,
     });
     throw error;

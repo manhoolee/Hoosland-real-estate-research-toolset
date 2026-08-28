@@ -18,6 +18,7 @@ export interface ChatMessage {
   errorMessage?: string;
   retryable?: boolean;
   progress?: AssistantProgress;
+  checklist?: RunChecklist;
 }
 
 export interface AssistantProgress {
@@ -27,6 +28,36 @@ export interface AssistantProgress {
   totalSteps: number;
   remainingSteps: number;
   etaLabel: string;
+}
+
+export type ChecklistPhase =
+  | "planning"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export type ChecklistItemStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "incomplete";
+
+export interface ChecklistItem {
+  id: string;
+  text: string;
+  status: ChecklistItemStatus;
+  detail?: string;
+}
+
+export interface RunChecklist {
+  version: 1;
+  revision: number;
+  phase: ChecklistPhase;
+  updated_at?: string;
+  tasks: ChecklistItem[];
+  deliverables: ChecklistItem[];
 }
 
 export interface TokenUsage {

@@ -44,11 +44,12 @@ flowchart TD
 2. 发送消息时携带附件 ID 和独立的 `client_request_id`。
 3. 后端先持久化用户消息与 `run.json=running`，两者成功后才启动模型。状态写入失败时禁止启动无法恢复的任务。
 4. `HarnessManager` 为 conversation 创建独立 cwd 和 session root，并签发仅绑定该 conversation 的临时 MCP bearer token。
-5. Cordis 装配主模型、沙箱、文件、会话、搜索、MCP 和唯一的 `real-estate-system-v0.2.2`。
-6. API 以首行 slash command 确定性提交 `comprehensive-real-estate-expert` 总控入口；Prompt/Skill 契约要求总控再通过 Harness 内置 `skill` tool 调用所需子 Skill 并对本轮调用去重。会话首行证明命令已提交，operation/E2E 证明后续子链；当前没有独立的总控正文加载回执。
-7. 中间材料写入 `work`，最终成品只能写入 `outputs`。
-8. 后端持久化唯一 assistant 结果、文件索引与终态；SSE 只发送安全进度和已提交结果。
-9. 页面刷新后按 `run → messages/files → run` 获取一致性快照；仍在运行时继续轮询，终态后自动回填结果。
+5. Cordis 装配主模型、沙箱、文件、会话、原生 `todo_write`、搜索、MCP 和唯一的 `real-estate-system-v0.2.3`。
+6. API 以首行 slash command 确定性提交 `comprehensive-real-estate-expert` 总控入口；根 Agent 先用 `todo_write` 把本轮拆成任务与成果要求，再由总控通过 Harness 内置 `skill` tool 调用所需子 Skill并去重。
+7. 应用只消费成功后的 `todo/write` 整表事件，把它绑定到当前 `run_id` 并以 revision 完整快照发送 SSE；首张清单前出现实质工具操作会阻止成功，首张不得预先完成项目，后续每个 revision 最多新增一个 completed。工具调用参数、子 Agent 清单和旧 run 事件均不能覆盖当前清单。
+8. 中间材料写入 `work`，最终成品只能写入 `outputs`。
+9. 进入终态前，后端把未完成或未复核项标记为未完成，并把文件成果要求与本轮真实新增或更新格式交叉核验。清单使用内部 `committing` 相位准备终态；只有 checklist、唯一 assistant 与 `run.json` 都持久化后才发送成功事件，写入失败与服务重启通过幂等补偿恢复为一致终态。
+10. 页面刷新后按 `run → messages/files → run` 获取包含 checklist revision 的一致性快照；仍在运行时继续轮询，终态后自动回填结果与完整清单。
 
 ## 4. 数据布局
 
@@ -59,6 +60,8 @@ DATA_DIR/
 │   ├── messages.jsonl
 │   ├── files.json
 │   ├── run.json
+│   ├── checklists/
+│   │   └── {run_id}.json
 │   └── workspace/
 │       ├── inputs/
 │       ├── work/

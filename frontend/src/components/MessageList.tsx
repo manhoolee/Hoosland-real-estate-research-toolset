@@ -2,8 +2,12 @@ import {
   ArrowClockwise,
   Buildings,
   ChatsTeardrop,
+  CheckCircle,
+  Circle,
+  CircleNotch,
   ClockCountdown,
   FileText,
+  ListChecks,
   User,
   WarningCircle,
 } from "@phosphor-icons/react";
@@ -11,7 +15,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { RefObject } from "react";
 import { presentResearchAssistantCopy } from "../api";
-import type { ChatMessage } from "../types";
+import type {
+  ChatMessage,
+  ChecklistItem,
+  ChecklistItemStatus,
+  ChecklistPhase,
+  RunChecklist,
+} from "../types";
 
 interface MessageListProps {
   messages: ChatMessage[];
@@ -97,6 +107,153 @@ function AssistantProgress({ message }: { message: ChatMessage }) {
   );
 }
 
+const checklistPhaseLabels: Record<ChecklistPhase, string> = {
+  planning: "正在拆解任务与成果要求",
+  running: "正在逐项执行与复核",
+  succeeded: "执行与复核已完成",
+  failed: "执行结束，仍有未完成项",
+  cancelled: "执行已停止",
+  interrupted: "执行已中断",
+};
+
+const checklistStatusLabels: Record<ChecklistItemStatus, string> = {
+  pending: "待处理",
+  in_progress: "进行中",
+  completed: "已完成",
+  incomplete: "未完成",
+};
+
+function checklistPhaseLabel(checklist: RunChecklist): string {
+  const items = [...checklist.tasks, ...checklist.deliverables];
+  if (checklist.phase === "succeeded" && !items.length) {
+    return "执行结束，未生成有效清单";
+  }
+  if (
+    checklist.phase === "succeeded" &&
+    items.some((item) => item.status !== "completed")
+  ) return "执行结束，仍有未完成项";
+  return checklistPhaseLabels[checklist.phase];
+}
+
+function checklistSummary(checklist: RunChecklist): string {
+  const items = [...checklist.tasks, ...checklist.deliverables];
+  const completed = items.filter((item) => item.status === "completed").length;
+  const isTerminal = !["planning", "running"].includes(checklist.phase);
+  if (!items.length) {
+    return isTerminal ? "本轮未生成有效清单" : "正在生成执行清单";
+  }
+  return `${completed} 项已完成，${items.length - completed} 项${
+    isTerminal ? "未完成" : "待完成"
+  }`;
+}
+
+function ChecklistStatusIcon({ status }: { status: ChecklistItemStatus }) {
+  if (status === "completed") {
+    return <CheckCircle size={17} weight="fill" />;
+  }
+  if (status === "in_progress") {
+    return <CircleNotch size={17} weight="bold" />;
+  }
+  if (status === "incomplete") {
+    return <WarningCircle size={17} weight="fill" />;
+  }
+  return <Circle size={17} weight="regular" />;
+}
+
+interface ChecklistGroupProps {
+  id: string;
+  title: string;
+  items: ChecklistItem[];
+  phase: ChecklistPhase;
+}
+
+function ChecklistGroup({ id, title, items, phase }: ChecklistGroupProps) {
+  const completed = items.filter((item) => item.status === "completed").length;
+  return (
+    <section className="checklist-group" aria-labelledby={id}>
+      <div className="checklist-group-heading">
+        <h4 id={id}>{title}</h4>
+        <span>{items.length ? `${completed}/${items.length} 完成` : "0 项"}</span>
+      </div>
+      {items.length ? (
+        <ul className="checklist-items" role="list">
+          {items.map((item) => (
+            <li
+              className={`checklist-item ${item.status}`}
+              key={item.id}
+              aria-current={item.status === "in_progress" ? "step" : undefined}
+            >
+              <span className="checklist-status-icon" aria-hidden="true">
+                <ChecklistStatusIcon status={item.status} />
+              </span>
+              <span className="checklist-item-text">{item.text}</span>
+              <span className="checklist-status-label">
+                {checklistStatusLabels[item.status]}
+              </span>
+              {item.detail ? (
+                <p className="checklist-item-detail">
+                  <span>复核</span>
+                  {item.detail}
+                </p>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="checklist-empty">
+          {phase === "planning" ? "正在拆解，稍后同步" : "本轮未列出相关条目"}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function AssistantChecklist({
+  checklist,
+  messageId,
+}: {
+  checklist: RunChecklist;
+  messageId: string;
+}) {
+  const titleId = `checklist-${messageId}`;
+  const phaseLabel = checklistPhaseLabel(checklist);
+  const summary = checklistSummary(checklist);
+
+  return (
+    <section
+      className={`assistant-checklist phase-${checklist.phase}`}
+      aria-labelledby={titleId}
+    >
+      <div className="assistant-checklist-heading">
+        <span className="assistant-checklist-mark" aria-hidden="true">
+          <ListChecks size={18} weight="regular" />
+        </span>
+        <div>
+          <h3 id={titleId}>执行与交付清单</h3>
+          <span>{phaseLabel}</span>
+        </div>
+        <span className="assistant-checklist-summary" aria-hidden="true">
+          {summary}
+        </span>
+      </div>
+      <div className="checklist-groups">
+        <ChecklistGroup
+          id={`${titleId}-tasks`}
+          title="任务清单"
+          items={checklist.tasks}
+          phase={checklist.phase}
+        />
+        <ChecklistGroup
+          id={`${titleId}-deliverables`}
+          title="成果要求"
+          items={checklist.deliverables}
+          phase={checklist.phase}
+        />
+      </div>
+    </section>
+  );
+}
+
 function EmptyConversation({ onPromptSelect }: Pick<MessageListProps, "onPromptSelect">) {
   return (
     <section className="empty-conversation" aria-labelledby="empty-title">
@@ -163,7 +320,26 @@ export function MessageList({
                   </div>
                 ) : null}
 
-                {message.role === "assistant" ? <AssistantProgress message={message} /> : null}
+                {message.role === "assistant" ? (
+                  <>
+                    <span
+                      className="sr-only"
+                      role="status"
+                      aria-live="polite"
+                      aria-atomic="true"
+                    >
+                      {message.checklist
+                        ? `清单第 ${message.checklist.revision} 次更新：${
+                          checklistPhaseLabel(message.checklist)
+                        }，${checklistSummary(message.checklist)}`
+                        : ""}
+                    </span>
+                    <AssistantProgress message={message} />
+                    {message.checklist ? (
+                      <AssistantChecklist checklist={message.checklist} messageId={message.id} />
+                    ) : null}
+                  </>
+                ) : null}
 
                 <div className="message-content">
                   {message.content ? (

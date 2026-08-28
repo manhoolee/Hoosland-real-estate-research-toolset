@@ -53,6 +53,7 @@ import type {
   CapabilityState,
   CapabilityView,
   ChatMessage,
+  RunChecklist,
   TokenUsage,
   WorkspaceFile,
 } from "./types";
@@ -224,6 +225,12 @@ function errorStatus(error: unknown): number | undefined {
     : undefined;
 }
 
+function errorReplyTo(error: unknown): string | undefined {
+  return error instanceof Error
+    ? (error as Error & { replyTo?: string }).replyTo
+    : undefined;
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -329,8 +336,51 @@ function sameRunSnapshot(
     left.userMessageId === right.userMessageId &&
     left.startedAt === right.startedAt &&
     left.updatedAt === right.updatedAt &&
-    left.completedAt === right.completedAt
+    left.completedAt === right.completedAt &&
+    left.checklist?.revision === right.checklist?.revision
   );
+}
+
+function withNewerChecklist(
+  message: ChatMessage,
+  checklist: RunChecklist | undefined,
+): ChatMessage {
+  if (!checklist) return message;
+  const current = message.checklist;
+  if (current) {
+    if (current.revision > checklist.revision) return message;
+    if (current.revision === checklist.revision) {
+      const currentIsActive = ["planning", "running"].includes(current.phase);
+      const nextIsTerminal = !["planning", "running"].includes(checklist.phase);
+      // A pending durable commit is deliberately projected as running. Once
+      // /run repairs that commit, the same persisted revision may converge to
+      // its terminal phase; no other same-revision replacement is accepted.
+      if (!currentIsActive || !nextIsTerminal) return message;
+    }
+  }
+  return { ...message, checklist };
+}
+
+function withRunChecklist(
+  messages: ChatMessage[],
+  run: ConversationRunState,
+): ChatMessage[] {
+  if (!run.checklist || !run.userMessageId) return messages;
+  let targetIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && message.replyTo === run.userMessageId) {
+      targetIndex = index;
+      break;
+    }
+  }
+  if (targetIndex < 0) return messages;
+  const current = messages[targetIndex];
+  const updated = withNewerChecklist(current, run.checklist);
+  if (updated === current) return messages;
+  const next = messages.slice();
+  next[targetIndex] = updated;
+  return next;
 }
 
 function withAttachmentNames(
@@ -354,22 +404,23 @@ function reconcileMessages(
   history: ChatMessage[],
   run: ConversationRunState,
 ): ChatMessage[] {
+  const projectedHistory = withRunChecklist(history, run);
   const successfulReplies = new Set(
-    history
+    projectedHistory
       .filter((message) => message.role === "assistant" && message.status === "complete")
       .map((message) => message.replyTo)
       .filter((value): value is string => Boolean(value)),
   );
   const activeUserId = run.active ? run.userMessageId : undefined;
   const latestTerminalReplies = new Map<string, string>();
-  for (const message of history) {
+  for (const message of projectedHistory) {
     if (
       message.role === "assistant" &&
       (message.status === "error" || message.status === "stopped") &&
       message.replyTo
     ) latestTerminalReplies.set(message.replyTo, message.id);
   }
-  const cleaned = history.filter((message) => !(
+  const cleaned = projectedHistory.filter((message) => !(
     message.role === "assistant" &&
     (message.status === "error" || message.status === "stopped") &&
     message.replyTo &&
@@ -409,6 +460,7 @@ function reconcileMessages(
         replyTo: unresolvedUser.id,
         retryable: false,
         progress: RECOVERED_RESEARCH_PROGRESS,
+        checklist: run.checklist,
       },
     ];
   }
@@ -428,6 +480,7 @@ function reconcileMessages(
       status: stopped ? "stopped" : "error",
       replyTo: unresolvedUser.id,
       retryable: true,
+      checklist: run.checklist,
       errorMessage: stopped
         ? "本次研究已终止，可以重新生成。"
         : "上次后台任务没有保存完整结果，可以从原请求继续重试。",
@@ -659,6 +712,9 @@ export default function App() {
             consecutiveFailures = 0;
             if (run.active) {
               setTerminationPending(run.status === "termination_requested");
+              if (hydratedActiveTurn && run.checklist) {
+                setMessages((current) => withRunChecklist(current, run));
+              }
               if (!hydratedActiveTurn) {
                 const [history, savedFiles] = await Promise.all([
                   listMessages(nextConversationId, controller.signal),
@@ -901,6 +957,7 @@ export default function App() {
       }));
 
       let id: string | null = null;
+      let receivedChecklistForThisRun = false;
       try {
         id = await ensureConversation();
         const finalContent = await sendMessage(
@@ -924,6 +981,13 @@ export default function App() {
                     ? progress
                     : message.progress,
               }));
+            },
+            onChecklist: (checklist) => {
+              const isFirstSnapshot = !receivedChecklistForThisRun;
+              receivedChecklistForThisRun = true;
+              updateAssistantMessage(assistantId, (message) => isFirstSnapshot
+                ? { ...message, checklist }
+                : withNewerChecklist(message, checklist));
             },
             onUsage: (usage) => {
               if (id) applyConversationTokenUsage(id, usage);
@@ -958,11 +1022,15 @@ export default function App() {
       } catch (error) {
         const cancellation = cancellationRequestsRef.current.get(controller);
         const wasCancelled = cancellation ? await cancellation.catch(() => false) : false;
-        const stopped = cancellation
-          ? wasCancelled
-          : error instanceof DOMException && error.name === "AbortError";
-        const status = errorStatus(error);
         const code = errorCode(error);
+        const stopped = code === "AGENT_CANCELLED" || (cancellation
+          ? wasCancelled
+          : error instanceof DOMException && error.name === "AbortError");
+        const status = errorStatus(error);
+        const retryOf = request.retryOf || errorReplyTo(error);
+        if (retryOf) {
+          failedRequestsRef.current.set(assistantId, { ...request, retryOf });
+        }
         if (
           !stopped &&
           !cancellation &&
@@ -1021,6 +1089,7 @@ export default function App() {
         updateAssistantMessage(assistantId, (message) => ({
           ...message,
           status: stopped ? "stopped" : "error",
+          replyTo: retryOf || message.replyTo,
           progress: undefined,
           errorMessage: cancellation && !wasCancelled
             ? "终止请求仍在处理中，请稍后再次确认。"
