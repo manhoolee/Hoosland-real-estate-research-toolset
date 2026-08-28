@@ -7,8 +7,8 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.4`（候选） | 后端、前端和公开应用行为版本；线上仍为 `0.2.3` |
-| Build ID | `v0.2.4-task-checklist-20260828T043537Z`（候选） | 从当前线上 Build 精确派生，尚未切换 |
+| Application SemVer | `0.2.4` | 后端、前端和公开应用行为版本；已上线 V2 / slot-b |
+| Build ID | `v0.2.4-task-checklist-20260828T043537Z` | 从前一线上 Build 精确派生并完成原子切换 |
 | System Prompt | `real-estate-system-v0.2.3` | 全局身份、安全、证据、权限、任务复核和执行规则 |
 | Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
 | Project state Schema | `2.1.0` | Skill 使用的持久化 project_state / case payload 契约 |
@@ -111,15 +111,15 @@ V0.2.2 将 Application 从 `0.2.1` 升至 `0.2.2`，新增对话 Token 用量统
 
 ## 8. 当前 Build 的升级摘要
 
-V0.2.4 task checklist Candidate（Build ID：`v0.2.4-task-checklist-20260828T043537Z`）：
+V0.2.4 task checklist（Build ID：`v0.2.4-task-checklist-20260828T043537Z`）：
 
-- 以线上 V0.2.3 部署记录 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 为唯一父基线，候选分支为 `release/v0.2.4-task-checklist`；
+- 以线上 V0.2.3 部署记录 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 为唯一父基线，发布分支为 `release/v0.2.4-task-checklist`，部署源码 commit 为 `de24812edb0920d728b0e1ea7d9e0954218ef7ce`；
 - Application 升至 `0.2.4`，System Prompt 升至 `real-estate-system-v0.2.3`；Skill bundle、Project state Schema 与 usage sidecar 不变；
 - 使用 Harness 原生 `todo_write` / `todo/write` 建立任务与成果要求的整表快照，应用新增 Run checklist sidecar Schema `1`，并在 SSE、消息与恢复链路中发送完整 revision；
 - 未完成或未复核项目在终态保留为未完成；文件成果还需与本轮 canonical outputs 的真实变化一致；
-- 当前未部署，线上继续运行 V0.2.3；回滚候选只需切回整个 V0.2.3 release，新增 checklist sidecar 可保留并由旧代码忽略。
+- 已于 `2026-08-28T06:09:01Z` 上线 V2 / slot-b；直接回滚点为完整 V0.2.3 release，新增 checklist sidecar 可保留并由旧代码忽略。
 
-### 当前线上 Build
+### 前一线上与直接回滚 Build
 
 V0.2.3 output persistence Build（Build ID：`v0.2.3-output-persistence-20260828T040220Z`）：
 

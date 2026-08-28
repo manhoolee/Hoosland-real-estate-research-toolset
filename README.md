@@ -24,15 +24,15 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
-| 工作台应用 | `0.2.4`（候选） | FastAPI、React、API、文件、长任务恢复、任务清单与管理配置 |
-| 候选 Build | `v0.2.4-task-checklist-20260828T043537Z` | 从当前线上 V0.2.3 精确派生，尚未切换线上 |
+| 工作台应用 | `0.2.4` | FastAPI、React、API、文件、长任务恢复、任务清单与管理配置 |
+| 线上 Build | `v0.2.4-task-checklist-20260828T043537Z` | V2 / slot-b；部署源码 commit `de24812edb0920d728b0e1ea7d9e0954218ef7ce` |
 | System Prompt | `real-estate-system-v0.2.3` | 全局身份、安全、证据、权限、任务复核和交付规则 |
 | Skill 套件 | `2.3.1` | 1 个总控 + 10 个专项 Skill |
 | 项目状态 Schema | `2.1.0` | Skill 使用的 project_state / case payload 契约，本次不变 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection；兼容、惰性创建 |
 | Run checklist sidecar Schema | `1` | 按新 run 惰性创建；旧对话无需迁移 |
 
-V0.2.4 候选直接基于当前线上 V0.2.3 Build `v0.2.3-output-persistence-20260828T040220Z`：复用 Harness 原生任务整表事件，把用户需求拆成任务与成果要求，运行中逐项更新，终态将未完成或未复核项目明确收口；文件成果仍与本轮顶层 `workspace/outputs` 的真实变化核对。线上 V2 / slot-b 在完成候选验收和原子切换前继续运行 V0.2.3。
+V0.2.4 直接基于前一线上 V0.2.3 Build `v0.2.3-output-persistence-20260828T040220Z`：复用 Harness 原生任务整表事件，把用户需求拆成任务与成果要求，运行中逐项更新，终态将未完成或未复核项目明确收口；文件成果仍与本轮顶层 `workspace/outputs` 的真实变化核对。Build `v0.2.4-task-checklist-20260828T043537Z` 已上线 V2 / slot-b，V0.2.3 不可变 release 继续作为直接回滚点保留。
 
 ## 核心能力
 
@@ -185,7 +185,7 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-当前线上 V2 / slot-b 仍为 V0.2.3，并已通过 102 个后端单元/HTTP 测试及真实成果持久化 E2E。V0.2.4 是从该线上源码直接创建的候选分支，现已通过 124 项后端回归、Python 编译、前端检查与构建、Skill smoke 和本地响应式浏览器复核；真实 Provider 流式 E2E、隔离候选部署与原子切换尚未执行。V1 和 Skill v2.3.1 均不在本次变更范围。
+当前线上 V2 / slot-b 为 V0.2.4。该 Build 已通过 124 项后端回归、Python 编译、前端检查与构建、Skill smoke、本地响应式浏览器复核，以及隔离候选和生产公网真实 Provider 清单 E2E；候选与生产重启后，清单、成果文件、sidecar 和 Token 用量均精确保持。V1、Nginx 与 Skill v2.3.1 前后指纹一致，未进入本次变更范围。
 
 ## 数据与安全边界
 
@@ -231,7 +231,7 @@ bash ./tests/run_smoke_tests.sh
 - [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
-- [V0.2.4 候选说明](docs/releases/v0.2.4/RELEASE-NOTES.md)
+- [V0.2.4 发布说明](docs/releases/v0.2.4/RELEASE-NOTES.md)
 - [V0.2.3 发布说明](docs/releases/v0.2.3/RELEASE-NOTES.md)
 - [V0.2.2 发布说明](docs/releases/v0.2.2/RELEASE-NOTES.md)
 - [V0.2.1 发布说明](docs/releases/v0.2.1/RELEASE-NOTES.md)

@@ -11,11 +11,11 @@
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
 
-## App 0.2.4 Candidate Build `v0.2.4-task-checklist-20260828T043537Z` / System Prompt v0.2.3 / Skill 2.3.1 / Checklist sidecar 1 — 2026-08-28
+## App 0.2.4 Build `v0.2.4-task-checklist-20260828T043537Z` / System Prompt v0.2.3 / Skill 2.3.1 / Checklist sidecar 1 — 2026-08-28
 
 ### 任务清单与成果复核
 
-- 直接从已上线 V0.2.3 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 创建候选分支，未从旧 `main` 或根目录镜像回拷源码；
+- 直接从已上线 V0.2.3 记录 commit `34d831a4779c204f08f25009a4d5dba4edfb3582` 创建发布分支，部署源码为 `de24812edb0920d728b0e1ea7d9e0954218ef7ce`，未从旧 `main` 或根目录镜像回拷源码；
 - 挂载锁定 Harness `0.1.1rc1` 的原生 `todo_write`，要求根 Agent 在实质执行前把用户请求拆成任务与成果要求，并在每项复核后立即整表更新；
 - 应用只接受成功后的 `todo/write` 事件，按 `run_id` 持久化 revision 快照，通过 SSE、刷新恢复、历史消息、取消、失败和重试显示同一份清单；
 - 后端硬性拒绝首清单前实质操作、首张预完成和单 revision 批量完成；success 前至少观察一次首张后的逐项完成更新；
@@ -28,8 +28,8 @@
 - Application 从 `0.2.3` 升至 `0.2.4`，System Prompt 从 `real-estate-system-v0.2.2` 升至 `real-estate-system-v0.2.3`；Skill bundle `2.3.1`、Project state Schema `2.1.0` 与 usage sidecar Schema `1` 不变；
 - 首次引入 Run checklist sidecar Schema `1`，只为新 run 惰性创建，不写入 `run.json`，不回填旧任务；回滚到 V0.2.3 时旧应用会忽略该 sidecar；
 - Python、Node、Harness 和系统依赖版本不变；
-- 候选已通过后端 124 项回归、Python 编译、前端类型检查与生产构建、Skill smoke，以及 1440/1024/375/320px 本地固定快照浏览器复核；
-- 当前仍未部署。线上 V2 / slot-b 在完成真实 Provider 流式 E2E、隔离候选部署和原子切换前继续运行 Build `v0.2.3-output-persistence-20260828T040220Z`。
+- 后端 124 项回归、Python 编译、前端类型检查与生产构建、Skill smoke，以及 1440/1024/375/320px 本地固定快照浏览器复核均通过；
+- Build 已于 `2026-08-28T06:09:01Z` 上线 V2 / slot-b。隔离候选与生产公网真实 Provider E2E 均产生 2 个任务、3 项成果要求和 8 个 revision，并以 5 次逐项完成收口；两端重启后 checklist、assistant、sidecar、成果文件与 Token 用量精确保持。V1、Nginx 和 Skill 指纹前后相同，V0.2.3 作为直接回滚点保留。
 
 ## App 0.2.3 Build `v0.2.3-output-persistence-20260828T040220Z` / System Prompt v0.2.2 / Skill 2.3.1 / Usage sidecar 1 — 2026-08-28
 
