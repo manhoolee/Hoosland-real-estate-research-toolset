@@ -87,6 +87,16 @@ class ChecklistError(StorageError):
     code = "CHECKLIST_ERROR"
 
 
+class ChecklistSnapshotRejected(ChecklistError):
+    """A model snapshot that can be repaired by restoring the durable baseline."""
+
+    code = "CHECKLIST_SNAPSHOT_REJECTED"
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -792,7 +802,13 @@ class ConversationStore:
             raise ValueError("run id is invalid")
         if isinstance(event_seq, bool) or not isinstance(event_seq, int) or event_seq < 0:
             raise ValueError("checklist event seq is invalid")
-        normalized = self._validated_model_todos(todos)
+        try:
+            normalized = self._validated_model_todos(todos)
+        except ChecklistError as exc:
+            raise ChecklistSnapshotRejected(
+                "MODEL_TODOS_INVALID",
+                str(exc),
+            ) from exc
         paths = self.require(conversation_id)
         with self._lock(conversation_id):
             previous = self.read_checklist(conversation_id, run_id)
@@ -812,7 +828,8 @@ class ConversationStore:
                 expected = [item["content"] for item in previous_items]
                 received = [item["content"] for item in normalized]
                 if received != expected:
-                    raise ChecklistError(
+                    raise ChecklistSnapshotRejected(
+                        "ITEM_SET_CHANGED",
                         "checklist items cannot be renamed, reordered, added, or removed"
                     )
                 newly_completed = sum(
@@ -825,7 +842,8 @@ class ConversationStore:
                     )
                 )
                 if newly_completed > 1:
-                    raise ChecklistError(
+                    raise ChecklistSnapshotRejected(
+                        "BULK_COMPLETION",
                         "one checklist update cannot complete multiple unfinished items"
                     )
                 items = []
@@ -839,7 +857,8 @@ class ConversationStore:
             else:
                 items = []
                 if any(item["status"] == "completed" for item in normalized):
-                    raise ChecklistError(
+                    raise ChecklistSnapshotRejected(
+                        "INITIAL_COMPLETION",
                         "initial checklist items cannot already be completed"
                     )
                 newly_completed = 0
@@ -854,14 +873,16 @@ class ConversationStore:
                     if kind == "file":
                         assert extension is not None
                         if extension in file_extensions:
-                            raise ChecklistError(
+                            raise ChecklistSnapshotRejected(
+                                "DUPLICATE_FILE_EXTENSION",
                                 "checklist must contain only one deliverable per file extension"
                             )
                         file_extensions.add(extension)
                     if kind == "reply":
                         reply_count += 1
                         if reply_count > 1:
-                            raise ChecklistError(
+                            raise ChecklistSnapshotRejected(
+                                "MULTIPLE_REPLY_DELIVERABLES",
                                 "checklist must contain at most one reply deliverable"
                             )
                     items.append(
@@ -874,7 +895,8 @@ class ConversationStore:
                         }
                     )
                 if task_count == 0 or deliverable_count == 0:
-                    raise ChecklistError(
+                    raise ChecklistSnapshotRejected(
+                        "MISSING_TASK_OR_DELIVERABLE",
                         "initial checklist requires at least one task and one deliverable"
                     )
 

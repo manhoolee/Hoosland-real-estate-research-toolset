@@ -13,6 +13,7 @@ from pypdf import PdfWriter
 from app.config import Settings
 from app.harness_adapter import (
     HarnessAdapterError,
+    HarnessFollowup,
     HarnessRunResult,
     SKILL_COMMAND,
     harness_session_id,
@@ -351,7 +352,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.4",
+                "version": "0.2.5",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -360,7 +361,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.4", ready.json()["version"])
+        self.assertEqual("0.2.5", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
@@ -1477,19 +1478,23 @@ class HttpApiTests(unittest.TestCase):
     def test_checklist_state_machine_rejects_completion_shortcuts(self) -> None:
         cases = {
             "initial_completed": (
+                "AGENT_CHECKLIST_RECOVERY_FAILED",
                 ("completed", "completed"),
             ),
             "batch_completed": (
+                "AGENT_CHECKLIST_MISSING",
                 ("in_progress", "pending"),
                 ("completed", "completed"),
             ),
             "no_post_initial_completion": (
+                "AGENT_CHECKLIST_MISSING",
                 ("pending", "pending"),
                 ("pending", "pending"),
             ),
         }
-        for case_name, snapshots in cases.items():
+        for case_name, case in cases.items():
             with self.subTest(case=case_name):
+                expected_error, *snapshots = case
                 conversation_id = self.client.post(
                     "/api/conversations",
                     json={},
@@ -1553,7 +1558,7 @@ class HttpApiTests(unittest.TestCase):
                     if line.startswith("data: ")
                 ]
                 error = next(event for event in events if event.get("type") == "error")
-                self.assertEqual("AGENT_CHECKLIST_MISSING", error["code"])
+                self.assertEqual(expected_error, error["code"])
                 self.assertFalse(any(event.get("type") == "final" for event in events))
                 terminal = [
                     event["checklist"]
@@ -1561,6 +1566,556 @@ class HttpApiTests(unittest.TestCase):
                     if event.get("type") == "checklist"
                 ][-1]
                 self.assertEqual("failed", terminal["phase"])
+
+    def test_rejected_batch_completion_recovers_from_authoritative_snapshot(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        private_marker = "PRIVATE-CHECKLIST-REPAIR-91e2"
+        received_followups: list[HarnessFollowup] = []
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            session_id = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+            contents = [
+                f"任务｜核验市场数据 {private_marker}",
+                "任务｜核验竞品数据",
+                "任务｜形成研究结论",
+                "任务｜复核最终答复",
+                "成果回复｜提交研究结论",
+            ]
+
+            def emit(seq: int, statuses: tuple[str, ...]) -> HarnessFollowup | None:
+                assert callable(on_notification)
+                return on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "data": {
+                                    "todos": [
+                                        {"content": content, "status": status}
+                                        for content, status in zip(
+                                            contents,
+                                            statuses,
+                                            strict=True,
+                                        )
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+
+            self.assertIsNone(
+                emit(1, ("in_progress", "pending", "pending", "pending", "pending"))
+            )
+            accepted = ("completed", "in_progress", "pending", "pending", "pending")
+            self.assertIsNone(emit(2, accepted))
+            followup = emit(
+                3,
+                ("completed", "completed", "in_progress", "pending", "completed"),
+            )
+            self.assertIsInstance(followup, HarnessFollowup)
+            assert isinstance(followup, HarnessFollowup)
+            received_followups.append(followup)
+            self.assertIn("服务端清单状态纠正", followup.content)
+            self.assertIn('"rejection_reason":"BULK_COMPLETION"', followup.content)
+            self.assertIn('"accepted_revision":2', followup.content)
+            self.assertIn(private_marker, followup.content)
+
+            self.assertIsNone(emit(4, accepted))
+            self.assertIsNone(
+                emit(5, ("completed", "completed", "in_progress", "pending", "pending"))
+            )
+            self.assertIsNone(
+                emit(6, ("completed", "completed", "completed", "in_progress", "pending"))
+            )
+            self.assertIsNone(
+                emit(7, ("completed", "completed", "completed", "completed", "in_progress"))
+            )
+            self.assertIsNone(
+                emit(8, ("completed", "completed", "completed", "completed", "completed"))
+            )
+            return HarnessRunResult(
+                final_response="已逐项复核并完成研究结论",
+                finish_reason="stop",
+                session_id=session_id,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "测试清单状态恢复", "attachment_ids": []},
+        )
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertEqual(1, len(received_followups))
+        self.assertTrue(any(event.get("type") == "final" for event in events))
+        self.assertFalse(any(event.get("type") == "error" for event in events))
+        run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
+        self.assertEqual("succeeded", run["status"])
+        self.assertEqual("succeeded", run["checklist"]["phase"])
+        public_items = run["checklist"]["tasks"] + run["checklist"]["deliverables"]
+        self.assertTrue(all(item["status"] == "completed" for item in public_items))
+
+        raw_log = self.settings.operation_log_path.read_text(encoding="utf-8")
+        records = [json.loads(line) for line in raw_log.splitlines() if line]
+        checklist_records = [
+            record for record in records if record.get("conversation_id") == conversation_id
+        ]
+        self.assertNotIn(private_marker, raw_log)
+        self.assertEqual(
+            ["BULK_COMPLETION"],
+            [
+                record["rejection_reason"]
+                for record in checklist_records
+                if record.get("event") == "agent.checklist.rejected"
+            ],
+        )
+        self.assertEqual(
+            1,
+            sum(
+                record.get("event") == "agent.checklist.repair.requested"
+                for record in checklist_records
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                record.get("event") == "agent.checklist.repair.completed"
+                for record in checklist_records
+            ),
+        )
+
+    def test_checklist_recovery_exhaustion_fails_fast(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        followups: list[HarnessFollowup] = []
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            session_id = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+            contents = [
+                "任务｜核验数据",
+                "任务｜形成结论",
+                "任务｜复核结论",
+                "任务｜检查最终答复",
+                "成果回复｜提交结论",
+            ]
+
+            def emit(seq: int, statuses: tuple[str, ...]) -> HarnessFollowup | None:
+                assert callable(on_notification)
+                return on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "data": {
+                                    "todos": [
+                                        {"content": content, "status": status}
+                                        for content, status in zip(
+                                            contents,
+                                            statuses,
+                                            strict=True,
+                                        )
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+
+            baseline_0 = (
+                "in_progress",
+                "pending",
+                "pending",
+                "pending",
+                "pending",
+            )
+            baseline_1 = (
+                "completed",
+                "in_progress",
+                "pending",
+                "pending",
+                "pending",
+            )
+            baseline_2 = (
+                "completed",
+                "completed",
+                "in_progress",
+                "pending",
+                "pending",
+            )
+            baseline_3 = (
+                "completed",
+                "completed",
+                "completed",
+                "in_progress",
+                "pending",
+            )
+            repair_cycles = (
+                (
+                    2,
+                    ("completed", "completed", "in_progress", "pending", "pending"),
+                    3,
+                    baseline_0,
+                    4,
+                    baseline_1,
+                ),
+                (
+                    5,
+                    ("completed", "completed", "completed", "in_progress", "pending"),
+                    6,
+                    baseline_1,
+                    7,
+                    baseline_2,
+                ),
+                (
+                    8,
+                    ("completed", "completed", "completed", "completed", "in_progress"),
+                    9,
+                    baseline_2,
+                    10,
+                    baseline_3,
+                ),
+            )
+            self.assertIsNone(emit(1, baseline_0))
+            for (
+                rejected_seq,
+                rejected_statuses,
+                reset_seq,
+                reset_statuses,
+                accepted_seq,
+                accepted_statuses,
+            ) in repair_cycles:
+                followup = emit(rejected_seq, rejected_statuses)
+                self.assertIsInstance(followup, HarnessFollowup)
+                assert isinstance(followup, HarnessFollowup)
+                followups.append(followup)
+                self.assertIsNone(emit(reset_seq, reset_statuses))
+                self.assertIsNone(emit(accepted_seq, accepted_statuses))
+            emit(11, ("completed", "completed", "completed", "completed", "completed"))
+            raise AssertionError("the fourth rejection must abort the run")
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "测试连续忽略清单纠正", "attachment_ids": []},
+        )
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        error = next(event for event in events if event.get("type") == "error")
+        self.assertEqual("AGENT_CHECKLIST_RECOVERY_EXHAUSTED", error["code"])
+        self.assertEqual(3, len(followups))
+        self.assertFalse(any(event.get("type") == "final" for event in events))
+        run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
+        self.assertEqual("failed", run["status"])
+
+        records = [
+            json.loads(line)
+            for line in self.settings.operation_log_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        ]
+        checklist_records = [
+            record for record in records if record.get("conversation_id") == conversation_id
+        ]
+        rejections = [
+            record
+            for record in checklist_records
+            if record.get("event") == "agent.checklist.rejected"
+        ]
+        self.assertEqual(
+            [
+                "BULK_COMPLETION",
+                "BULK_COMPLETION",
+                "BULK_COMPLETION",
+                "BULK_COMPLETION",
+            ],
+            [record["rejection_reason"] for record in rejections],
+        )
+        requested = [
+            record
+            for record in checklist_records
+            if record.get("event") == "agent.checklist.repair.requested"
+        ]
+        self.assertEqual(
+            [1, 2, 3],
+            [record["attempt"] for record in requested],
+        )
+        exhausted = [
+            record
+            for record in checklist_records
+            if record.get("event") == "agent.checklist.repair.exhausted"
+        ]
+        self.assertEqual(1, len(exhausted))
+        self.assertEqual(3, exhausted[0]["attempt_count"])
+
+    def test_pending_checklist_repair_cannot_be_committed_as_success(self) -> None:
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        repair_requested = False
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            nonlocal repair_requested
+            session_id = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+            contents = [
+                "任务｜核验数据",
+                "任务｜形成结论",
+                "成果回复｜提交结论",
+            ]
+
+            def emit(seq: int, statuses: tuple[str, ...]) -> HarnessFollowup | None:
+                assert callable(on_notification)
+                return on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "data": {
+                                    "todos": [
+                                        {"content": content, "status": status}
+                                        for content, status in zip(
+                                            contents,
+                                            statuses,
+                                            strict=True,
+                                        )
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+
+            self.assertIsNone(emit(1, ("in_progress", "pending", "pending")))
+            self.assertIsNone(emit(2, ("completed", "pending", "pending")))
+            followup = emit(3, ("completed", "completed", "completed"))
+            self.assertIsInstance(followup, HarnessFollowup)
+            repair_requested = True
+            return HarnessRunResult(
+                final_response="不得在未确认状态纠正时提交",
+                finish_reason="stop",
+                session_id=session_id,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "测试未确认的清单纠正", "attachment_ids": []},
+        )
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertTrue(repair_requested)
+        error = next(event for event in events if event.get("type") == "error")
+        self.assertEqual("AGENT_CHECKLIST_MISSING", error["code"])
+        self.assertFalse(any(event.get("type") == "final" for event in events))
+
+        records = [
+            json.loads(line)
+            for line in self.settings.operation_log_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        ]
+        missing = next(
+            record
+            for record in records
+            if record.get("conversation_id") == conversation_id
+            and record.get("event") == "agent.checklist.missing"
+        )
+        self.assertTrue(missing["checklist_repair_pending"])
+
+    def test_pending_checklist_repair_rejects_mismatch_and_other_tools(self) -> None:
+        for violation in ("mismatched_todo", "other_tool"):
+            with self.subTest(violation=violation):
+                conversation_id = self.client.post(
+                    "/api/conversations",
+                    json={},
+                ).json()["id"]
+                followups: list[HarnessFollowup] = []
+
+                async def fake_run(
+                    current_conversation_id: str,
+                    _prompt: str,
+                    on_notification: object,
+                    *,
+                    run_id: str,
+                    session_generation: int = 0,
+                    current_violation: str = violation,
+                ) -> HarnessRunResult:
+                    session_id = harness_session_id(
+                        current_conversation_id,
+                        run_id,
+                        session_generation,
+                    )
+                    contents = [
+                        "任务｜核验数据",
+                        "任务｜形成结论",
+                        "成果回复｜提交结论",
+                    ]
+
+                    def emit_todo(
+                        seq: int,
+                        statuses: tuple[str, ...],
+                    ) -> HarnessFollowup | None:
+                        assert callable(on_notification)
+                        return on_notification(
+                            {
+                                "method": "session.event",
+                                "payload": {
+                                    "sessionId": session_id,
+                                    "event": {
+                                        "type": "todo/write",
+                                        "seq": seq,
+                                        "data": {
+                                            "todos": [
+                                                {"content": content, "status": status}
+                                                for content, status in zip(
+                                                    contents,
+                                                    statuses,
+                                                    strict=True,
+                                                )
+                                            ]
+                                        },
+                                    },
+                                },
+                            }
+                        )
+
+                    self.assertIsNone(
+                        emit_todo(1, ("in_progress", "pending", "pending"))
+                    )
+                    self.assertIsNone(
+                        emit_todo(2, ("completed", "in_progress", "pending"))
+                    )
+                    followup = emit_todo(3, ("completed", "completed", "completed"))
+                    self.assertIsInstance(followup, HarnessFollowup)
+                    assert isinstance(followup, HarnessFollowup)
+                    followups.append(followup)
+
+                    if current_violation == "mismatched_todo":
+                        emit_todo(4, ("completed", "completed", "in_progress"))
+                    else:
+                        assert callable(on_notification)
+                        on_notification(
+                            {
+                                "method": "session.event",
+                                "payload": {
+                                    "sessionId": session_id,
+                                    "event": {
+                                        "type": "tool/call",
+                                        "seq": 4,
+                                        "data": {
+                                            "name": "write",
+                                            "arguments": {
+                                                "file_path": "work/draft.md"
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        )
+                    raise AssertionError("the recovery violation must abort the run")
+
+                self.app.state.harness.run = fake_run
+                response = self.client.post(
+                    f"/api/conversations/{conversation_id}/messages",
+                    json={"content": violation, "attachment_ids": []},
+                )
+                events = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in response.text.splitlines()
+                    if line.startswith("data: ")
+                ]
+                error = next(
+                    event for event in events if event.get("type") == "error"
+                )
+                self.assertEqual("AGENT_CHECKLIST_RECOVERY_FAILED", error["code"])
+                self.assertEqual(1, len(followups))
+                self.assertFalse(
+                    any(event.get("type") == "final" for event in events)
+                )
+
+                records = [
+                    json.loads(line)
+                    for line in self.settings.operation_log_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line
+                ]
+                current = [
+                    record
+                    for record in records
+                    if record.get("conversation_id") == conversation_id
+                ]
+                self.assertEqual(
+                    1,
+                    sum(
+                        record.get("event")
+                        == "agent.checklist.repair.requested"
+                        for record in current
+                    ),
+                )
+                self.assertEqual(
+                    1,
+                    sum(
+                        record.get("event") == "agent.checklist.repair.failed"
+                        for record in current
+                    ),
+                )
+                self.assertFalse(
+                    any(
+                        record.get("event") == "agent.checklist.repair.completed"
+                        for record in current
+                    )
+                )
 
     def test_success_commit_failure_is_compensated_before_error_streams(self) -> None:
         conversation_id = self.client.post("/api/conversations", json={}).json()["id"]

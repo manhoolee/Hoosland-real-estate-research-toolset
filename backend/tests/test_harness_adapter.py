@@ -139,6 +139,8 @@ class HarnessAdapterTests(unittest.TestCase):
         prompt = build_harness_prompt("继续", [])
         self.assertEqual(SKILL_COMMAND, prompt.splitlines()[0])
         self.assertIn("路由模式：总控先行", prompt)
+        self.assertIn("服务端清单状态纠正", prompt)
+        self.assertIn("authoritative_todos 原样重置", prompt)
         self.assertTrue(prompt.endswith('{"content":"继续"}'))
 
     def test_user_slash_command_does_not_replace_service_controller(self) -> None:
@@ -170,7 +172,7 @@ class HarnessAdapterTests(unittest.TestCase):
     def test_main_system_prompt_has_one_versioned_source(self) -> None:
         cordis_path = Path(__file__).resolve().parents[1] / "cordis.yml"
         cordis = cordis_path.read_text(encoding="utf-8")
-        self.assertEqual(1, cordis.count("real-estate-system-v0.2.3"))
+        self.assertEqual(1, cordis.count("real-estate-system-v0.2.4"))
         self.assertIn("includeRuntimeContext: true", cordis)
         self.assertIn("write/edit 文件工具不跟随 persistent Bash 的 cd", cordis)
         self.assertIn("/tmp/**/outputs", cordis)
@@ -198,6 +200,8 @@ class HarnessAdapterTests(unittest.TestCase):
         self.assertIn("allowParallelInProgress: false", cordis)
         self.assertIn("goals: false", cordis)
         self.assertIn("第一个实质动作必须调用 todo_write", cordis)
+        self.assertIn("服务端清单状态纠正", cordis)
+        self.assertIn("authoritative_todos 原样重置", cordis)
 
     def test_todo_write_parser_accepts_only_bounded_unique_root_snapshots(self) -> None:
         session_id = harness_session_id("conversation_123456", "a" * 32, 3)

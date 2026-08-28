@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.config import Settings
-from app.harness_adapter import HarnessAdapterError, HarnessManager
+from app.harness_adapter import HarnessAdapterError, HarnessFollowup, HarnessManager
 from app.storage import ConversationStore
 
 
@@ -32,6 +32,206 @@ class FakeRunner:
         del on_notification
         self.session_ids.append(session_id)
         return self.result
+
+
+class FakeClient:
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.failure = failure
+        self.prompts: list[tuple[str, list[dict[str, str]]]] = []
+
+    def session_prompt(
+        self,
+        session_id: str,
+        content: list[dict[str, str]],
+    ) -> None:
+        if self.failure is not None:
+            raise self.failure
+        self.prompts.append((session_id, content))
+
+
+class PromptingRunner(FakeRunner):
+    def __init__(self, *, client: FakeClient | None = None) -> None:
+        super().__init__(
+            SimpleNamespace(final_response="恢复成功", finish_reason="stop")
+        )
+        self.client = client or FakeClient()
+
+    def run(
+        self,
+        _prompt: str,
+        *,
+        session_id: str,
+        on_notification: object,
+    ) -> object:
+        self.session_ids.append(session_id)
+        assert callable(on_notification)
+        on_notification({"type": "todo/write"})
+        return self.result
+
+
+class FakeSubscription:
+    def __init__(self) -> None:
+        self.notifications: list[object] = []
+        self.next_calls = 0
+
+    def __enter__(self) -> FakeSubscription:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        return None
+
+    def next(self) -> object:
+        self.next_calls += 1
+        if not self.notifications:
+            raise AssertionError("owned session waited beyond the final idle")
+        return self.notifications.pop(0)
+
+
+class OwnedClient:
+    def __init__(self) -> None:
+        self.subscription = FakeSubscription()
+        self.prompt_calls: list[tuple[str, list[dict[str, str]], object]] = []
+
+    @staticmethod
+    def _event(session_id: str, event: dict[str, object]) -> object:
+        return SimpleNamespace(
+            method="session.event",
+            payload={"sessionId": session_id, "event": event},
+        )
+
+    @staticmethod
+    def _idle(session_id: str) -> object:
+        return SimpleNamespace(
+            method="session.status",
+            payload={"sessionId": session_id, "status": "idle"},
+        )
+
+    def subscribe_session_notifications(self, _session_id: str) -> FakeSubscription:
+        return self.subscription
+
+    def session_prompt(
+        self,
+        session_id: str,
+        content: list[dict[str, str]],
+        *,
+        notification_subscription: object,
+    ) -> str:
+        self.prompt_calls.append((session_id, content, notification_subscription))
+        message_id = f"message-{len(self.prompt_calls)}"
+        if len(self.prompt_calls) == 1:
+            self.subscription.notifications.extend(
+                [
+                    self._event(
+                        session_id,
+                        {
+                            "type": "agent/inbox/spliced",
+                            "data": {"inserted": [{"id": message_id}]},
+                        },
+                    ),
+                    self._event(session_id, {"type": "todo/write", "data": {}}),
+                    # This idle belongs to the original prompt and must not end
+                    # the owned interval once a correction has been queued.
+                    self._idle(session_id),
+                ]
+            )
+        elif len(self.prompt_calls) == 2:
+            self.subscription.notifications.extend(
+                [
+                    self._event(
+                        session_id,
+                        {
+                            "type": "agent/inbox/spliced",
+                            "data": {"inserted": [{"id": message_id}]},
+                        },
+                    ),
+                    self._event(
+                        session_id,
+                        {
+                            "type": "assistant/message",
+                            "data": {
+                                "message": {
+                                    "content": [
+                                        {"type": "text", "text": "纠正处理完成"}
+                                    ]
+                                }
+                            },
+                        },
+                    ),
+                    self._event(
+                        session_id,
+                        {"type": "turn/end", "data": {"reason": {"kind": "stop"}}},
+                    ),
+                    self._idle(session_id),
+                ]
+            )
+        else:
+            raise AssertionError("only one correction may be queued")
+        return message_id
+
+
+class NormalOwnedClient(OwnedClient):
+    def session_prompt(
+        self,
+        session_id: str,
+        content: list[dict[str, str]],
+        *,
+        notification_subscription: object,
+    ) -> str:
+        self.prompt_calls.append((session_id, content, notification_subscription))
+        if len(self.prompt_calls) != 1:
+            raise AssertionError("normal run must submit exactly one prompt")
+        message_id = "message-normal"
+        self.subscription.notifications.extend(
+            [
+                self._event(
+                    session_id,
+                    {
+                        "type": "agent/inbox/spliced",
+                        "data": {"inserted": [{"id": message_id}]},
+                    },
+                ),
+                self._event(
+                    session_id,
+                    {
+                        "type": "assistant/message",
+                        "data": {
+                            "message": {
+                                "content": [{"type": "text", "text": "正常完成"}]
+                            }
+                        },
+                    },
+                ),
+                self._event(
+                    session_id,
+                    {"type": "turn/end", "data": {"reason": {"kind": "stop"}}},
+                ),
+                self._idle(session_id),
+            ]
+        )
+        return message_id
+
+
+class OwnedRunner(FakeRunner):
+    def __init__(self, *, client: OwnedClient | None = None) -> None:
+        super().__init__()
+        self.client = client or OwnedClient()
+        self.started_sessions: list[str] = []
+        self.run_called = False
+
+    def start_session(self, session_id: str) -> object:
+        self.started_sessions.append(session_id)
+        return object()
+
+    def run(
+        self,
+        _prompt: str,
+        *,
+        session_id: str,
+        on_notification: object,
+    ) -> object:
+        del session_id, on_notification
+        self.run_called = True
+        raise AssertionError("the production-owned path must not call runner.run")
 
 
 class BlockingRunner(FakeRunner):
@@ -222,6 +422,95 @@ class HarnessManagerCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_runner.closed)
         self.assertTrue(second_runner.closed)
         self.assertNotIn(self.conversation_id, self.manager._runners)
+
+    async def test_notification_followup_is_injected_into_active_session(self) -> None:
+        runner = PromptingRunner()
+        self.manager._runners[self.conversation_id] = runner
+
+        result = await self.manager.run(
+            self.conversation_id,
+            "继续",
+            lambda _notification: HarnessFollowup("权威清单重置"),
+            run_id="run-checklist-repair",
+            session_generation=2,
+        )
+
+        self.assertEqual("恢复成功", result.final_response)
+        self.assertEqual(
+            [
+                (
+                    result.session_id,
+                    [{"type": "text", "text": "权威清单重置"}],
+                )
+            ],
+            runner.client.prompts,
+        )
+        self.assertTrue(runner.closed)
+
+    async def test_notification_followup_failure_aborts_and_discards_runner(self) -> None:
+        runner = PromptingRunner(client=FakeClient(failure=RuntimeError("closed")))
+        self.manager._runners[self.conversation_id] = runner
+
+        with self.assertRaises(HarnessAdapterError) as caught:
+            await self.manager.run(
+                self.conversation_id,
+                "继续",
+                lambda _notification: HarnessFollowup("权威清单重置"),
+                run_id="run-checklist-repair-failure",
+            )
+
+        self.assertEqual("AGENT_CHECKLIST_RECOVERY_FAILED", caught.exception.code)
+        self.assertTrue(runner.closed)
+        self.assertNotIn(self.conversation_id, self.manager._runners)
+
+    async def test_owned_followup_waits_past_old_idle_until_correction_idle(self) -> None:
+        runner = OwnedRunner()
+        self.manager._runners[self.conversation_id] = runner
+
+        def repair_todo(notification: object) -> HarnessFollowup | None:
+            payload = getattr(notification, "payload", None)
+            event = payload.get("event") if isinstance(payload, dict) else None
+            if isinstance(event, dict) and event.get("type") == "todo/write":
+                return HarnessFollowup("权威清单重置")
+            return None
+
+        result = await self.manager.run(
+            self.conversation_id,
+            "继续",
+            repair_todo,
+            run_id="run-owned-checklist-repair",
+        )
+
+        self.assertEqual("纠正处理完成", result.final_response)
+        self.assertEqual("stop", result.finish_reason)
+        self.assertFalse(runner.run_called)
+        self.assertEqual([result.session_id], runner.started_sessions)
+        self.assertEqual(2, len(runner.client.prompt_calls))
+        self.assertTrue(
+            all(
+                call[2] is runner.client.subscription
+                for call in runner.client.prompt_calls
+            )
+        )
+        self.assertGreaterEqual(runner.client.subscription.next_calls, 7)
+        self.assertTrue(runner.closed)
+
+    async def test_owned_normal_run_matches_sdk_turn_boundary(self) -> None:
+        runner = OwnedRunner(client=NormalOwnedClient())
+        self.manager._runners[self.conversation_id] = runner
+
+        result = await self.manager.run(
+            self.conversation_id,
+            "继续",
+            lambda _notification: None,
+            run_id="run-owned-normal",
+        )
+
+        self.assertEqual("正常完成", result.final_response)
+        self.assertEqual("stop", result.finish_reason)
+        self.assertEqual(1, len(runner.client.prompt_calls))
+        self.assertFalse(runner.run_called)
+        self.assertTrue(runner.closed)
 
     async def test_busy_is_held_until_response_validation_finishes(self) -> None:
         runner = FakeRunner(

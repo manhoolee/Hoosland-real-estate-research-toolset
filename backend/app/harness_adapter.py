@@ -79,6 +79,13 @@ class HarnessRunResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HarnessFollowup:
+    """A bounded server instruction appended to the currently active session."""
+
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChecklistTodo:
     content: str
     status: str
@@ -153,6 +160,166 @@ class OutputWriteAttempt:
     canonical: bool
     output_format: str | None
     target_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedHarnessRunResult:
+    final_response: str
+    finish_reason: str | None
+
+
+def _notification_method_payload(
+    notification: object,
+) -> tuple[object, object]:
+    method = getattr(notification, "method", None)
+    payload = getattr(notification, "payload", None)
+    if isinstance(notification, dict):
+        method = notification.get("method", method)
+        payload = notification.get("payload", payload)
+    return method, payload
+
+
+def _owned_root_event(
+    notification: object,
+    session_id: str,
+) -> dict[str, Any] | None:
+    method, payload = _notification_method_payload(notification)
+    if (
+        method != "session.event"
+        or not isinstance(payload, dict)
+        or payload.get("sessionId") != session_id
+    ):
+        return None
+    event = payload.get("event")
+    return event if isinstance(event, dict) else None
+
+
+def _owned_inbox_message_ids(
+    notification: object,
+    session_id: str,
+) -> set[str]:
+    event = _owned_root_event(notification, session_id)
+    if event is None or event.get("type") != "agent/inbox/spliced":
+        return set()
+    data = event.get("data")
+    inserted = data.get("inserted") if isinstance(data, dict) else None
+    if not isinstance(inserted, list):
+        return set()
+    return {
+        message_id
+        for message in inserted
+        if isinstance(message, dict)
+        and isinstance((message_id := message.get("id")), str)
+    }
+
+
+def _owned_final_response(events: list[dict[str, Any]]) -> str:
+    for event in reversed(events):
+        if event.get("type") != "assistant/message":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        message = data.get("message")
+        content_owner = message if isinstance(message, dict) else data
+        content = content_owner.get("content")
+        if not isinstance(content, list):
+            continue
+        return "".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _owned_finish_reason(events: list[dict[str, Any]]) -> str | None:
+    for event in reversed(events):
+        if event.get("type") != "turn/end":
+            continue
+        data = event.get("data")
+        reason = data.get("reason") if isinstance(data, dict) else None
+        kind = reason.get("kind") if isinstance(reason, dict) else None
+        if not isinstance(kind, str):
+            raise HarnessAdapterError(
+                "AGENT_PROTOCOL_ERROR",
+                "研究助手结束状态无效",
+            )
+        return kind
+    return None
+
+
+def _run_owned_harness_session(
+    runner: Any,
+    prompt: str,
+    *,
+    session_id: str,
+    on_notification: Callable[[object], HarnessFollowup | None],
+) -> _OwnedHarnessRunResult:
+    """Own every injected prompt from its inbox receipt through the next idle."""
+
+    runner.start_session(session_id)
+    client = runner.client
+    events: list[dict[str, Any]] = []
+    with client.subscribe_session_notifications(session_id) as subscription:
+        initial_message_id = client.session_prompt(
+            session_id,
+            [{"type": "text", "text": prompt}],
+            notification_subscription=subscription,
+        )
+        if not isinstance(initial_message_id, str) or not initial_message_id:
+            raise HarnessAdapterError(
+                "AGENT_PROTOCOL_ERROR",
+                "研究助手消息回执无效",
+            )
+        awaiting_receipts = {initial_message_id}
+        initial_received = False
+        while True:
+            notification = subscription.next()
+            receipt_ids = _owned_inbox_message_ids(notification, session_id)
+            if not initial_received:
+                if initial_message_id not in receipt_ids:
+                    continue
+                initial_received = True
+            awaiting_receipts.difference_update(receipt_ids)
+
+            followup = on_notification(notification)
+            event = _owned_root_event(notification, session_id)
+            if event is not None:
+                events.append(event)
+            if followup is not None:
+                try:
+                    followup_message_id = client.session_prompt(
+                        session_id,
+                        [{"type": "text", "text": followup.content}],
+                        notification_subscription=subscription,
+                    )
+                except Exception as exc:
+                    raise HarnessAdapterError(
+                        "AGENT_CHECKLIST_RECOVERY_FAILED",
+                        "研究助手无法接收任务清单纠正指令",
+                    ) from exc
+                if not isinstance(followup_message_id, str) or not followup_message_id:
+                    raise HarnessAdapterError(
+                        "AGENT_PROTOCOL_ERROR",
+                        "研究助手清单纠正回执无效",
+                    )
+                awaiting_receipts.add(followup_message_id)
+
+            method, payload = _notification_method_payload(notification)
+            if (
+                method == "session.status"
+                and isinstance(payload, dict)
+                and payload.get("sessionId") == session_id
+                and payload.get("status") == "idle"
+                and not awaiting_receipts
+            ):
+                break
+
+    return _OwnedHarnessRunResult(
+        final_response=_owned_final_response(events),
+        finish_reason=_owned_finish_reason(events),
+    )
 
 
 def notification_to_token_retry_attempt(
@@ -335,6 +502,7 @@ def build_harness_prompt(
         "- 清单必须至少包含一个以“任务｜”开头的执行任务，以及至少一个成果项。文件成果必须逐格式单列，严格写成“成果文件(.ext)｜说明”（例如成果文件(.md)｜研究报告），每种扩展名只列一项；不形成文件时写“成果回复｜说明”。\n"
         "- todo_write 每次发送完整清单。首次清单不得包含 completed；首次提交后不得改名、重排、新增或删除项目，只能更新状态；按顺序执行时最多一个项目为 in_progress。\n"
         "- 每完成并复核一个任务或成果要求，必须立即再次调用 todo_write 更新整表，每次最多把一个此前未完成项目改为 completed，不得批量补记。只有取得实际证据后才能标 completed。\n"
+        "- Harness 显示 todo_write 成功只代表本地整表已替换；若收到“服务端清单状态纠正”，说明应用未接受上一版。下一动作必须且只能按其中 authoritative_todos 原样重置 todo_write，允许撤销本地过早完成状态；重置前不得继续其他操作或 final。\n"
         "- 输出文件必须在唯一 outputs/ 中实际存在、非空且对应本轮新增或更新，才可把相应成果文件项标为 completed；最终答复非空且已复核，才可把成果回复项标为 completed。\n"
         "- 提交 final 前必须最后调用一次 todo_write，同步所有已完成与未完成项目；未完成项目保持 pending，不得伪报 completed。"
     )
@@ -848,7 +1016,7 @@ class HarnessManager:
         self,
         conversation_id: str,
         prompt: str,
-        on_notification: Callable[[object], None],
+        on_notification: Callable[[object], HarnessFollowup | None],
         *,
         run_id: str,
         session_generation: int = 0,
@@ -879,13 +1047,66 @@ class HarnessManager:
         # unique while the application restores continuity from its own
         # successful-message history.
         session_id = harness_session_id(conversation_id, run_id, session_generation)
+
+        def checked_notification(notification: object) -> HarnessFollowup | None:
+            followup = on_notification(notification)
+            if followup is None:
+                return None
+            if not isinstance(followup, HarnessFollowup) or not followup.content.strip():
+                raise HarnessAdapterError(
+                    "AGENT_PROTOCOL_ERROR",
+                    "研究助手反馈指令无效",
+                )
+            return followup
+
+        def observe(notification: object) -> None:
+            followup = checked_notification(notification)
+            if followup is None:
+                return
+            try:
+                runner.client.session_prompt(
+                    session_id,
+                    [{"type": "text", "text": followup.content}],
+                )
+            except Exception as exc:
+                raise HarnessAdapterError(
+                    "AGENT_CHECKLIST_RECOVERY_FAILED",
+                    "研究助手无法接收任务清单纠正指令",
+                ) from exc
+
         try:
-            result = await asyncio.to_thread(
-                runner.run,
-                prompt,
-                session_id=session_id,
-                on_notification=on_notification,
-            )
+            client = getattr(runner, "client", None)
+            if callable(getattr(runner, "start_session", None)) and callable(
+                getattr(client, "subscribe_session_notifications", None)
+            ):
+                # The pinned SDK's convenience Session.run stops at the first
+                # idle belonging to the original prompt. Own the subscription
+                # here so every correction is observed from its inbox receipt
+                # through a later idle and cannot be abandoned behind an old
+                # queued idle notification.
+                result = await asyncio.to_thread(
+                    _run_owned_harness_session,
+                    runner,
+                    prompt,
+                    session_id=session_id,
+                    on_notification=checked_notification,
+                )
+            else:
+                # Minimal compatibility path for lightweight test doubles.
+                # Production DeepSeekHarness instances always take the owned
+                # subscription path above.
+                result = await asyncio.to_thread(
+                    runner.run,
+                    prompt,
+                    session_id=session_id,
+                    on_notification=observe,
+                )
+        except HarnessAdapterError:
+            if await self._take_cancelled(run_id):
+                await self._discard_runner(conversation_id, runner, run_id)
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+            await self._discard_runner(conversation_id, runner, run_id)
+            raise
         except Exception as exc:
             if await self._take_cancelled(run_id):
                 await self._discard_runner(conversation_id, runner, run_id)

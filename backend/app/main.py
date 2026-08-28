@@ -28,6 +28,7 @@ from .config import CAPABILITY_NAMES, Settings
 from .harness_adapter import (
     CONTROLLER_SKILL_ID,
     HarnessAdapterError,
+    HarnessFollowup,
     HarnessManager,
     build_harness_prompt,
     harness_session_id,
@@ -45,6 +46,8 @@ from .operation_log import OperationLog
 from .pdf_runtime import pdf_runtime_status
 from .runtime_config import DEFAULT_OUTPUT_FORMATS, RuntimeConfigError, RuntimeConfigStore
 from .storage import (
+    ChecklistError,
+    ChecklistSnapshotRejected,
     ConversationNotFound,
     ConversationStore,
     FileNotFound,
@@ -62,6 +65,7 @@ _OUTPUT_DELIVERY_SKILLS = frozenset(
         "hoosland-pdf-output",
     }
 )
+_CHECKLIST_REPAIR_MAX_ATTEMPTS = 3
 
 
 class ConversationCreate(BaseModel):
@@ -488,6 +492,65 @@ def _checklist_event(
         "type": "checklist",
         "checklist": _public_checklist(record, phase_override=phase_override),
     }
+
+
+def _authoritative_checklist_todos(
+    record: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Return the exact durable todo state that may be replayed into Harness."""
+
+    items = record.get("items")
+    if record.get("phase") != "running" or not isinstance(items, list) or not items:
+        raise ValueError("checklist repair requires a running durable snapshot")
+    todos: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("checklist repair item is invalid")
+        content = item.get("content")
+        status = item.get("status")
+        if (
+            not isinstance(content, str)
+            or not content
+            or status not in {"pending", "in_progress", "completed"}
+        ):
+            raise ValueError("checklist repair item cannot be restored")
+        todos.append({"content": content, "status": str(status)})
+    return todos
+
+
+def _checklist_repair_followup(
+    record: dict[str, Any],
+    *,
+    rejected_event_seq: int,
+    reason: str,
+) -> HarnessFollowup:
+    """Build a bounded, authoritative todo reset for the active root session."""
+
+    todos = _authoritative_checklist_todos(record)
+    payload = json.dumps(
+        {
+            "rejected_event_seq": rejected_event_seq,
+            "rejection_reason": reason,
+            "accepted_revision": record.get("revision"),
+            "authoritative_todos": todos,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return HarnessFollowup(
+        content=(
+            "[服务端清单状态纠正｜必须立即执行]\n"
+            "刚才的 todo_write 仅在 Harness 本地写入成功，但未通过应用的持久化门禁。"
+            "该次状态无效，不得继续沿用，也不得据此声明完成。\n"
+            "下一动作必须且只能调用一次 todo_write，把 authoritative_todos 原样作为完整清单提交；"
+            "允许把 Harness 中过早标记的 completed 回退到这里给出的权威状态。"
+            "在这次重置成功前，不得检索、读写文件、运行命令或输出 final。\n"
+            "重置后再继续实际工作；此后每次 todo_write 最多新增一个 completed，"
+            "项目名称、数量和顺序不得变化，completed 不得回退，最多一个 in_progress。\n"
+            "这是服务端状态同步指令，不是用户新增需求，最终答复不要复述内部纠正过程。\n"
+            + payload
+        )
+    )
 
 
 def _token_usage_event(
@@ -1841,6 +1904,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         output_delivery_skill_invoked = False
         checklist_initialized = False
         checklist_order_violation = False
+        checklist_repair_attempts = 0
+        checklist_repair_pending = False
+        checklist_repair_expected: list[dict[str, str]] | None = None
         pre_checklist_operation_count = 0
         highest_progress_step = 1
         output_baseline = _output_fingerprint(conversation_paths.outputs)
@@ -1850,28 +1916,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             read_token_usage_safely(conversation_id),
         )
 
-        def on_notification(notification: object) -> None:
+        def on_notification(notification: object) -> HarnessFollowup | None:
             nonlocal highest_progress_step
             nonlocal checklist_initialized
             nonlocal checklist_order_violation
+            nonlocal checklist_repair_attempts
+            nonlocal checklist_repair_expected
+            nonlocal checklist_repair_pending
             nonlocal misplaced_output_write_attempt_count
             nonlocal output_delivery_skill_invoked
             nonlocal output_write_attempt_count
             nonlocal pre_checklist_operation_count
+            followup: HarnessFollowup | None = None
             operation_event = notification_to_operation_event(notification)
             checklist_snapshot = notification_to_checklist_snapshot(
                 notification,
                 expected_session_id=active.session_id or "",
             )
             if checklist_snapshot is not None:
+                snapshot_todos = checklist_snapshot.todo_dicts()
                 try:
+                    if (
+                        checklist_repair_expected is not None
+                        and snapshot_todos != checklist_repair_expected
+                    ):
+                        raise ChecklistSnapshotRejected(
+                            "REPAIR_BASELINE_MISMATCH",
+                            "the next checklist snapshot must exactly restore the durable baseline",
+                        )
                     checklist_record, checklist_changed = store.apply_checklist_snapshot(
                         conversation_id,
                         run_id=active.run_id,
                         event_seq=checklist_snapshot.event_seq,
-                        todos=checklist_snapshot.todo_dicts(),
+                        todos=snapshot_todos,
                     )
-                except Exception:
+                except ChecklistSnapshotRejected as exc:
                     operation_log.record(
                         "agent.checklist.rejected",
                         source="backend",
@@ -1882,17 +1961,136 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         event_seq=checklist_snapshot.event_seq,
                         item_count=len(checklist_snapshot.todos),
                         error_code="CHECKLIST_SNAPSHOT_REJECTED",
+                        rejection_reason=exc.reason,
+                    )
+                    LOGGER.warning(
+                        "Rejected checklist snapshot conversation=%s run=%s seq=%s reason=%s",
+                        conversation_id,
+                        active.run_id,
+                        checklist_snapshot.event_seq,
+                        exc.reason,
+                    )
+                    if checklist_repair_pending:
+                        operation_log.record(
+                            "agent.checklist.repair.failed",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            event_seq=checklist_snapshot.event_seq,
+                            attempt=checklist_repair_attempts,
+                            rejection_reason=exc.reason,
+                            error_code="AGENT_CHECKLIST_RECOVERY_FAILED",
+                        )
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_FAILED",
+                            "研究助手未按权威基线恢复任务清单",
+                        ) from exc
+                    accepted = store.read_checklist(conversation_id, active.run_id)
+                    if checklist_repair_attempts >= _CHECKLIST_REPAIR_MAX_ATTEMPTS:
+                        operation_log.record(
+                            "agent.checklist.repair.exhausted",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            event_seq=checklist_snapshot.event_seq,
+                            attempt_count=checklist_repair_attempts,
+                            error_code="AGENT_CHECKLIST_RECOVERY_EXHAUSTED",
+                        )
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_EXHAUSTED",
+                            "研究助手多次未能恢复任务清单状态",
+                        ) from exc
+                    if accepted is None or not accepted.get("items"):
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_FAILED",
+                            "研究助手没有可恢复的任务清单基线",
+                        ) from exc
+                    checklist_repair_attempts += 1
+                    try:
+                        checklist_repair_expected = _authoritative_checklist_todos(
+                            accepted
+                        )
+                        followup = _checklist_repair_followup(
+                            accepted,
+                            rejected_event_seq=checklist_snapshot.event_seq,
+                            reason=exc.reason,
+                        )
+                    except (TypeError, ValueError) as repair_exc:
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_FAILED",
+                            "研究助手无法构造任务清单纠正指令",
+                        ) from repair_exc
+                    checklist_repair_pending = True
+                    operation_log.record(
+                        "agent.checklist.repair.requested",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        event_seq=checklist_snapshot.event_seq,
+                        attempt=checklist_repair_attempts,
+                        accepted_revision=accepted.get("revision"),
+                        rejection_reason=exc.reason,
+                    )
+                except ChecklistError as exc:
+                    operation_log.record(
+                        "agent.checklist.failed",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        event_seq=checklist_snapshot.event_seq,
+                        error_code="CHECKLIST_STATE_ERROR",
+                    )
+                    raise HarnessAdapterError(
+                        "AGENT_CHECKLIST_STORAGE_ERROR",
+                        "研究助手任务清单状态不可用",
+                    ) from exc
+                except Exception as exc:
+                    operation_log.record(
+                        "agent.checklist.failed",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        event_seq=checklist_snapshot.event_seq,
+                        error_code="CHECKLIST_PERSIST_FAILED",
                     )
                     LOGGER.exception(
-                        "Rejected checklist snapshot conversation=%s run=%s seq=%s",
+                        "Failed to persist checklist snapshot conversation=%s run=%s seq=%s",
                         conversation_id,
                         active.run_id,
                         checklist_snapshot.event_seq,
                     )
+                    raise HarnessAdapterError(
+                        "AGENT_CHECKLIST_STORAGE_ERROR",
+                        "研究助手任务清单无法持久化",
+                    ) from exc
                 else:
                     if checklist_record.get("items"):
                         checklist_initialized = True
                     if checklist_changed:
+                        if checklist_repair_pending:
+                            operation_log.record(
+                                "agent.checklist.repair.completed",
+                                source="backend",
+                                request_id=request.state.request_id,
+                                project_id=project_id,
+                                conversation_id=conversation_id,
+                                run_id=active.run_id,
+                                event_seq=checklist_snapshot.event_seq,
+                                attempt=checklist_repair_attempts,
+                                revision=checklist_record["revision"],
+                            )
+                            checklist_repair_pending = False
+                            checklist_repair_expected = None
                         operation_log.record(
                             "agent.checklist.updated",
                             source="backend",
@@ -1908,6 +2106,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             queue.put_nowait,
                             _checklist_event(checklist_record),
                         )
+            if (
+                checklist_repair_pending
+                and operation_event is not None
+                and operation_event.get("tool_name") != "checklist"
+            ):
+                operation_log.record(
+                    "agent.checklist.repair.failed",
+                    source="backend",
+                    request_id=request.state.request_id,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    run_id=active.run_id,
+                    attempt=checklist_repair_attempts,
+                    blocked_tool_name=operation_event.get("tool_name"),
+                    error_code="AGENT_CHECKLIST_RECOVERY_FAILED",
+                )
+                raise HarnessAdapterError(
+                    "AGENT_CHECKLIST_RECOVERY_FAILED",
+                    "研究助手在任务清单恢复前启动了其他操作",
+                )
             if (
                 operation_event is not None
                 and operation_event.get("tool_name") != "checklist"
@@ -1990,7 +2208,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             _token_usage_event(conversation_id, usage_record),
                         )
             if active.cancel_event.is_set():
-                return
+                return None
             if operation_event is not None:
                 if operation_event.get("skill_id") in _OUTPUT_DELIVERY_SKILLS:
                     output_delivery_skill_invoked = True
@@ -2016,19 +2234,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ):
                 event = research_progress_event("delivery")
             if event is None:
-                return
+                return followup
             # Customer-visible progress is monotonic and replace-only. Detailed
             # operations remain available exclusively in the private log.
             if event.get("type") == "progress":
                 current_step = event.get("current_step")
                 if not isinstance(current_step, int) or current_step < highest_progress_step:
-                    return
+                    return followup
                 if event == last_notification:
-                    return
+                    return followup
                 highest_progress_step = current_step
                 last_notification.clear()
                 last_notification.update(event)
             loop.call_soon_threadsafe(queue.put_nowait, event)
+            return followup
 
         async def is_current() -> bool:
             async with app.state.active_guard:
@@ -2153,6 +2372,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     or checklist_before_success.get("phase") != "running"
                     or not checklist_before_success.get("items")
                     or checklist_order_violation
+                    or checklist_repair_pending
                     or int(
                         checklist_before_success.get("completion_revisions", 0)
                     ) < 1
@@ -2171,6 +2391,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         run_id=active.run_id,
                         error_code="AGENT_CHECKLIST_MISSING",
                         checklist_order_violation=checklist_order_violation,
+                        checklist_repair_pending=checklist_repair_pending,
                         pre_checklist_operation_count=pre_checklist_operation_count,
                     )
                     raise HarnessAdapterError(
@@ -2335,6 +2556,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "AGENT_RESPONSE_ERROR",
                     "AGENT_EMPTY_RESPONSE",
                     "AGENT_CHECKLIST_MISSING",
+                    "AGENT_CHECKLIST_RECOVERY_FAILED",
+                    "AGENT_CHECKLIST_RECOVERY_EXHAUSTED",
+                    "AGENT_CHECKLIST_STORAGE_ERROR",
                 }:
                     active.rotate_session_on_exit = True
                 await queue.put(

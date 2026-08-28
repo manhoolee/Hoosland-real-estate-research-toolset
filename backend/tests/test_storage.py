@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.storage import (
     ChecklistError,
+    ChecklistSnapshotRejected,
     ConversationStore,
     InvalidIdentifier,
     ProjectConflict,
@@ -246,7 +247,7 @@ class ConversationStoreTests(unittest.TestCase):
         self.store.start_checklist(conversation_id, run_id)
         contents = ["任务｜逐项执行", "成果回复｜逐项结论"]
 
-        with self.assertRaisesRegex(ChecklistError, "cannot already be completed"):
+        with self.assertRaisesRegex(ChecklistError, "cannot already be completed") as caught:
             self.store.apply_checklist_snapshot(
                 conversation_id,
                 run_id=run_id,
@@ -256,6 +257,8 @@ class ConversationStoreTests(unittest.TestCase):
                     for content in contents
                 ],
             )
+        self.assertIsInstance(caught.exception, ChecklistSnapshotRejected)
+        self.assertEqual("INITIAL_COMPLETION", caught.exception.reason)
         self.assertEqual(
             "planning",
             self.store.read_checklist(conversation_id, run_id)["phase"],
@@ -271,7 +274,7 @@ class ConversationStoreTests(unittest.TestCase):
             ],
         )
         self.assertTrue(changed)
-        with self.assertRaisesRegex(ChecklistError, "cannot complete multiple"):
+        with self.assertRaisesRegex(ChecklistError, "cannot complete multiple") as caught:
             self.store.apply_checklist_snapshot(
                 conversation_id,
                 run_id=run_id,
@@ -281,6 +284,8 @@ class ConversationStoreTests(unittest.TestCase):
                     for content in contents
                 ],
             )
+        self.assertIsInstance(caught.exception, ChecklistSnapshotRejected)
+        self.assertEqual("BULK_COMPLETION", caught.exception.reason)
         self.assertEqual(initial, self.store.read_checklist(conversation_id, run_id))
 
         one, changed = self.store.apply_checklist_snapshot(
