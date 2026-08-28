@@ -34,7 +34,7 @@
 - 后端单元与 HTTP 回归：94 项全部通过；
 - Python 编译、前端 TypeScript 检查与生产构建：通过；
 - 自动化覆盖 chunk/final 替换、重试、子 Agent、压缩、取消、持久化、旧对话缺省、404 与 conversation 隔离；
-- 候选 Build 已冻结为 `v0.2.2-conversation-token-usage-20260828T023809Z`；正式切换前后均需补充真实 Provider 验收证据。
+- Build `v0.2.2-conversation-token-usage-20260828T023809Z` 已上线 V2 / slot-b；隔离候选与生产均完成真实 Provider Token E2E，SSE/读取接口一致，服务重启后统计保持，V1 前后快照一致。
 
 ## App 0.2.1 Build `v0.2.1-production-sync-version-info-20260827T062425Z` / Skill 2.3.1 — 2026-08-27
 

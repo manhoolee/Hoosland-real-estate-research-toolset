@@ -1,6 +1,6 @@
 # Hoosland 地产研究工作台 V0.2.2 发布说明
 
-- 发布状态：release candidate
+- 发布状态：已上线（V2 / slot-b）
 - 发布日期：2026-08-28
 - 应用版本：`0.2.2`
 - Build ID：`v0.2.2-conversation-token-usage-20260828T023809Z`
@@ -89,20 +89,22 @@ V0.2.2 在输入框上方显示当前对话累计 Token 消耗。后端按 `conv
 
 ## 7. 验证
 
-当前候选源码完成：
+发布源码与生产验证完成：
 
 - 后端单元与 HTTP 回归：94 项全部通过；
 - `python -m compileall -q app tests`：通过；
 - 前端 TypeScript 检查：通过；
 - 前端生产构建：通过；
+- Skill manifest 与 smoke tests：通过；
 - 自动化覆盖 chunk/final 替换、重试 attempt、子 Agent、压缩、取消、持久化、事件重放、旧 conversation 缺省、404 和 conversation 隔离。
 
-正式放行前仍需补充：
+生产放行验证：
 
-- 使用真实 Provider 完成最小对话，确认 usage 字段与部署所用 Provider 一致；
-- 验证运行中显示、刷新恢复、对话切换、取消和失败路径；
-- 归档与 `v0.2.2-conversation-token-usage-20260828T023809Z` 对应的 manifest 与 SHA-256；
-- 核对 `/api/health/live`、前端版本和 release manifest 均为 Application `0.2.2`、Project state Schema `2.1.0`、usage sidecar Schema `1`。
+- 隔离候选与生产均使用真实 Provider 完成最小对话，SSE 正值 snapshot、最终 `GET /usage`、conversation 隔离与 sidecar 落盘一致；
+- 候选与生产分别重启服务，确认同一统计 snapshot 完整恢复；
+- 本机、网关与公网 Ready 均返回 Application `0.2.2` 和精确 Build ID，公网 `/mcp` 继续为 404，前端资产哈希一致；
+- 输入框上方 Token 控件在桌面与 390px 窄屏通过视觉验收，真实对话的汇总和分项明细正确，浏览器控制台无错误或警告；
+- V1 本机与公网快照在切换前后完全一致；发布 manifest、测试日志与 SHA-256 证据已经归档。
 
 ## 8. 已知边界
 
