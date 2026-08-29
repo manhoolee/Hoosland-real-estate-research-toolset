@@ -1,0 +1,10 @@
+Hoosland scope-gate release
+build_id=v0.2.6-scope-gate-20260829T101331Z
+base_commit=c0824d3399d34bdcd4c4bf18fb558772cfd969f3
+source_tree=base-commit-plus-worktree-overlay
+policy_version=scope-gate-v1.1
+egress_policy_version=egress-gate-v1
+app_version=0.2.6
+slot=slot-b
+validation=159 backend unit tests; frontend check/build passed
+

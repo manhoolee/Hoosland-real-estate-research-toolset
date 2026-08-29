@@ -24,15 +24,15 @@ Hoosland-real-estate-research-toolset 是一套面向房地产研究、产品策
 
 | 层 | 当前版本 | 说明 |
 |---|---:|---|
-| 工作台应用 | `0.2.5` | FastAPI、React、API、文件、长任务恢复、任务清单与管理配置 |
-| 线上 Build | `v0.2.5-todo-write-recovery-20260828T090530Z` | V2 / slot-b；部署源码 commit `914dc8f12a41a54ee2233f70834f24ed16330dcd` |
+| 工作台应用 | `0.2.6` | FastAPI、React、API、文件、长任务恢复、任务清单与管理配置 |
+| 线上 Build | `v0.2.6-scope-gate-20260829T101331Z` | V2 / slot-b；对话 scope/egress 防护已上线 |
 | System Prompt | `real-estate-system-v0.2.4` | 全局身份、安全、证据、权限、任务复核和交付规则 |
 | Skill 套件 | `2.3.1` | 1 个总控 + 10 个专项 Skill |
 | 项目状态 Schema | `2.1.0` | Skill 使用的 project_state / case payload 契约，本次不变 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection；兼容、惰性创建 |
 | Run checklist sidecar Schema | `1` | 按新 run 惰性创建；旧对话无需迁移 |
 
-V0.2.5 直接基于前一线上 V0.2.4 Build `v0.2.4-task-checklist-20260828T043537Z`：继续严格拒绝预完成、批量完成和项目集合变化，但不再把 Harness 本地 `todo_write` 成功误当成应用持久化成功。已有持久化权威基线时，被拒的后续快照会触发同一根会话中的清单纠正，模型必须先原样恢复最后一张持久快照，才能继续工具操作或发送 final；首张非法且没有权威基线时仍直接失败关闭。Build `v0.2.5-todo-write-recovery-20260828T090530Z` 已上线 V2 / slot-b，V0.2.4 不可变 release 作为直接回滚点保留。
+V0.2.6 在 V0.2.5 的运行协调基础上统一应用版本身份，并增加对话 scope gate 与 egress gate：闲聊、运行信息/技能清单/模型配置刺探，以及混入项目话术的内部元数据提取请求，在进入 Harness 前本地拒绝；最终文本和文件输出也会对内部运行标记 fail closed。Build `v0.2.6-scope-gate-20260829T101331Z` 已上线 V2 / slot-b，V0.2.5 scope-gate release 作为直接回滚点保留。
 
 ## 核心能力
 
@@ -185,7 +185,7 @@ cd ../skills
 bash ./tests/run_smoke_tests.sh
 ```
 
-当前线上 V2 / slot-b 为 V0.2.5。精确源码提交已通过 GitHub Actions；本地与服务器端 132 项后端回归、Python 编译、前端检查与构建、Skill smoke 全部通过。隔离候选和生产公网真实 Provider 清单 E2E 均以 8 个 revision 逐项完成，重启后清单、成果文件、sidecar 和 Token 用量精确保持；真实 pinned SDK 的 recovery 门禁另验证了纠正回执跨越旧 idle 后仍在同一会话完成。V1、Nginx 与 Skill v2.3.1 前后指纹一致，未进入本次变更范围。
+当前线上 V2 / slot-b 为 V0.2.6。159 项后端回归、Python 编译、前端检查与构建、隔离候选和生产健康/路由/刺探 smoke 全部通过。V0.2.6 在 V0.2.5 的运行协调基础上增加对话 scope gate 与 egress gate；V0.2.5 scope-gate release 作为直接回滚点保留。V1、Nginx 与 Skill v2.3.1 前后指纹一致，未进入本次变更范围。
 
 ## 数据与安全边界
 
@@ -231,6 +231,7 @@ bash ./tests/run_smoke_tests.sh
 - [测试与验收](docs/TESTING-AND-ACCEPTANCE.md)
 - [部署说明](docs/DEPLOYMENT.md)
 - [迭代原则](docs/ITERATION-PRINCIPLES.md)
+- [V0.2.6 发布说明](docs/releases/v0.2.6/RELEASE-NOTES.md)
 - [V0.2.5 发布说明](docs/releases/v0.2.5/RELEASE-NOTES.md)
 - [V0.2.4 发布说明](docs/releases/v0.2.4/RELEASE-NOTES.md)
 - [V0.2.3 发布说明](docs/releases/v0.2.3/RELEASE-NOTES.md)

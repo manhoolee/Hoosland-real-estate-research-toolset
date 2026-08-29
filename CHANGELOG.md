@@ -11,6 +11,16 @@
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
 
+## App 0.2.6 Build `v0.2.6-scope-gate-20260829T101331Z` / Scope gate v1.1 / Egress gate v1 — 2026-08-29
+
+### 对话边界与版本身份
+
+- Application、后端健康接口、前端展示和构建元数据统一升至 `0.2.6`；
+- 在地产项目任务之外，闲聊、运行信息/技能清单/模型与配置刺探，以及混入项目话术的后台、服务端、接口、版本和助手设定提取请求，均在进入 Harness 前本地拒绝，不消耗 Provider token；
+- 增加最终文本与文件输出的 egress 过滤，命中内部运行标记时 fail closed，不把原始内容写入 SSE、历史或审计字段；
+- System Prompt `real-estate-system-v0.2.4`、Skill bundle `2.3.1`、Project state Schema `2.1.0`、usage/checklist sidecar Schema `1` 均保持不变，无数据迁移；
+- 本地 159 项后端回归、前端类型检查/生产构建、隔离候选和生产健康/路由/刺探 smoke 全部通过；旧 V0.2.5 release 保留为直接回滚点。
+
 ## App 0.2.5 Build `v0.2.5-todo-write-recovery-20260828T090530Z` / System Prompt v0.2.4 / Skill 2.3.1 / Checklist sidecar 1 — 2026-08-28
 
 ### todo/write 持久化拒绝恢复

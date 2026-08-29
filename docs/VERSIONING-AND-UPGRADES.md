@@ -7,15 +7,15 @@
 | 版本轴 | 当前值 | 作用 |
 |---|---:|---|
 | 产品线 | V2 | 产品与界面代际，不作为可执行发布标识 |
-| Application SemVer | `0.2.5` | 后端、前端和公开应用行为版本；已上线 V2 / slot-b |
-| Build ID | `v0.2.5-todo-write-recovery-20260828T090530Z` | 从前一线上 Build 精确派生并完成原子切换 |
+| Application SemVer | `0.2.6` | 后端、前端和公开应用行为版本；已上线 V2 / slot-b |
+| Build ID | `v0.2.6-scope-gate-20260829T101331Z` | 从前一线上 Build 精确派生并完成原子切换 |
 | System Prompt | `real-estate-system-v0.2.4` | 全局身份、安全、证据、权限、任务复核和执行规则 |
 | Skill bundle SemVer | `2.3.1` | 总控与 10 个专项 Skill 的协议集合 |
 | Project state Schema | `2.1.0` | Skill 使用的持久化 project_state / case payload 契约 |
 | Conversation usage sidecar Schema | `1` | 可选 `usage.json` accounting projection |
 | Run checklist sidecar Schema | `1` | 按 run 保存任务与成果复核快照 |
 
-这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。V0.2.4 因此为运行清单建立独立 sidecar Schema `1`，不借用 usage 或 project state 的版本号；V0.2.5 只改变拒绝后的运行协调，sidecar 字段和复核语义不变，因此继续使用 Schema `1`。
+这些数字不要求同步。只修改 System Prompt 时不应为了视觉整齐而改写 Project state Schema；新增不参与 project_state / case payload 的持久化 sidecar，应建立并维护自己的 Schema 轴，避免迫使无关的 Skill 契约跳号。V0.2.4 因此为运行清单建立独立 sidecar Schema `1`，不借用 usage 或 project state 的版本号；V0.2.5 改变拒绝后的运行协调，V0.2.6 增加对话 scope/egress 门禁，sidecar 字段和复核语义均不变，因此继续使用 Schema `1`。
 
 V0.2.2 的 `usage.json` 使用独立 sidecar Schema `1`。文件缺失等价于 0，应用在首次收到新 usage 时惰性创建，旧 V0.2.1 会忽略它；不需要迁移，但升级前的历史 Token不会被推算或回填。Skill 所消费的 project_state / case payload 继续为 `2.1.0`，此次没有修改 case 文件或 Skill 契约。
 

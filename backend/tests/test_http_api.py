@@ -190,7 +190,10 @@ class HttpApiTests(unittest.TestCase):
         self.assertTrue(updated.json()["main_agent"]["api_key_set"])
 
     def test_operation_log_records_lifecycle_without_private_content(self) -> None:
-        message_marker = "PRIVATE-MESSAGE-7f69dfef"
+        # Include an explicit project action so this lifecycle/logging fixture
+        # exercises the accepted path now that unknown opaque strings are
+        # fail-closed by the ingress policy.
+        message_marker = "请处理项目资料 PRIVATE-MESSAGE-7f69dfef"
         password_marker = "PRIVATE-PASSWORD-2c725f1b"
         path_marker = "PRIVATE-PATH-e70ebcbd"
 
@@ -390,7 +393,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.5",
+                "version": "0.2.6",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -399,7 +402,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.5", ready.json()["version"])
+        self.assertEqual("0.2.6", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
@@ -1298,7 +1301,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "无清单运行", "attachment_ids": []},
+            json={"content": "请分析项目并验证无清单运行", "attachment_ids": []},
         )
         events = [
             json.loads(line.removeprefix("data: "))
@@ -1402,7 +1405,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "先搜索后补清单", "attachment_ids": []},
+            json={"content": "请分析项目并验证先搜索后补清单", "attachment_ids": []},
         )
         events = [
             json.loads(line.removeprefix("data: "))
@@ -1502,7 +1505,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "合法首清单", "attachment_ids": []},
+            json={"content": "请分析项目并验证合法首清单", "attachment_ids": []},
         )
         self.assertIn('"type":"final"', response.text)
         self.assertNotIn("AGENT_CHECKLIST_MISSING", response.text)
@@ -1588,7 +1591,7 @@ class HttpApiTests(unittest.TestCase):
                 self.app.state.harness.run = fake_run
                 response = self.client.post(
                     f"/api/conversations/{conversation_id}/messages",
-                    json={"content": case_name, "attachment_ids": []},
+                    json={"content": f"请分析项目并验证 {case_name}", "attachment_ids": []},
                 )
                 events = [
                     json.loads(line.removeprefix("data: "))
@@ -1695,7 +1698,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "测试清单状态恢复", "attachment_ids": []},
+            json={"content": "请分析项目并测试清单状态恢复", "attachment_ids": []},
         )
         events = [
             json.loads(line.removeprefix("data: "))
@@ -1861,7 +1864,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "测试跨会话清单恢复", "attachment_ids": []},
+            json={"content": "请分析项目并测试跨会话清单恢复", "attachment_ids": []},
         )
         events = [
             json.loads(line.removeprefix("data: "))
@@ -2031,7 +2034,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "测试连续忽略清单纠正", "attachment_ids": []},
+            json={"content": "请分析项目并测试连续忽略清单纠正", "attachment_ids": []},
         )
         events = [
             json.loads(line.removeprefix("data: "))
@@ -2149,7 +2152,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = fake_run
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "测试未确认的清单纠正", "attachment_ids": []},
+            json={"content": "请分析项目并测试未确认的清单纠正", "attachment_ids": []},
         )
         events = [
             json.loads(line.removeprefix("data: "))
@@ -2271,7 +2274,7 @@ class HttpApiTests(unittest.TestCase):
                 self.app.state.harness.run = fake_run
                 response = self.client.post(
                     f"/api/conversations/{conversation_id}/messages",
-                    json={"content": violation, "attachment_ids": []},
+                    json={"content": f"请分析项目并验证 {violation}", "attachment_ids": []},
                 )
                 events = [
                     json.loads(line.removeprefix("data: "))
@@ -2350,7 +2353,7 @@ class HttpApiTests(unittest.TestCase):
         try:
             response = self.client.post(
                 f"/api/conversations/{conversation_id}/messages",
-                json={"content": "测试清单提交故障", "attachment_ids": []},
+                json={"content": "请分析项目并测试清单提交故障", "attachment_ids": []},
             )
         finally:
             store.commit_checklist_success = original_commit
@@ -2421,7 +2424,7 @@ class HttpApiTests(unittest.TestCase):
         try:
             response = self.client.post(
                 f"/api/conversations/{conversation_id}/messages",
-                json={"content": "测试成功回复持久化故障", "attachment_ids": []},
+                json={"content": "请分析项目并测试成功回复持久化故障", "attachment_ids": []},
             )
         finally:
             store.append_message = original_append
@@ -2501,7 +2504,7 @@ class HttpApiTests(unittest.TestCase):
         try:
             response = self.client.post(
                 f"/api/conversations/{conversation_id}/messages",
-                json={"content": "测试run提交重试", "attachment_ids": []},
+                json={"content": "请分析项目并测试run提交重试", "attachment_ids": []},
             )
         finally:
             store.write_run = original_write_run
@@ -2568,7 +2571,7 @@ class HttpApiTests(unittest.TestCase):
         try:
             response = self.client.post(
                 f"/api/conversations/{conversation_id}/messages",
-                json={"content": "测试成功事件恰好一次", "attachment_ids": []},
+                json={"content": "请分析项目并测试成功事件恰好一次", "attachment_ids": []},
             )
         finally:
             store.list_files = original_list_files
@@ -2633,7 +2636,7 @@ class HttpApiTests(unittest.TestCase):
         try:
             response = self.client.post(
                 f"/api/conversations/{conversation_id}/messages",
-                json={"content": "测试二次恢复", "attachment_ids": []},
+                json={"content": "请分析项目并测试二次恢复", "attachment_ids": []},
             )
             events = [
                 json.loads(line.removeprefix("data: "))
@@ -2868,7 +2871,7 @@ class HttpApiTests(unittest.TestCase):
         self.app.state.harness.run = self._completed_checklist_run(fake_run)
         response = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
-            json={"content": "measure this", "attachment_ids": []},
+            json={"content": "analyze this project", "attachment_ids": []},
         )
 
         self.assertEqual(200, response.status_code)
@@ -3414,7 +3417,7 @@ class HttpApiTests(unittest.TestCase):
         rejected = self.client.post(
             f"/api/conversations/{conversation_id}/messages",
             json={
-                "content": "不应进入任务队列",
+                "content": "请分析项目，此请求不应进入任务队列",
                 "attachment_ids": [],
                 "client_request_id": "not-a-canonical-uuid",
             },

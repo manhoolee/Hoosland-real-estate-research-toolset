@@ -43,6 +43,8 @@ from .harness_adapter import (
 )
 from .mcp_protocol import McpProtocol
 from .operation_log import OperationLog
+from .output_policy import scan_output_file, scrub_output
+from .policy import POLICY_REFUSAL, evaluate_request
 from .pdf_runtime import pdf_runtime_status
 from .runtime_config import DEFAULT_OUTPUT_FORMATS, RuntimeConfigError, RuntimeConfigStore
 from .storage import (
@@ -132,6 +134,38 @@ def _sse(event: dict[str, Any]) -> bytes:
     event_name = str(event.get("type", "message"))
     payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event_name}\ndata: {payload}\n\n".encode("utf-8")
+
+
+def _policy_stream_response() -> StreamingResponse:
+    """Return a local, token-free response for a denied chat turn.
+
+    The browser already creates an assistant placeholder before posting a
+    message, so using the normal SSE ``final`` shape keeps the refusal visible
+    without creating a Harness run or persisting the rejected input.
+    """
+
+    async def event_stream() -> AsyncIterator[bytes]:
+        yield _sse(
+            {
+                "type": "final",
+                "message": {
+                    "role": "assistant",
+                    "content": POLICY_REFUSAL,
+                    "status": "complete",
+                },
+            }
+        )
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _bearer(request: Request) -> str | None:
@@ -712,6 +746,10 @@ def _completed_conversation_history(
         if item.get("role") == "user"
         and isinstance(item.get("id"), str)
         and isinstance(item.get("content"), str)
+        and not (
+            isinstance(item.get("metadata"), dict)
+            and item["metadata"].get("policy_excluded") is True
+        )
     }
     pairs: list[list[dict[str, str]]] = []
     for item in messages:
@@ -720,6 +758,8 @@ def _completed_conversation_history(
         content = item.get("content")
         metadata = item.get("metadata")
         if not isinstance(content, str) or not content.strip() or not isinstance(metadata, dict):
+            continue
+        if metadata.get("policy_excluded") is True:
             continue
         finish_reason = metadata.get("finish_reason")
         if isinstance(finish_reason, str) and finish_reason.strip().lower() in {
@@ -858,6 +898,67 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.active_guard = asyncio.Lock()
     app.state.config_update_in_progress = False
     app.state.background_tasks: set[asyncio.Task[None]] = set()
+    reported_output_blocks: set[tuple[str, str, str]] = set()
+
+    def output_internal_markers() -> tuple[str, ...]:
+        main = runtime_config.main_agent()
+        candidates = (
+            app_settings.harness_provider,
+            str(main.get("model") or app_settings.harness_model),
+            CONTROLLER_SKILL_ID,
+            str(app_settings.cordis_path),
+        )
+        return tuple(value for value in candidates if value and len(value) >= 4)
+
+    def safe_file_items(
+        conversation_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return file metadata after hiding unverified generated artifacts."""
+
+        items = store.list_files(conversation_id)
+        paths = store.require(conversation_id)
+        output_root = paths.outputs.resolve()
+        safe: list[dict[str, Any]] = []
+        for item in items:
+            if item.get("kind") != "output":
+                safe.append(item)
+                continue
+            workspace_path = item.get("workspace_path")
+            if not isinstance(workspace_path, str):
+                continue
+            candidate = (paths.workspace / workspace_path).resolve()
+            try:
+                candidate.relative_to(output_root)
+            except ValueError:
+                reason = "OUTPUT_PATH_UNSAFE"
+            else:
+                reason = scan_output_file(
+                    candidate,
+                    display_name=str(item.get("name") or candidate.name),
+                    internal_markers=output_internal_markers(),
+                )
+            if reason is not None:
+                file_key = (
+                    conversation_id,
+                    str(item.get("id") or "unknown"),
+                    reason,
+                )
+                if file_key not in reported_output_blocks:
+                    reported_output_blocks.add(file_key)
+                    operation_log.record(
+                        "file.output.filtered",
+                        source="backend",
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        file_id=item.get("id"),
+                        file_type=_file_type(item.get("name")),
+                        reason_code=reason,
+                    )
+                continue
+            safe.append(item)
+        return safe
 
     def read_token_usage_safely(conversation_id: str) -> dict[str, Any]:
         """Keep optional accounting damage from blocking the research chat."""
@@ -1776,8 +1877,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         attachment_ids = list(payload.attachment_ids)
         retry_user_message: dict[str, Any] | None = None
+        policy_messages: list[dict[str, Any]] | None = None
         if payload.retry_of:
             messages = store.list_messages(conversation_id)
+            policy_messages = messages
             retry_user_message = next(
                 (
                     item
@@ -1809,6 +1912,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return _json_error(409, "TURN_ALREADY_COMPLETED", "这轮研究已经完成，无需重试。")
             content = original_content.strip()
             attachment_ids = list(original_attachment_ids)
+
+        # Run the cheap, deterministic scope/probe gate before reading files,
+        # creating a run, persisting the turn, or invoking the Harness.  A
+        # rejected request therefore costs no provider tokens and cannot be
+        # replayed through the model's normal conversation history.
+        if policy_messages is None:
+            policy_messages = store.list_messages(conversation_id)
+        try:
+            decision = evaluate_request(
+                content,
+                has_attachments=bool(attachment_ids),
+                has_context=bool(_completed_conversation_history(policy_messages)),
+            )
+        except Exception:
+            # Policy failures must fail closed.  Do not let a detector bug
+            # silently turn into a provider call or expose diagnostics.
+            operation_log.record(
+                "agent.policy.error",
+                source="api",
+                request_id=request.state.request_id,
+                conversation_id=conversation_id,
+                policy_version="unknown",
+                content_characters=len(content),
+                attachment_count=len(attachment_ids),
+            )
+            return _policy_stream_response()
+        if not decision.allowed:
+            operation_log.record(
+                "agent.policy.rejected",
+                source="api",
+                request_id=request.state.request_id,
+                conversation_id=conversation_id,
+                action=decision.action,
+                intent=decision.intent,
+                reason_code=decision.reason_code,
+                policy_version=decision.policy_version,
+                content_characters=len(content),
+                attachment_count=len(attachment_ids),
+                retried=payload.retry_of is not None,
+            )
+            return _policy_stream_response()
 
         attachments = store.input_files(conversation_id, attachment_ids)
 
@@ -1876,6 +2020,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 metadata={
                     "agent_session_generation": session_generation,
                     "history_seed_applied": seed_history,
+                    "policy_intent": decision.intent,
+                    "policy_version": decision.policy_version,
                 },
             )
             active.user_message_id = str(user_message["id"])
@@ -1915,6 +2061,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 attachment_count=len(attachment_ids),
                 history_seeded=seed_history,
                 retried=payload.retry_of is not None,
+                policy_intent=decision.intent,
+                policy_version=decision.policy_version,
             )
         except Exception:
             if active.user_message_id:
@@ -2506,7 +2654,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         conversation_id,
                         agent_session_seeded_generation=active.session_generation,
                     )
-                final_response = _research_assistant_text(result.final_response)
+                output_decision = scrub_output(
+                    result.final_response,
+                    internal_markers=output_internal_markers(),
+                )
+                final_response = _research_assistant_text(output_decision.content)
+                if output_decision.blocked:
+                    # Never persist or stream a model response that resembles
+                    # a prompt, runtime instruction, raw tool call, secret, or
+                    # internal path.  Only the fixed local refusal is exposed;
+                    # the detector reason remains private and content-free.
+                    operation_log.record(
+                        "agent.output.filtered",
+                        source="backend",
+                        request_id=request.state.request_id,
+                        project_id=project_id,
+                        conversation_id=conversation_id,
+                        run_id=active.run_id,
+                        policy_version=output_decision.policy_version,
+                        reason_code=output_decision.reason_code,
+                        response_characters=len(result.final_response),
+                    )
                 checklist_before_success = store.read_checklist(
                     conversation_id,
                     active.run_id,
@@ -2564,6 +2732,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "agent_session_id": result.session_id,
                         "reply_to": user_message["id"],
                         "run_id": active.run_id,
+                        **(
+                            {
+                                "policy_excluded": True,
+                                "policy_filtered": True,
+                                "policy_version": output_decision.policy_version,
+                            }
+                            if output_decision.blocked
+                            else {}
+                        ),
                     },
                 )
                 write_run_state(
@@ -2574,7 +2751,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     required=True,
                 )
                 outputs = [
-                    item for item in store.list_files(conversation_id)
+                    item
+                    for item in safe_file_items(
+                        conversation_id,
+                        request_id=request.state.request_id,
+                    )
                     if item.get("kind") == "output"
                 ]
                 operation_log.record(
@@ -2585,7 +2766,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     conversation_id=conversation_id,
                     run_id=active.run_id,
                     session_generation=active.session_generation,
-                    outcome="succeeded",
+                    outcome="policy_filtered" if output_decision.blocked else "succeeded",
                     duration_ms=round((perf_counter() - run_started_at) * 1000, 3),
                     finish_reason=result.finish_reason,
                     response_characters=len(final_response),
@@ -2597,6 +2778,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         }
                     ),
                     run_output_formats=run_output_formats,
+                    policy_filtered=output_decision.blocked,
                     default_output_pair_present_this_run=set(
                         DEFAULT_OUTPUT_FORMATS
                     ).issubset(run_output_formats),
@@ -3024,8 +3206,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.get("/api/conversations/{conversation_id}/files")
-    async def list_files(conversation_id: str) -> dict[str, Any]:
-        return {"items": store.list_files(conversation_id)}
+    async def list_files(request: Request, conversation_id: str) -> dict[str, Any]:
+        return {
+            "items": safe_file_items(
+                conversation_id,
+                request_id=request.state.request_id,
+            )
+        }
 
     @app.post("/api/conversations/{conversation_id}/files", status_code=201)
     async def upload_files(conversation_id: str, request: Request) -> dict[str, Any]:
@@ -3101,6 +3288,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> FileResponse:
         path, item = store.resolve_file(conversation_id, file_id)
         project_id = str(store.read_meta(conversation_id)["project_id"])
+        if item.get("kind") == "output":
+            reason = scan_output_file(
+                path,
+                display_name=str(item.get("name") or path.name),
+                internal_markers=output_internal_markers(),
+            )
+            if reason is not None:
+                operation_log.record(
+                    "file.output.filtered",
+                    source="backend",
+                    request_id=request.state.request_id,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    file_id=file_id,
+                    file_type=_file_type(item.get("name")),
+                    reason_code=reason,
+                )
+                raise HTTPException(status_code=404, detail="文件不可用")
         operation_log.record(
             "file.downloaded",
             source="api",
@@ -3132,6 +3337,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ".html": "text/html; charset=utf-8",
             ".pdf": "application/pdf",
         }
+        if item.get("kind") == "output":
+            reason = scan_output_file(
+                path,
+                display_name=str(item.get("name") or path.name),
+                internal_markers=output_internal_markers(),
+            )
+            if reason is not None:
+                operation_log.record(
+                    "file.output.filtered",
+                    source="backend",
+                    request_id=request.state.request_id,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    file_id=file_id,
+                    file_type=_file_type(item.get("name")),
+                    reason_code=reason,
+                )
+                raise HTTPException(status_code=404, detail="文件不可用")
         if item.get("kind") != "output" or suffix not in media_types:
             raise HTTPException(status_code=415, detail="仅支持打开 outputs 目录中的 Markdown、HTML 或 PDF 文件")
         operation_log.record(

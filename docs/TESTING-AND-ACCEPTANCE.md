@@ -20,15 +20,17 @@
 
 ## 2. 当前自动化基线
 
-当前线上 V0.2.5 源码快照的最低基线：
+当前线上 V0.2.6 源码快照的最低基线：
 
-- 后端单元与 HTTP 回归：132 项全部通过；
+- 后端单元与 HTTP 回归：159 项全部通过；
 - `python -m compileall -q app tests`：通过；
 - Skill bundle smoke tests：通过；
 - 若前端发生变化：TypeScript 检查与生产构建必须通过；
 - 若 Python 或 Node 依赖发生变化：依赖一致性检查、锁文件和干净环境安装必须通过。
 
-“132 项”是 V0.2.5 当前线上基线事实，不是永久固定目标。后续新增行为必须增加对应回归用例，并在候选记录中更新实际数量。
+“159 项”是 V0.2.6 当前线上基线事实，不是永久固定目标。后续新增行为必须增加对应回归用例，并在候选记录中更新实际数量。
+
+V0.2.6 另通过 scope gate / egress gate 对抗用例：闲聊、直接运行信息刺探、混入项目话术的后台/服务端/接口/版本/助手设定提取，以及模型最终文本中的内部标记均 fail closed；被拒请求不创建 run、不读取附件、不写入用户消息，也不消耗 Provider token。隔离候选、生产本机、gateway 与公网路由复验均通过。
 
 V0.2.5 精确源码在本地、GitHub Actions 和服务器端均完成对应自动化门禁；Python 编译、前端类型检查与生产构建、`pip check`、Skill smoke 和 release manifest 也已通过。隔离候选和生产公网的真实 Provider 流式 E2E 均验证逐项 revision、成果文件、刷新读取、sidecar 与服务重启保持一致；候选另用 pinned SDK 的真实 stdio/notification wire 确定性复现“旧 idle 先到、纠正回执后到”的顺序，确认最终只收口纠正后的 turn。
 
