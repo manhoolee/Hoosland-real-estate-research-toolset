@@ -7,6 +7,7 @@ import json
 import re
 import threading
 from collections import OrderedDict
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -83,6 +84,53 @@ class HarnessFollowup:
     """A bounded server instruction appended to the currently active session."""
 
     content: str
+    # The pinned SDK exposes only a next-turn queue for ``session/prompt``;
+    # it cannot interrupt a model step that is already executing.  Recovery
+    # instructions therefore may request a fresh runtime/session so queued
+    # sibling tools cannot run ahead of the correction.
+    restart_session: bool = False
+
+
+class _HarnessSessionRestart(RuntimeError):
+    """Internal signal asking the manager to rotate the live SDK session."""
+
+    def __init__(self, content: str) -> None:
+        super().__init__(content)
+        self.content = content
+
+
+class _HarnessStartGate:
+    """Linearize cancellation with the beginning of an SDK turn.
+
+    ``HarnessManager.cancel`` can otherwise detach a freshly-installed runner
+    in the small interval between an async ownership check and the worker
+    thread's ``start_session``/``run`` call.  The gate gives cancellation a
+    single ordering point: it either marks the run before the worker claims
+    the start, or waits until the initial prompt has been submitted.
+    """
+
+    def __init__(self, lock: threading.Lock, cancelled: threading.Event) -> None:
+        self._lock = lock
+        self._cancelled = cancelled
+
+    def claim(self) -> None:
+        """Claim a compatibility-path turn without holding the lock in it."""
+
+        with self._lock:
+            if self._cancelled.is_set():
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+
+    @contextmanager
+    def setup(self):
+        """Hold the gate through ``start_session`` and initial prompt submit."""
+
+        self._lock.acquire()
+        try:
+            if self._cancelled.is_set():
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+            yield
+        finally:
+            self._lock.release()
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,18 +303,31 @@ def _run_owned_harness_session(
     *,
     session_id: str,
     on_notification: Callable[[object], HarnessFollowup | None],
+    start_guard: _HarnessStartGate | None = None,
 ) -> _OwnedHarnessRunResult:
     """Own every injected prompt from its inbox receipt through the next idle."""
 
-    runner.start_session(session_id)
-    client = runner.client
     events: list[dict[str, Any]] = []
-    with client.subscribe_session_notifications(session_id) as subscription:
-        initial_message_id = client.session_prompt(
-            session_id,
-            [{"type": "text", "text": prompt}],
-            notification_subscription=subscription,
-        )
+    # Keep cancellation from detaching the runner between the ownership check
+    # in ``HarnessManager`` and the SDK's initial session/prompt submission.
+    # The lock is released before waiting for notifications, so cancellation
+    # remains responsive once the turn has genuinely started.
+    with ExitStack() as stack:
+        # Keep cancellation from detaching the runner between the ownership
+        # check and the initial SDK prompt, but release the gate while waiting
+        # for the turn's notifications so cancel() remains responsive.
+        setup_context = start_guard.setup() if start_guard is not None else nullcontext()
+        with setup_context:
+            runner.start_session(session_id)
+            client = runner.client
+            subscription = stack.enter_context(
+                client.subscribe_session_notifications(session_id)
+            )
+            initial_message_id = client.session_prompt(
+                session_id,
+                [{"type": "text", "text": prompt}],
+                notification_subscription=subscription,
+            )
         if not isinstance(initial_message_id, str) or not initial_message_id:
             raise HarnessAdapterError(
                 "AGENT_PROTOCOL_ERROR",
@@ -288,6 +349,14 @@ def _run_owned_harness_session(
             if event is not None:
                 events.append(event)
             if followup is not None:
+                if followup.restart_session:
+                    # ``session/prompt`` is a next-turn enqueue in the pinned
+                    # SDK, not a cancel/steer operation.  Continuing this
+                    # live turn could dispatch sibling tools after the server
+                    # rejected a checklist snapshot.  Let the manager close
+                    # this runtime and replay the bounded instruction in a
+                    # new session instead.
+                    raise _HarnessSessionRestart(followup.content)
                 try:
                     followup_message_id = client.session_prompt(
                         session_id,
@@ -551,6 +620,26 @@ def harness_session_id(
     return f"web-{conversation_id}-g{session_generation}-r{run_id}"
 
 
+def _session_recovery_prompt(prompt: str, instruction: str) -> str:
+    """Replay a bounded server correction in a clean SDK session.
+
+    The Python SDK's ``session/prompt`` endpoint only queues a next-turn
+    message.  Appending a correction to a live turn would leave already
+    planned sibling tools free to execute, so checklist recovery restarts the
+    runtime and gives the new root session both the original request and the
+    authoritative correction.
+    """
+
+    return (
+        prompt.rstrip()
+        + "\n\n"
+        + "[服务端恢复续接｜上一运行已隔离]\n"
+        + "上一运行在服务端清单校验失败后已被终止；不要把上一运行中尚未确认的工具调用视为已完成。"
+        + "请从下面的服务端指令开始，先完成清单恢复，再继续原任务；不要重复已经明确完成的外部副作用。\n"
+        + instruction.strip()
+    )
+
+
 def notification_to_checklist_snapshot(
     notification: object,
     *,
@@ -809,7 +898,13 @@ def notification_to_operation_event(notification: object) -> dict[str, str] | No
         "source_event": event_type,
         "tool_name": tool_name,
     }
-    call_id = _operation_call_id(data)
+    # Result/error envelopes frequently carry a generic message ``id``.  Only
+    # call/start envelopes may use that legacy fallback; result correlation
+    # must come from an explicit call-id or the runtime's nested source.
+    call_id = _operation_call_id(
+        data,
+        allow_generic_id=event_type in {"tool/call", "tool/execute/start"},
+    )
     if call_id:
         result["call_id"] = call_id
     if tool_name == "skill":
@@ -856,20 +951,76 @@ def _operation_tool_category(tool_name: str) -> str:
     return "other"
 
 
-def _operation_call_id(data: object) -> str | None:
+def _operation_call_id(
+    data: object,
+    *,
+    allow_generic_id: bool = True,
+) -> str | None:
     if not isinstance(data, dict):
         return None
-    candidates = [data]
-    call = data.get("call")
-    if isinstance(call, dict):
-        candidates.append(call)
-    for candidate in candidates:
-        for key in ("call_id", "callId", "tool_call_id", "toolCallId", "id"):
+
+    def pick(candidate: object, *, include_generic_id: bool = True) -> str | None:
+        if not isinstance(candidate, dict):
+            return None
+        keys = ["call_id", "callId", "tool_call_id", "toolCallId"]
+        if include_generic_id:
+            # ``id`` is useful on a normal tool/call envelope, but a result
+            # message may also carry a message id.  The latter must not be
+            # mistaken for the operation's call id.
+            keys.append("id")
+        for key in keys:
             value = candidate.get(key)
             if isinstance(value, (str, int)) and not isinstance(value, bool):
                 safe = _safe_operation_identifier(str(value))
                 if safe:
                     return safe
+        return None
+
+    # Current and older Harness tool envelopes put the explicit call
+    # identifier directly on ``data`` or under ``data.call``.  Prefer the
+    # call-specific keys before considering a generic ``id``: a result
+    # envelope may use ``id`` for its message rather than its tool call.
+    for candidate in (data, data.get("call")):
+        call_id = pick(candidate, include_generic_id=False)
+        if call_id:
+            return call_id
+
+    # The pinned runtime emits ``tool/result`` as an assistant message.  Its
+    # canonical id is nested at ``data.message.source.callId`` (and is also
+    # repeated as ``content[].toolCallId``).  Walk only those documented
+    # containers so arbitrary message ids cannot leak into the operation log.
+    message = data.get("message")
+    if isinstance(message, dict):
+        call_id = pick(message.get("source"), include_generic_id=False)
+        if call_id:
+            return call_id
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                call_id = pick(block, include_generic_id=False)
+                if call_id:
+                    return call_id
+
+    # A few adapter/runtime versions wrap the same result envelope once under
+    # ``result`` or ``output``.  Recurse through those bounded containers,
+    # preserving the no-generic-id rule for their message payloads.
+    for key in ("result", "output", "response"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            # A wrapper's generic ``id`` is commonly the response/message id,
+            # not the underlying tool call.  Only canonical call-id keys may
+            # cross that boundary.
+            call_id = _operation_call_id(nested, allow_generic_id=False)
+            if call_id:
+                return call_id
+
+    # Preserve compatibility with older tool/call envelopes that exposed only
+    # a generic ``id`` after all canonical result paths have been checked.
+    if allow_generic_id:
+        for candidate in (data, data.get("call")):
+            call_id = pick(candidate)
+            if call_id:
+                return call_id
     return None
 
 
@@ -960,6 +1111,11 @@ class HarnessManager:
         self._runners: OrderedDict[str, Any] = OrderedDict()
         self._busy: dict[str, str] = {}
         self._cancel_requested: set[str] = set()
+        # A per-conversation startup lock linearizes cancellation with the
+        # first SDK call.  The cancellation event is per run because a runner
+        # can be rotated several times while one HTTP run remains active.
+        self._start_locks: dict[str, threading.Lock] = {}
+        self._run_cancel_events: dict[str, threading.Event] = {}
         self._cache_lock = asyncio.Lock()
         self._runner_tokens: dict[int, str] = {}
         self._runner_tokens_lock = threading.Lock()
@@ -1012,6 +1168,23 @@ class HarnessManager:
             "reasons": reasons,
         }
 
+    async def _start_gate_for(
+        self,
+        conversation_id: str,
+        run_id: str,
+    ) -> _HarnessStartGate:
+        """Return the startup gate for an owned run after validating its lease."""
+
+        async with self._cache_lock:
+            if self._busy.get(conversation_id) != run_id:
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+            lock = self._start_locks.setdefault(conversation_id, threading.Lock())
+            cancelled = self._run_cancel_events.setdefault(
+                run_id,
+                threading.Event(),
+            )
+        return _HarnessStartGate(lock, cancelled)
+
     async def run(
         self,
         conversation_id: str,
@@ -1040,80 +1213,170 @@ class HarnessManager:
 
         if isinstance(session_generation, bool) or session_generation < 0:
             raise HarnessAdapterError("AGENT_PROTOCOL_ERROR", "研究助手运行会话代际无效")
-        runner = await self._runner_for(conversation_id, run_id)
+        runner: Any | None = await self._runner_for(conversation_id, run_id)
+        try:
+            start_gate = await self._start_gate_for(conversation_id, run_id)
+        except Exception:
+            if runner is not None:
+                await self._discard_runner(conversation_id, runner, run_id)
+            raise
         # A web request is a self-contained SDK session.  Reusing a persisted
         # SDK session id in a fresh runtime can collide after restart, runner
         # eviction, or configuration reset.  The HTTP run id makes the SDK id
         # unique while the application restores continuity from its own
-        # successful-message history.
-        session_id = harness_session_id(conversation_id, run_id, session_generation)
-
-        def checked_notification(notification: object) -> HarnessFollowup | None:
-            followup = on_notification(notification)
-            if followup is None:
-                return None
-            if not isinstance(followup, HarnessFollowup) or not followup.content.strip():
-                raise HarnessAdapterError(
-                    "AGENT_PROTOCOL_ERROR",
-                    "研究助手反馈指令无效",
-                )
-            return followup
-
-        def observe(notification: object) -> None:
-            followup = checked_notification(notification)
-            if followup is None:
-                return
-            try:
-                runner.client.session_prompt(
-                    session_id,
-                    [{"type": "text", "text": followup.content}],
-                )
-            except Exception as exc:
-                raise HarnessAdapterError(
-                    "AGENT_CHECKLIST_RECOVERY_FAILED",
-                    "研究助手无法接收任务清单纠正指令",
-                ) from exc
+        # successful-message history.  A checklist correction may rotate this
+        # generation again below because the pinned SDK has no interrupt RPC.
+        current_generation = session_generation
+        current_prompt = prompt
+        session_id = harness_session_id(
+            conversation_id,
+            run_id,
+            current_generation,
+        )
+        session_restart_count = 0
 
         try:
-            client = getattr(runner, "client", None)
-            if callable(getattr(runner, "start_session", None)) and callable(
-                getattr(client, "subscribe_session_notifications", None)
-            ):
-                # The pinned SDK's convenience Session.run stops at the first
-                # idle belonging to the original prompt. Own the subscription
-                # here so every correction is observed from its inbox receipt
-                # through a later idle and cannot be abandoned behind an old
-                # queued idle notification.
-                result = await asyncio.to_thread(
-                    _run_owned_harness_session,
-                    runner,
-                    prompt,
-                    session_id=session_id,
-                    on_notification=checked_notification,
-                )
-            else:
-                # Minimal compatibility path for lightweight test doubles.
-                # Production DeepSeekHarness instances always take the owned
-                # subscription path above.
-                result = await asyncio.to_thread(
-                    runner.run,
-                    prompt,
-                    session_id=session_id,
-                    on_notification=observe,
-                )
+            while True:
+                # A cancellation may have won the hand-off race immediately
+                # after a replacement was installed.  Consume that marker
+                # before starting another SDK turn so a detached/closed
+                # runtime is never handed work after the request was stopped.
+                if await self._take_cancelled(run_id):
+                    if runner is not None:
+                        await self._discard_runner(conversation_id, runner, run_id)
+                    runner = None
+                    raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+                # Bind these closures to the runner/session for this attempt.
+                # They are called from the owned subscription thread.
+                def checked_notification(notification: object) -> HarnessFollowup | None:
+                    followup = on_notification(notification)
+                    if followup is None:
+                        return None
+                    if not isinstance(followup, HarnessFollowup) or not followup.content.strip():
+                        raise HarnessAdapterError(
+                            "AGENT_PROTOCOL_ERROR",
+                            "研究助手反馈指令无效",
+                        )
+                    return followup
+
+                def observe(notification: object) -> None:
+                    followup = checked_notification(notification)
+                    if followup is None:
+                        return
+                    if followup.restart_session:
+                        raise _HarnessSessionRestart(followup.content)
+                    try:
+                        assert runner is not None
+                        runner.client.session_prompt(
+                            session_id,
+                            [{"type": "text", "text": followup.content}],
+                        )
+                    except _HarnessSessionRestart:
+                        raise
+                    except Exception as exc:
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_FAILED",
+                            "研究助手无法接收任务清单纠正指令",
+                        ) from exc
+
+                try:
+                    assert runner is not None
+                    client = getattr(runner, "client", None)
+                    if callable(getattr(runner, "start_session", None)) and callable(
+                        getattr(client, "subscribe_session_notifications", None)
+                    ):
+                        # The pinned SDK's convenience Session.run stops at the
+                        # first idle belonging to the original prompt. Own the
+                        # subscription here so every ordinary correction is
+                        # observed from its inbox receipt through a later idle.
+                        result = await asyncio.to_thread(
+                            _run_owned_harness_session,
+                            runner,
+                            current_prompt,
+                            session_id=session_id,
+                            on_notification=checked_notification,
+                            start_guard=start_gate,
+                        )
+                    else:
+                        # Minimal compatibility path for lightweight test
+                        # doubles. Production DeepSeekHarness instances always
+                        # take the owned subscription path above.
+                        def run_compatibility_turn() -> object:
+                            # Compatibility doubles do not expose the owned
+                            # subscription API.  Claim the startup boundary
+                            # atomically, then leave the gate free so cancel()
+                            # can still close a blocking runner promptly.
+                            start_gate.claim()
+                            return runner.run(
+                                current_prompt,
+                                session_id=session_id,
+                                on_notification=observe,
+                            )
+
+                        result = await asyncio.to_thread(run_compatibility_turn)
+                except _HarnessSessionRestart as restart:
+                    if await self._take_cancelled(run_id):
+                        if runner is not None:
+                            await self._discard_runner(conversation_id, runner, run_id)
+                        runner = None
+                        raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+                    session_restart_count += 1
+                    if session_restart_count > 3:
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_EXHAUSTED",
+                            "研究助手多次无法在隔离会话中恢复任务清单",
+                        )
+                    # The old SDK session may still have queued tool calls.  A
+                    # replacement must therefore be an atomic hand-off: keep
+                    # this run's busy lease while the old process is closed and
+                    # the new one is created.  Dropping the lease first lets a
+                    # concurrent HTTP request steal the conversation between
+                    # the two sessions.
+                    old_runner = runner
+                    if old_runner is None:
+                        raise HarnessAdapterError(
+                            "AGENT_CHECKLIST_RECOVERY_FAILED",
+                            "研究助手恢复会话已丢失",
+                        )
+                    current_generation += 1
+                    next_session_id = harness_session_id(
+                        conversation_id,
+                        run_id,
+                        current_generation,
+                    )
+                    next_prompt = _session_recovery_prompt(
+                        prompt,
+                        restart.content,
+                    )
+                    runner = await self._replace_runner(
+                        conversation_id,
+                        old_runner,
+                        run_id,
+                    )
+                    session_id = next_session_id
+                    current_prompt = next_prompt
+                    continue
+                break
+
+            assert runner is not None
         except HarnessAdapterError:
             if await self._take_cancelled(run_id):
-                await self._discard_runner(conversation_id, runner, run_id)
+                if runner is not None:
+                    await self._discard_runner(conversation_id, runner, run_id)
                 raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
-            await self._discard_runner(conversation_id, runner, run_id)
+            if runner is not None:
+                await self._discard_runner(conversation_id, runner, run_id)
             raise
         except Exception as exc:
             if await self._take_cancelled(run_id):
-                await self._discard_runner(conversation_id, runner, run_id)
+                if runner is not None:
+                    await self._discard_runner(conversation_id, runner, run_id)
                 raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止") from exc
-            await self._discard_runner(conversation_id, runner, run_id)
+            if runner is not None:
+                await self._discard_runner(conversation_id, runner, run_id)
             raise HarnessAdapterError("AGENT_RUN_FAILED", self._safe_error_message(exc)) from exc
         if await self._take_cancelled(run_id):
+            assert runner is not None
             await self._discard_runner(conversation_id, runner, run_id)
             raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
         finish_reason = getattr(result, "finish_reason", None)
@@ -1121,6 +1384,7 @@ class HarnessManager:
             finish_reason.strip().lower() if isinstance(finish_reason, str) else None
         )
         if normalized_finish_reason in {"error", "failed", "failure"}:
+            assert runner is not None
             await self._discard_runner(conversation_id, runner, run_id)
             raise HarnessAdapterError(
                 "AGENT_RESPONSE_ERROR",
@@ -1128,6 +1392,7 @@ class HarnessManager:
             )
         final_response = getattr(result, "final_response", None)
         if not isinstance(final_response, str) or not final_response.strip():
+            assert runner is not None
             await self._discard_runner(conversation_id, runner, run_id)
             raise HarnessAdapterError(
                 "AGENT_EMPTY_RESPONSE",
@@ -1141,6 +1406,7 @@ class HarnessManager:
         # The next HTTP turn intentionally starts a fresh runtime/session and
         # receives persisted history in its prompt.  Closing here also avoids
         # accumulating per-session SDK state inside a long-lived runner.
+        assert runner is not None
         await self._discard_runner(conversation_id, runner, run_id)
         return response
 
@@ -1157,6 +1423,8 @@ class HarnessManager:
                 raise HarnessAdapterError("AGENT_BUSY", "研究助手正在处理这个项目的上一条消息")
             existing = self._runners.pop(conversation_id, None)
             self._busy[conversation_id] = run_id
+            self._start_locks.setdefault(conversation_id, threading.Lock())
+            self._run_cancel_events[run_id] = threading.Event()
             if existing is not None:
                 self._runners[conversation_id] = existing
                 return existing
@@ -1167,6 +1435,7 @@ class HarnessManager:
             async with self._cache_lock:
                 if self._busy.get(conversation_id) == run_id:
                     self._busy.pop(conversation_id, None)
+                self._run_cancel_events.pop(run_id, None)
             raise
 
         async with self._cache_lock:
@@ -1178,6 +1447,7 @@ class HarnessManager:
                 self._cancel_requested.discard(run_id)
                 if self._busy.get(conversation_id) == run_id:
                     self._busy.pop(conversation_id, None)
+                self._run_cancel_events.pop(run_id, None)
             else:
                 self._runners[conversation_id] = runner
                 await self._trim_cache_locked()
@@ -1185,6 +1455,134 @@ class HarnessManager:
             await asyncio.to_thread(self._close_runner, runner)
             raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
         return runner
+
+    async def _replace_runner(
+        self,
+        conversation_id: str,
+        old_runner: Any,
+        run_id: str,
+    ) -> Any:
+        """Rotate a runner without releasing the conversation's busy lease.
+
+        Checklist recovery is triggered from inside an active SDK turn.  The
+        pinned SDK exposes only a next-turn prompt, so the old process must be
+        closed before replaying the request in a fresh process.  This helper
+        deliberately keeps ``_busy[conversation_id]`` owned by ``run_id`` for
+        the whole hand-off.  Cancellation may detach the old runner while it is
+        being closed; identity checks ensure that neither side closes a runner
+        twice, and every newly-created candidate is closed if ownership is lost
+        before installation.
+        """
+
+        owns_old_close = False
+        async with self._cache_lock:
+            if self._busy.get(conversation_id) != run_id:
+                # ``cancel``/``close`` already detached the old process and
+                # owns its close operation.  Never close it a second time.
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+            current = self._runners.get(conversation_id)
+            if current is old_runner:
+                self._runners.pop(conversation_id, None)
+                owns_old_close = True
+            elif current is not None:
+                # A different live runner under the same lease is an internal
+                # ownership violation; fail closed without touching either
+                # process.
+                raise HarnessAdapterError(
+                    "AGENT_PROTOCOL_ERROR",
+                    "研究助手运行会话所有权不一致",
+                )
+            else:
+                # A busy lease without its runner means cancellation/cleanup
+                # detached it concurrently.  Do not create a replacement that
+                # could outlive the operation which owns the lease.
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+
+        if owns_old_close:
+            await asyncio.to_thread(self._close_runner, old_runner)
+
+        # Cancellation can arrive while the old process is shutting down.  Do
+        # this check before allocating a replacement so a cancelled request
+        # cannot spawn a fresh runtime.
+        async with self._cache_lock:
+            cancelled = (
+                self._busy.get(conversation_id) != run_id
+                or run_id in self._cancel_requested
+            )
+            if cancelled:
+                if self._busy.get(conversation_id) == run_id:
+                    self._busy.pop(conversation_id, None)
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+
+        try:
+            replacement = await asyncio.to_thread(
+                self._create_runner,
+                conversation_id,
+            )
+        except Exception:
+            # The old process is already gone.  Do not leave a permanent busy
+            # lease when construction fails; the caller will map the original
+            # exception to its normal API error (or to cancellation if a cancel
+            # marker won the race).
+            async with self._cache_lock:
+                if self._busy.get(conversation_id) == run_id:
+                    self._busy.pop(conversation_id, None)
+            raise
+
+        installed = False
+        async with self._cache_lock:
+            cancelled = (
+                self._busy.get(conversation_id) != run_id
+                or run_id in self._cancel_requested
+            )
+            if not cancelled:
+                # No other request can install a runner while this lease is
+                # held.  Store the candidate before trimming idle cache entries
+                # so cache eviction cannot mistake it for an orphan.
+                self._runners[conversation_id] = replacement
+                installed = True
+                await self._trim_cache_locked()
+            elif self._busy.get(conversation_id) == run_id:
+                self._busy.pop(conversation_id, None)
+
+        if cancelled:
+            # ``cancel`` may already have detached/closed a candidate that was
+            # installed just before this check.  Only close it when it is still
+            # ours in the cache; an uninstalled candidate is ours exclusively.
+            owns_replacement_close = not installed
+            if installed:
+                async with self._cache_lock:
+                    if self._runners.get(conversation_id) is replacement:
+                        self._runners.pop(conversation_id, None)
+                        owns_replacement_close = True
+            if owns_replacement_close:
+                await asyncio.to_thread(self._close_runner, replacement)
+            raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+
+        # ``cancel()`` can run just after the installation lock is released.
+        # Re-check ownership before returning to the loop; otherwise the next
+        # turn could begin with a candidate that cancellation already removed
+        # and is closing.  A cancellation that arrives after this final check
+        # is still handled by the runtime's normal close/error path.
+        owns_replacement_close = False
+        async with self._cache_lock:
+            if (
+                self._busy.get(conversation_id) != run_id
+                or run_id in self._cancel_requested
+            ):
+                if self._runners.get(conversation_id) is replacement:
+                    self._runners.pop(conversation_id, None)
+                    owns_replacement_close = True
+                if self._busy.get(conversation_id) == run_id:
+                    self._busy.pop(conversation_id, None)
+                cancelled = True
+            else:
+                cancelled = False
+        if cancelled:
+            if owns_replacement_close:
+                await asyncio.to_thread(self._close_runner, replacement)
+            raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止")
+        return replacement
 
     def _create_runner(self, conversation_id: str) -> Any:
         try:
@@ -1257,6 +1655,7 @@ class HarnessManager:
                 owns_close = True
             if self._busy.get(conversation_id) == run_id:
                 self._busy.pop(conversation_id, None)
+            self._run_cancel_events.pop(run_id, None)
             self._cancel_requested.discard(run_id)
         # cancel(), close(), or cache eviction may already have detached and
         # taken ownership of closing this runtime.  Only the operation that
@@ -1295,29 +1694,90 @@ class HarnessManager:
     async def close(self) -> None:
         async with self._cache_lock:
             runners = list(self._runners.values())
-            self._cancel_requested.update(
-                self._busy.values()
-            )
+            busy_run_ids = list(self._busy.values())
+            lock_conversation_ids = set(self._busy)
+            lock_conversation_ids.update(self._runners)
+            self._cancel_requested.update(busy_run_ids)
+            for run_id in busy_run_ids:
+                event = self._run_cancel_events.get(run_id)
+                if event is not None:
+                    event.set()
             self._runners.clear()
             self._busy.clear()
-        for runner in runners:
-            await asyncio.to_thread(self._close_runner, runner)
+            self._run_cancel_events.clear()
+            start_locks = [
+                self._start_locks[conversation_id]
+                for conversation_id in lock_conversation_ids
+                if conversation_id in self._start_locks
+            ]
+        acquired_locks: list[threading.Lock] = []
+        try:
+            # Wait until any in-flight initial SDK setup has crossed its
+            # startup boundary before closing that runtime.  Events were set
+            # above, so a worker that has not claimed setup will fail closed.
+            for start_lock in start_locks:
+                while not start_lock.acquire(blocking=False):
+                    await asyncio.sleep(0.005)
+                acquired_locks.append(start_lock)
+            for runner in runners:
+                await asyncio.to_thread(self._close_runner, runner)
+        finally:
+            for start_lock in reversed(acquired_locks):
+                start_lock.release()
 
     async def cancel(self, conversation_id: str, *, run_id: str) -> bool:
+        # Take the same startup lock used by the worker before detaching the
+        # runner.  If the worker has not claimed its first SDK call yet, the
+        # cancellation event wins and the worker will abort without starting
+        # the replacement runtime.  If setup is already in progress, waiting
+        # for this short critical section establishes that the turn started
+        # before cancellation and keeps close() out of the setup call.
         async with self._cache_lock:
             busy_run_id = self._busy.get(conversation_id)
-            active = busy_run_id == run_id
-            runner = None
-            if active:
-                self._busy.pop(conversation_id, None)
-                runner = self._runners.pop(conversation_id, None)
-            elif busy_run_id is None:
-                # The SDK call may have just completed but the web worker has
-                # not committed its response yet. Invalidate that cached
-                # session so a cancelled turn cannot be resumed as completed.
-                runner = self._runners.pop(conversation_id, None)
-            if active or runner is not None:
-                self._cancel_requested.add(run_id)
+            if busy_run_id is not None and busy_run_id != run_id:
+                return False
+            start_lock = self._start_locks.get(conversation_id)
+        start_lock_acquired = False
+        if start_lock is not None:
+            # Do not delegate a blocking ``threading.Lock.acquire`` to an
+            # executor: if this coroutine is cancelled while waiting, the
+            # orphaned executor job could acquire the lock long after this
+            # function's finally block has gone away.  Non-blocking polling is
+            # cheap because the gate is held only for initial SDK setup.
+            try:
+                while not start_lock.acquire(blocking=False):
+                    await asyncio.sleep(0.005)
+                start_lock_acquired = True
+            except BaseException:
+                if start_lock_acquired:
+                    start_lock.release()
+                raise
+        try:
+            async with self._cache_lock:
+                busy_run_id = self._busy.get(conversation_id)
+                active = busy_run_id == run_id
+                runner = None
+                if active:
+                    self._busy.pop(conversation_id, None)
+                    runner = self._runners.pop(conversation_id, None)
+                elif busy_run_id is None:
+                    # The SDK call may have just completed but the web worker
+                    # has not committed its response yet. Invalidate that
+                    # cached session so a cancelled turn cannot be resumed as
+                    # completed.
+                    runner = self._runners.pop(conversation_id, None)
+                else:
+                    # Another run acquired the lease while we waited for the
+                    # startup gate; never detach its runner.
+                    return False
+                if active or runner is not None:
+                    self._cancel_requested.add(run_id)
+                    cancelled_event = self._run_cancel_events.get(run_id)
+                    if cancelled_event is not None:
+                        cancelled_event.set()
+        finally:
+            if start_lock_acquired:
+                start_lock.release()
         if runner is not None:
             await asyncio.to_thread(self._close_runner, runner)
         return active or runner is not None

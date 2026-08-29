@@ -21,6 +21,7 @@ from app.harness_adapter import (
 from app.main import (
     _completed_conversation_history,
     _new_or_updated_output_formats,
+    _session_generation_for_run,
     create_app,
 )
 
@@ -47,6 +48,43 @@ class HttpApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client_context.__exit__(None, None, None)
         self.temporary.cleanup()
+
+    def test_session_generation_for_run_is_scoped_and_canonical(self) -> None:
+        conversation_id = "conversation-123"
+        run_id = "a" * 32
+        self.assertEqual(
+            0,
+            _session_generation_for_run(
+                harness_session_id(conversation_id, run_id, 0),
+                conversation_id=conversation_id,
+                run_id=run_id,
+            ),
+        )
+        self.assertEqual(
+            7,
+            _session_generation_for_run(
+                harness_session_id(conversation_id, run_id, 7),
+                conversation_id=conversation_id,
+                run_id=run_id,
+            ),
+        )
+        for invalid in (
+            harness_session_id("other-conversation", run_id, 1),
+            harness_session_id(conversation_id, "b" * 32, 1),
+            f"web-{conversation_id}-g01-r{run_id}",
+            f"web-{conversation_id}-g-1-r{run_id}",
+            f"web-{conversation_id}-g1-r{run_id}extra",
+            "not-a-harness-session",
+            None,
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(
+                    _session_generation_for_run(
+                        invalid,
+                        conversation_id=conversation_id,
+                        run_id=run_id,
+                    )
+                )
 
     @staticmethod
     def _completed_checklist_run(run: object) -> object:
@@ -1700,6 +1738,172 @@ class HttpApiTests(unittest.TestCase):
                 record.get("event") == "agent.checklist.repair.completed"
                 for record in checklist_records
             ),
+        )
+
+    def test_recovery_session_accepts_reset_with_session_local_sequence(self) -> None:
+        """A fresh Harness session may restart its event seq at one."""
+
+        conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
+        received_followups: list[HarnessFollowup] = []
+
+        async def fake_run(
+            current_conversation_id: str,
+            _prompt: str,
+            on_notification: object,
+            *,
+            run_id: str,
+            session_generation: int = 0,
+        ) -> HarnessRunResult:
+            assert callable(on_notification)
+            first_session = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation,
+            )
+
+            def emit(
+                session_id: str,
+                seq: int,
+                statuses: tuple[str, str, str],
+            ) -> object:
+                return on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": session_id,
+                            "event": {
+                                "type": "todo/write",
+                                "seq": seq,
+                                "time": seq,
+                                "data": {
+                                    "todos": [
+                                        {
+                                            "content": "任务｜恢复后继续研究",
+                                            "status": statuses[0],
+                                        },
+                                        {
+                                            "content": "成果回复｜提交恢复结论",
+                                            "status": statuses[1],
+                                        },
+                                        {
+                                            "content": "任务｜复核恢复结论",
+                                            "status": statuses[2],
+                                        },
+                                    ]
+                                },
+                            },
+                        },
+                    }
+                )
+
+            self.assertIsNone(
+                emit(first_session, 1, ("in_progress", "pending", "pending"))
+            )
+            self.assertIsNone(
+                emit(first_session, 2, ("completed", "in_progress", "pending"))
+            )
+            followup = emit(
+                first_session,
+                3,
+                ("completed", "completed", "completed"),
+            )
+            self.assertIsInstance(followup, HarnessFollowup)
+            assert isinstance(followup, HarnessFollowup)
+            self.assertTrue(followup.restart_session)
+            received_followups.append(followup)
+
+            # This is the only root-session event after the manager rotates the
+            # runtime.  Its raw seq restarts at one, but it must still be
+            # accepted as the next durable event in this run.
+            recovery_session = harness_session_id(
+                current_conversation_id,
+                run_id,
+                session_generation + 1,
+            )
+            self.assertIsNone(
+                on_notification(
+                    {
+                        "method": "session.event",
+                        "payload": {
+                            "sessionId": recovery_session,
+                            "event": {
+                                "type": "tool/call",
+                                "seq": 1,
+                                "data": {
+                                    "callId": "todo-recovery-call",
+                                    "name": "todo_write",
+                                },
+                            },
+                        },
+                    }
+                )
+            )
+            self.assertIsNone(
+                emit(recovery_session, 1, ("completed", "in_progress", "pending"))
+            )
+            self.assertIsNone(
+                emit(recovery_session, 2, ("completed", "completed", "pending"))
+            )
+            self.assertIsNone(
+                emit(recovery_session, 3, ("completed", "completed", "completed"))
+            )
+            # A late event from the disposed generation must not take the root
+            # session filter back to the old runtime.
+            self.assertIsNone(
+                emit(first_session, 4, ("completed", "completed", "completed"))
+            )
+            return HarnessRunResult(
+                final_response="恢复后已完成",
+                finish_reason="stop",
+                session_id=recovery_session,
+            )
+
+        self.app.state.harness.run = fake_run
+        response = self.client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": "测试跨会话清单恢复", "attachment_ids": []},
+        )
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertEqual(1, len(received_followups))
+        self.assertFalse(any(event.get("type") == "error" for event in events))
+        self.assertTrue(any(event.get("type") == "final" for event in events))
+        self.assertEqual(
+            "succeeded",
+            self.client.get(f"/api/conversations/{conversation_id}/run").json()[
+                "status"
+            ],
+        )
+        run_id = self.app.state.store.read_run(conversation_id)["run_id"]
+        sidecar = self.app.state.store.read_checklist(conversation_id, run_id)
+        self.assertIsNotNone(sidecar)
+        assert sidecar is not None
+        self.assertEqual(6, sidecar["source_seq"])
+        records = [
+            json.loads(line)
+            for line in self.settings.operation_log_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        ]
+        current = [
+            record
+            for record in records
+            if record.get("conversation_id") == conversation_id
+        ]
+        self.assertEqual(
+            1,
+            sum(record.get("event") == "agent.checklist.repair.requested" for record in current),
+        )
+        self.assertEqual(
+            1,
+            sum(record.get("event") == "agent.checklist.repair.completed" for record in current),
+        )
+        self.assertFalse(
+            any(record.get("event") == "agent.checklist.repair.failed" for record in current)
         )
 
     def test_checklist_recovery_exhaustion_fails_fast(self) -> None:

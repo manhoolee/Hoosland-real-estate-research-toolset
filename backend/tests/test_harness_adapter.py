@@ -591,6 +591,74 @@ class HarnessAdapterTests(unittest.TestCase):
         self.assertEqual("call-123", event["call_id"])
         self.assertNotIn(marker, str(event))
 
+    def test_operation_result_reads_nested_harness_call_id(self) -> None:
+        event = notification_to_operation_event(
+            FakeNotification(
+                "session.event",
+                {
+                    "event": {
+                        "type": "tool/result",
+                        "data": {
+                            "turn": 1,
+                            "step": 2,
+                            "message": {
+                                "id": "message-id-must-not-be-used",
+                                "source": {
+                                    "kind": "tool",
+                                    "callId": "call-todo-rejected",
+                                },
+                                "content": [
+                                    {
+                                        "type": "tool-result",
+                                        "toolCallId": "call-todo-rejected",
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                },
+            )
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual("call-todo-rejected", event["call_id"])
+        self.assertEqual("other", event["tool_name"])
+
+        # A response wrapper may expose only its own message id.  It is not a
+        # tool call id and must not be copied into the private operation log.
+        self.assertNotIn(
+            "call_id",
+            notification_to_operation_event(
+                FakeNotification(
+                    "session.event",
+                    {
+                        "event": {
+                            "type": "tool/result",
+                            "data": {
+                                "result": {"id": "response-message-only"},
+                            },
+                        }
+                    },
+                )
+            )
+            or {},
+        )
+        self.assertNotIn(
+            "call_id",
+            notification_to_operation_event(
+                FakeNotification(
+                    "session.event",
+                    {
+                        "event": {
+                            "type": "tool/result",
+                            "data": {"id": "result-message-id"},
+                        }
+                    },
+                )
+            )
+            or {},
+        )
+
     def test_operation_notification_tracks_skill_without_skill_arguments(self) -> None:
         event = notification_to_operation_event(
             FakeNotification(

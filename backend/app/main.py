@@ -8,7 +8,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, AsyncIterator
@@ -538,6 +538,11 @@ def _checklist_repair_followup(
         separators=(",", ":"),
     )
     return HarnessFollowup(
+        # The SDK's prompt API only queues a next turn.  Once a snapshot has
+        # been rejected, the current turn may already have sibling tool calls
+        # queued behind it; keep the old runtime isolated while this reset is
+        # replayed in a fresh session.
+        restart_session=True,
         content=(
             "[服务端清单状态纠正｜必须立即执行]\n"
             "刚才的 todo_write 仅在 Harness 本地写入成功，但未通过应用的持久化门禁。"
@@ -633,6 +638,61 @@ def _metadata_generation(metadata: dict[str, Any], key: str, default: int) -> in
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return default
+
+
+def _session_generation_for_run(
+    session_id: object,
+    *,
+    conversation_id: str,
+    run_id: str,
+) -> int | None:
+    """Return the canonical SDK generation when an id belongs to this run.
+
+    Recovery can replace the SDK runtime while the HTTP run remains the same.
+    The manager consequently emits ``web-{conversation}-gN-r{run}`` ids for
+    successive generations.  Treat the conversation and run components as
+    trust boundaries: a well-formed id for another run must never be allowed
+    to commit a checklist snapshot into this run.
+    """
+
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(conversation_id, str)
+        or not conversation_id
+        or not isinstance(run_id, str)
+        or not run_id
+    ):
+        return None
+    prefix = f"web-{conversation_id}-g"
+    if not session_id.startswith(prefix):
+        return None
+    generation_and_run = session_id[len(prefix) :]
+    generation_text, separator, candidate_run_id = generation_and_run.partition("-r")
+    if separator != "-r" or candidate_run_id != run_id:
+        return None
+    # ``harness_session_id`` uses the canonical decimal representation of a
+    # non-negative integer.  Reject signs, whitespace, leading zeroes and
+    # Python's potentially huge/unbounded integer spellings.
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)", generation_text):
+        return None
+    try:
+        generation = int(generation_text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return generation
+
+
+def _notification_session_id(notification: object) -> str | None:
+    """Read a notification's root session id without trusting its shape."""
+
+    payload = getattr(notification, "payload", None)
+    if isinstance(notification, dict):
+        payload = notification.get("payload", payload)
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sessionId", payload.get("session_id"))
+    return value if isinstance(value, str) and value else None
 
 
 def _completed_conversation_history(
@@ -1907,6 +1967,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         checklist_repair_attempts = 0
         checklist_repair_pending = False
         checklist_repair_expected: list[dict[str, str]] | None = None
+        # Harness event sequence numbers are scoped to an SDK session.  A
+        # recovery restart therefore resets the raw ``seq`` counter; keep a
+        # per-run logical cursor so the durable sidecar still receives a
+        # strictly increasing sequence across generations.
+        checklist_raw_seq_by_session: dict[str, int] = {}
+        initial_source_seq = initial_checklist.get("source_seq")
+        checklist_logical_seq = (
+            initial_source_seq
+            if isinstance(initial_source_seq, int) and not isinstance(initial_source_seq, bool)
+            else -1
+        )
         pre_checklist_operation_count = 0
         highest_progress_step = 1
         output_baseline = _output_fingerprint(conversation_paths.outputs)
@@ -1915,6 +1986,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             conversation_id,
             read_token_usage_safely(conversation_id),
         )
+
+        def adopt_notification_session(notification: object) -> bool:
+            """Adopt a manager-rotated root session only for this HTTP run.
+
+            ``HarnessManager`` may dispose a poisoned runtime and continue the
+            same HTTP run with a higher SDK generation.  The callback itself is
+            intentionally session-agnostic, so validate the notification id
+            here before handing a checklist snapshot to storage.  Descendant
+            sessions, stale generations, and ids belonging to another
+            conversation/run remain outside the checklist trust boundary.
+            """
+
+            candidate = _notification_session_id(notification)
+            generation = _session_generation_for_run(
+                candidate,
+                conversation_id=conversation_id,
+                run_id=active.run_id,
+            )
+            if generation is None or generation < active.session_generation:
+                return False
+            # A manager rotation advances the root SDK generation exactly one
+            # step.  Reject a jump larger than one so a stale/fabricated
+            # notification cannot silently move the checklist trust boundary.
+            if generation > active.session_generation + 1:
+                return False
+            # A manager rotation is monotonic.  Keep the active metadata in
+            # lockstep so subsequent callbacks, terminal logs and cleanup
+            # rotation all refer to the adopted generation.
+            if (
+                active.session_id != candidate
+                or active.session_generation != generation
+            ):
+                active.session_id = candidate
+                active.session_generation = generation
+                # A runtime that was disposed mid-turn must not become the
+                # implicit session for a later request, even when this run
+                # eventually succeeds after recovery.
+                active.rotate_session_on_exit = True
+            return True
+
+        def normalize_checklist_snapshot(snapshot: object) -> Any | None:
+            """Map session-local checklist seqs onto one monotonic run cursor."""
+
+            nonlocal checklist_logical_seq
+            session_id = getattr(snapshot, "session_id", None)
+            raw_seq = getattr(snapshot, "event_seq", None)
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or isinstance(raw_seq, bool)
+                or not isinstance(raw_seq, int)
+                or raw_seq < 0
+                or session_id != active.session_id
+            ):
+                return None
+            previous_raw = checklist_raw_seq_by_session.get(session_id)
+            if previous_raw is not None and raw_seq <= previous_raw:
+                # Preserve the storage layer's duplicate/out-of-order replay
+                # semantics without manufacturing a new logical event.
+                return None
+            checklist_raw_seq_by_session[session_id] = raw_seq
+            logical_seq = max(raw_seq, checklist_logical_seq + 1)
+            checklist_logical_seq = logical_seq
+            return replace(snapshot, event_seq=logical_seq)
 
         def on_notification(notification: object) -> HarnessFollowup | None:
             nonlocal highest_progress_step
@@ -1928,10 +2063,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             nonlocal output_write_attempt_count
             nonlocal pre_checklist_operation_count
             followup: HarnessFollowup | None = None
+            current_root_session = adopt_notification_session(notification)
             operation_event = notification_to_operation_event(notification)
-            checklist_snapshot = notification_to_checklist_snapshot(
+            raw_checklist_snapshot = notification_to_checklist_snapshot(
                 notification,
-                expected_session_id=active.session_id or "",
+                expected_session_id=(
+                    active.session_id if current_root_session else ""
+                )
+                or "",
+            )
+            checklist_snapshot = (
+                normalize_checklist_snapshot(raw_checklist_snapshot)
+                if raw_checklist_snapshot is not None
+                else None
             )
             if checklist_snapshot is not None:
                 snapshot_todos = checklist_snapshot.todo_dicts()
