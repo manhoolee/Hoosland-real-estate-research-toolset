@@ -1116,6 +1116,7 @@ class HarnessManager:
         # can be rotated several times while one HTTP run remains active.
         self._start_locks: dict[str, threading.Lock] = {}
         self._run_cancel_events: dict[str, threading.Event] = {}
+        self._cancel_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._cache_lock = asyncio.Lock()
         self._runner_tokens: dict[int, str] = {}
         self._runner_tokens_lock = threading.Lock()
@@ -1431,11 +1432,19 @@ class HarnessManager:
 
         try:
             runner = await asyncio.to_thread(self._create_runner, conversation_id)
-        except Exception:
+        except Exception as exc:
+            cancelled = False
             async with self._cache_lock:
+                cancelled = (
+                    run_id in self._cancel_requested
+                    or self._busy.get(conversation_id) != run_id
+                )
+                self._cancel_requested.discard(run_id)
                 if self._busy.get(conversation_id) == run_id:
                     self._busy.pop(conversation_id, None)
                 self._run_cancel_events.pop(run_id, None)
+            if cancelled:
+                raise HarnessAdapterError("AGENT_CANCELLED", "本次研究已终止") from exc
             raise
 
         async with self._cache_lock:
@@ -1725,38 +1734,54 @@ class HarnessManager:
             for start_lock in reversed(acquired_locks):
                 start_lock.release()
 
-    async def cancel(self, conversation_id: str, *, run_id: str) -> bool:
-        # Take the same startup lock used by the worker before detaching the
-        # runner.  If the worker has not claimed its first SDK call yet, the
-        # cancellation event wins and the worker will abort without starting
-        # the replacement runtime.  If setup is already in progress, waiting
-        # for this short critical section establishes that the turn started
-        # before cancellation and keeps close() out of the setup call.
-        async with self._cache_lock:
-            busy_run_id = self._busy.get(conversation_id)
-            if busy_run_id is not None and busy_run_id != run_id:
-                return False
-            start_lock = self._start_locks.get(conversation_id)
-        start_lock_acquired = False
-        if start_lock is not None:
-            # Do not delegate a blocking ``threading.Lock.acquire`` to an
-            # executor: if this coroutine is cancelled while waiting, the
-            # orphaned executor job could acquire the lock long after this
-            # function's finally block has gone away.  Non-blocking polling is
-            # cheap because the gate is held only for initial SDK setup.
-            try:
-                while not start_lock.acquire(blocking=False):
-                    await asyncio.sleep(0.005)
-                start_lock_acquired = True
-            except BaseException:
-                if start_lock_acquired:
-                    start_lock.release()
-                raise
+    @staticmethod
+    async def _acquire_start_lock(lock: threading.Lock) -> None:
+        """Acquire a threading lock without creating an orphaned executor job."""
+
+        acquired = False
+        try:
+            while not lock.acquire(blocking=False):
+                await asyncio.sleep(0.005)
+            acquired = True
+        except BaseException:
+            # A cancellation delivered immediately after the non-blocking
+            # acquire must not strand the per-conversation startup gate.
+            if acquired:
+                lock.release()
+            raise
+
+    def _track_cancel_cleanup(self, task: asyncio.Task[Any]) -> None:
+        self._cancel_cleanup_tasks.add(task)
+
+        def forget(done: asyncio.Task[Any]) -> None:
+            self._cancel_cleanup_tasks.discard(done)
+            # A shielded cleanup task may finish after its request task has
+            # already returned.  Retrieve any exception here so an unusual
+            # close failure does not become an unhandled-task warning.
+            if not done.cancelled():
+                try:
+                    done.exception()
+                except BaseException:
+                    pass
+
+        task.add_done_callback(forget)
+
+    async def _finish_cancel_after_gate(
+        self,
+        conversation_id: str,
+        run_id: str,
+        start_lock: threading.Lock | None,
+        *,
+        lock_acquired: bool,
+    ) -> bool:
+        """Detach and close a cancelled run; optionally release its startup gate."""
+
+        runner: Any | None = None
+        active = False
         try:
             async with self._cache_lock:
                 busy_run_id = self._busy.get(conversation_id)
                 active = busy_run_id == run_id
-                runner = None
                 if active:
                     self._busy.pop(conversation_id, None)
                     runner = self._runners.pop(conversation_id, None)
@@ -1769,18 +1794,114 @@ class HarnessManager:
                 else:
                     # Another run acquired the lease while we waited for the
                     # startup gate; never detach its runner.
+                    self._cancel_requested.discard(run_id)
+                    self._run_cancel_events.pop(run_id, None)
                     return False
-                if active or runner is not None:
-                    self._cancel_requested.add(run_id)
-                    cancelled_event = self._run_cancel_events.get(run_id)
-                    if cancelled_event is not None:
-                        cancelled_event.set()
+                self._run_cancel_events.pop(run_id, None)
+                # There is no worker left that could consume this marker when
+                # the lease was already idle.  Clear it now instead of
+                # retaining an unbounded stale run id in the manager.
+                if not active:
+                    self._cancel_requested.discard(run_id)
+            if runner is not None:
+                # Keep the close operation alive even if the caller's task is
+                # cancelled (for example, an API timeout).
+                close_task = asyncio.create_task(
+                    asyncio.to_thread(self._close_runner, runner)
+                )
+                self._track_cancel_cleanup(close_task)
+                await asyncio.shield(close_task)
+            return active or runner is not None
         finally:
-            if start_lock_acquired:
+            if lock_acquired and start_lock is not None:
                 start_lock.release()
-        if runner is not None:
-            await asyncio.to_thread(self._close_runner, runner)
-        return active or runner is not None
+
+    async def cancel(self, conversation_id: str, *, run_id: str) -> bool:
+        # Mark cancellation before waiting for startup setup.  This makes a
+        # timeout/cancellation of this coroutine safe: an unstarted worker
+        # observes the event and fails closed, while a background cleanup task
+        # below still detaches and closes the runtime.
+        async with self._cache_lock:
+            busy_run_id = self._busy.get(conversation_id)
+            if busy_run_id is not None and busy_run_id != run_id:
+                return False
+            active_hint = busy_run_id == run_id
+            cached_hint = busy_run_id is None and conversation_id in self._runners
+            if not active_hint and not cached_hint:
+                return False
+            self._cancel_requested.add(run_id)
+            cancelled_event = self._run_cancel_events.get(run_id)
+            if cancelled_event is not None:
+                cancelled_event.set()
+            start_lock = self._start_locks.get(conversation_id)
+
+        lock_acquired = False
+        if start_lock is not None:
+            acquire_task = asyncio.create_task(self._acquire_start_lock(start_lock))
+            self._track_cancel_cleanup(acquire_task)
+            try:
+                # Shield the polling task so wait_for/task cancellation cannot
+                # leave a lock acquisition running without its cleanup owner.
+                await asyncio.shield(acquire_task)
+                lock_acquired = True
+            except asyncio.CancelledError:
+                async def finish_after_acquire() -> None:
+                    acquired = False
+                    try:
+                        # The outer request may be cancelled repeatedly while
+                        # this background owner waits.  Keep the polling task
+                        # shielded and continue until we know whether it
+                        # acquired the lock; otherwise a late acquisition
+                        # would strand the gate forever.
+                        while True:
+                            try:
+                                await asyncio.shield(acquire_task)
+                                acquired = True
+                                break
+                            except asyncio.CancelledError:
+                                if not acquire_task.done():
+                                    continue
+                                if acquire_task.cancelled():
+                                    return
+                                try:
+                                    acquire_task.result()
+                                except BaseException:
+                                    return
+                                acquired = True
+                                break
+                            except BaseException:
+                                return
+                        # This coroutine owns the lock and releases it in its
+                        # finally block, even if detachment is cancelled.
+                        await self._finish_cancel_after_gate(
+                            conversation_id,
+                            run_id,
+                            start_lock,
+                            lock_acquired=False,
+                        )
+                    finally:
+                        if acquired:
+                            start_lock.release()
+
+                cleanup_task = asyncio.create_task(finish_after_acquire())
+                self._track_cancel_cleanup(cleanup_task)
+                raise
+
+        cleanup_task = asyncio.create_task(
+            self._finish_cancel_after_gate(
+                conversation_id,
+                run_id,
+                start_lock,
+                lock_acquired=lock_acquired,
+            )
+        )
+        self._track_cancel_cleanup(cleanup_task)
+        try:
+            return await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            # The shielded cleanup remains tracked and will release the gate
+            # and close the detached runner in the background.
+            raise
 
     async def reset(self) -> None:
         await self.close()

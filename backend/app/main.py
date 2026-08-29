@@ -2926,9 +2926,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         cancel_completed = True
+        cancel_task = asyncio.create_task(
+            harness.cancel(conversation_id, run_id=active.run_id),
+            name=f"cancel-agent-{conversation_id}-{active.run_id}",
+        )
+        def consume_cancel_task(task: asyncio.Task[Any]) -> None:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                LOGGER.exception(
+                    "Background cancellation cleanup failed conversation=%s run=%s",
+                    conversation_id,
+                    active.run_id,
+                )
+
+        cancel_task.add_done_callback(consume_cancel_task)
         try:
             await asyncio.wait_for(
-                harness.cancel(conversation_id, run_id=active.run_id),
+                asyncio.shield(cancel_task),
                 timeout=10.0,
             )
         except TimeoutError:
