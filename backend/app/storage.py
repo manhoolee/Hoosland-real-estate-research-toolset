@@ -22,6 +22,12 @@ RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 CLIENT_REQUEST_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+# ``intake.py`` owns the public intake protocol.  Keep this narrow shape
+# check local to storage as well so a damaged sidecar can never be trusted
+# merely because it is valid JSON (and avoid a storage -> API import cycle).
+INTAKE_ID_RE = re.compile(r"^intake_[0-9a-f]{32}$")
+INTAKE_MAX_QUESTIONS = 3
+INTAKE_MAX_OPTIONS = 4
 RUN_STATUSES = frozenset(
     {"idle", "running", "succeeded", "failed", "cancelled", "interrupted"}
 )
@@ -163,6 +169,7 @@ class ConversationPaths:
     run: Path
     usage: Path
     checklists: Path
+    pending_intake: Path
 
 
 class ConversationStore:
@@ -210,6 +217,7 @@ class ConversationStore:
             run=root / "run.json",
             usage=root / "usage.json",
             checklists=root / "checklists",
+            pending_intake=root / "pending_intake.json",
         )
 
     def create_or_reuse(
@@ -359,6 +367,13 @@ class ConversationStore:
             or paths.checklists.resolve() != paths.root.resolve() / "checklists"
         ):
             raise StorageError("conversation checklists directory is unsafe")
+        # ``Path.exists()`` is false for a dangling symlink; check the link
+        # bit independently so an attacker cannot hide an unsafe sidecar by
+        # pointing it at a missing target.
+        if paths.pending_intake.is_symlink() or (
+            paths.pending_intake.exists() and not paths.pending_intake.is_file()
+        ):
+            raise StorageError("conversation pending intake state is missing or unsafe")
         return paths
 
     def read_meta(self, conversation_id: str) -> dict[str, Any]:
@@ -380,6 +395,475 @@ class ConversationStore:
             value["updated_at"] = utc_now()
             self._atomic_json(paths.meta, value)
             return value
+
+    # ------------------------------------------------------------------
+    # Guided-intake sidecar
+    # ------------------------------------------------------------------
+    # A pending intake is deliberately kept out of messages.jsonl and run.json:
+    # it represents a question which has not yet become a model turn.  This
+    # lets a browser refresh/retry the choices without polluting conversation
+    # history or making the run state look active.
+
+    @staticmethod
+    def _validate_pending_intake(value: object) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise StorageError("conversation pending intake state is invalid")
+        version = value.get("version")
+        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+            raise StorageError("conversation pending intake version is invalid")
+        intake_id = value.get("intake_id")
+        if not isinstance(intake_id, str) or not INTAKE_ID_RE.fullmatch(intake_id):
+            raise StorageError("conversation pending intake id is invalid")
+        status = value.get("status")
+        if status not in {"awaiting_input", "confirmed"}:
+            raise StorageError("conversation pending intake status is invalid")
+        task_type = value.get("task_type")
+        if not isinstance(task_type, str) or not task_type or len(task_type) > 80:
+            raise StorageError("conversation pending intake task type is invalid")
+        task_type_label = value.get("task_type_label")
+        if (
+            task_type_label is not None
+            and (
+                not isinstance(task_type_label, str)
+                or not task_type_label.strip()
+                or len(task_type_label) > 120
+            )
+        ):
+            raise StorageError("conversation pending intake task type label is invalid")
+        original_content = value.get("original_content")
+        if (
+            not isinstance(original_content, str)
+            or not original_content.strip()
+            or len(original_content) > 200_000
+        ):
+            raise StorageError("conversation pending intake content is invalid")
+        digest = value.get("content_sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise StorageError("conversation pending intake digest is invalid")
+        if hashlib.sha256(original_content.encode("utf-8")).hexdigest() != digest:
+            raise StorageError("conversation pending intake digest does not match content")
+        attachment_ids = value.get("attachment_ids", [])
+        if not isinstance(attachment_ids, list) or len(attachment_ids) > 20:
+            raise StorageError("conversation pending intake attachments are invalid")
+        seen_attachments: set[str] = set()
+        for attachment_id in attachment_ids:
+            if (
+                not isinstance(attachment_id, str)
+                or not attachment_id.strip()
+                or attachment_id in seen_attachments
+            ):
+                raise StorageError("conversation pending intake attachments are invalid")
+            seen_attachments.add(attachment_id)
+        questions = value.get("questions")
+        if (
+            not isinstance(questions, list)
+            or not questions
+            or len(questions) > INTAKE_MAX_QUESTIONS
+        ):
+            raise StorageError("conversation pending intake questions are invalid")
+        question_ids: set[str] = set()
+        for question in questions:
+            if not isinstance(question, dict):
+                raise StorageError("conversation pending intake questions are invalid")
+            question_id = question.get("id")
+            prompt = question.get("prompt")
+            options = question.get("options")
+            if (
+                not isinstance(question_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", question_id)
+                or not isinstance(prompt, str)
+                or not prompt.strip()
+                or len(prompt) > 500
+                or not isinstance(options, list)
+                or len(options) < 2
+                or len(options) > INTAKE_MAX_OPTIONS
+                or question_id in question_ids
+            ):
+                raise StorageError("conversation pending intake questions are invalid")
+            question_ids.add(question_id)
+            field = question.get("field")
+            if field is not None and (
+                not isinstance(field, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", field)
+            ):
+                raise StorageError("conversation pending intake question field is invalid")
+            kind = question.get("kind", "single")
+            if kind not in {"single", "multi"}:
+                raise StorageError("conversation pending intake question kind is invalid")
+            for text_field, maximum in (
+                ("help", 500),
+                ("custom_placeholder", 500),
+            ):
+                text_value = question.get(text_field)
+                if text_value is not None and (
+                    not isinstance(text_value, str) or len(text_value) > maximum
+                ):
+                    raise StorageError(
+                        f"conversation pending intake question {text_field} is invalid"
+                    )
+            for boolean_field in ("required", "allow_custom"):
+                boolean_value = question.get(boolean_field)
+                if boolean_value is not None and not isinstance(boolean_value, bool):
+                    raise StorageError(
+                        f"conversation pending intake question {boolean_field} is invalid"
+                    )
+            option_ids: set[str] = set()
+            for option in options:
+                if not isinstance(option, dict):
+                    raise StorageError("conversation pending intake options are invalid")
+                option_id = option.get("id")
+                label = option.get("label")
+                if (
+                    not isinstance(option_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", option_id)
+                    or option_id in option_ids
+                    or not isinstance(label, str)
+                    or not label.strip()
+                    or len(label) > 160
+                ):
+                    raise StorageError("conversation pending intake options are invalid")
+                for text_field, maximum in (
+                    ("description", 320),
+                    ("impact", 320),
+                ):
+                    text_value = option.get(text_field)
+                    if text_value is not None and (
+                        not isinstance(text_value, str) or len(text_value) > maximum
+                    ):
+                        raise StorageError(
+                            f"conversation pending intake option {text_field} is invalid"
+                        )
+                recommended = option.get("recommended")
+                if recommended is not None and not isinstance(recommended, bool):
+                    raise StorageError(
+                        "conversation pending intake option recommendation is invalid"
+                    )
+                option_ids.add(option_id)
+        for field in ("created_at", "updated_at"):
+            timestamp = value.get(field)
+            if not isinstance(timestamp, str):
+                raise StorageError(f"conversation pending intake {field} is invalid")
+            _timestamp(timestamp, f"pending intake {field}")
+        # Newly-created records always carry a 24-hour expiry.  Keep reading
+        # older/unreleased sidecars that omitted the field for compatibility,
+        # but all live readers treat a missing expiry as already expired (see
+        # ``_pending_intake_expired``).  This fail-closed behavior prevents a
+        # damaged or partially-written sidecar from blocking a conversation
+        # forever.
+        expires_at = value.get("expires_at")
+        if expires_at is not None:
+            try:
+                _timestamp(expires_at, "pending intake expires_at")
+            except StorageError:
+                # Expiry is the one field whose corruption must be recoverable
+                # at read time. Keep the record shape available to the live
+                # reader, which will classify it as expired and unlink it;
+                # write paths still reject it through _require_pending_intake_ttl.
+                pass
+        client_request_id = value.get("client_request_id")
+        if client_request_id is not None and (
+            not isinstance(client_request_id, str)
+            or not CLIENT_REQUEST_ID_RE.fullmatch(client_request_id)
+        ):
+            raise StorageError("conversation pending intake client request id is invalid")
+        for text_field, maximum in (("title", 160), ("description", 500)):
+            text_value = value.get(text_field)
+            if text_value is not None and (
+                not isinstance(text_value, str)
+                or not text_value.strip()
+                or len(text_value) > maximum
+            ):
+                raise StorageError(f"conversation pending intake {text_field} is invalid")
+        # Return a shallow JSON-safe copy.  Callers must not mutate the object
+        # they obtained from the store and accidentally bypass the sidecar lock.
+        return json.loads(json.dumps(value, ensure_ascii=False))
+
+    @staticmethod
+    def _pending_intake_expired(value: dict[str, Any]) -> bool:
+        """Return whether a sidecar is expired, failing closed on no TTL.
+
+        The sidecar is a short-lived reservation rather than durable history.
+        A missing/invalid expiry must therefore never be interpreted as
+        "forever".  Invalid non-empty timestamps are normally rejected by the
+        validator; the defensive catch keeps cleanup safe if that validator is
+        loosened during a rolling upgrade.
+        """
+
+        expires_at = value.get("expires_at")
+        if not isinstance(expires_at, str) or not expires_at:
+            return True
+        try:
+            return _timestamp(expires_at, "pending intake expires_at") <= datetime.now(UTC)
+        except StorageError:
+            return True
+
+    @staticmethod
+    def _require_pending_intake_ttl(value: dict[str, Any]) -> None:
+        """Require a valid expiry on every newly-written sidecar."""
+
+        expires_at = value.get("expires_at")
+        if not isinstance(expires_at, str) or not expires_at:
+            raise StorageError("conversation pending intake expires_at is required")
+        _timestamp(expires_at, "pending intake expires_at")
+
+    def read_pending_intake(self, conversation_id: str) -> dict[str, Any] | None:
+        """Read the current pending guided-intake sidecar, if any."""
+
+        paths = self.require(conversation_id)
+        # Reads must use the same per-conversation RLock as writes.  Without
+        # this guard, Windows can reject an open/read while a concurrent
+        # ``os.replace`` or unlink is changing the sidecar (WinError 32/5).
+        # RLock keeps the nested calls from read_live/consume/clear safe.
+        with self._lock(conversation_id):
+            if paths.pending_intake.is_symlink() or (
+                paths.pending_intake.exists() and not paths.pending_intake.is_file()
+            ):
+                raise StorageError("conversation pending intake state is missing or unsafe")
+            if not paths.pending_intake.exists():
+                return None
+            try:
+                with paths.pending_intake.open("r", encoding="utf-8") as handle:
+                    value = json.load(handle)
+            except FileNotFoundError:
+                # A concurrent cancel/consume in another process can unlink
+                # the sidecar between the existence check and open. Treat
+                # that as the same empty state rather than surfacing a 500.
+                return None
+            except PermissionError as exc:
+                # A non-cooperating process may briefly hold the Windows file
+                # handle while replacing the sidecar. Surface a storage
+                # error with a stable code; callers can retry safely.
+                raise StorageError("conversation pending intake state is unavailable") from exc
+            except json.JSONDecodeError as exc:
+                raise StorageError("conversation pending intake state is invalid") from exc
+            validated = self._validate_pending_intake(value)
+            # ``confirmed`` was reserved for an earlier draft of the protocol.
+            # It is not a live sidecar state: treating it as empty keeps a stale
+            # file from blocking direct messages or producing a false card after
+            # a rolling upgrade.  The next reservation may safely overwrite it.
+            return validated if validated.get("status") == "awaiting_input" else None
+
+    def read_live_pending_intake(self, conversation_id: str) -> dict[str, Any] | None:
+        """Read a pending intake and expire it atomically with the read.
+
+        Message creation uses this helper as a server-side guard.  Keeping the
+        expiry check under the same conversation lock prevents an old card from
+        blocking a new task indefinitely, while avoiding a check-then-delete
+        race with the reservation endpoint.
+        """
+
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            current = self.read_pending_intake(conversation_id)
+            if current is None:
+                return None
+            if self._pending_intake_expired(current):
+                try:
+                    paths.pending_intake.unlink()
+                except FileNotFoundError:
+                    return None
+                try:
+                    self.update_meta(conversation_id)
+                except Exception:
+                    try:
+                        self._atomic_json(paths.pending_intake, current)
+                    except Exception as restore_exc:
+                        raise StorageError(
+                            "conversation pending intake could not be restored"
+                        ) from restore_exc
+                    raise
+                return None
+            return current
+
+    def write_pending_intake(
+        self,
+        conversation_id: str,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically create/replace a pending intake sidecar."""
+
+        paths = self.require(conversation_id)
+        normalized = self._validate_pending_intake(value)
+        self._require_pending_intake_ttl(normalized)
+        if normalized.get("status") != "awaiting_input":
+            raise StorageError("conversation pending intake state is not awaiting input")
+        with self._lock(conversation_id):
+            # Re-run the safety check while holding the conversation lock.  A
+            # concurrent file replacement must not turn an atomic write into a
+            # symlink-following operation.
+            if paths.pending_intake.is_symlink() or (
+                paths.pending_intake.exists() and not paths.pending_intake.is_file()
+            ):
+                raise StorageError("conversation pending intake state is missing or unsafe")
+            self._atomic_json(paths.pending_intake, normalized)
+            self.update_meta(conversation_id)
+            return normalized
+
+    def create_pending_intake_if_absent(
+        self,
+        conversation_id: str,
+        value: dict[str, Any],
+        *,
+        replace_expired: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create a pending intake without racing another creator.
+
+        ``write_pending_intake`` intentionally supports replacement because it
+        is also used by recovery.  The HTTP intake endpoint needs the opposite
+        semantics: once a card exists, a second task must not silently replace
+        it between its read and write.  Return the authoritative existing
+        record and ``False`` when another card already owns the slot.
+        """
+
+        paths = self.require(conversation_id)
+        normalized = self._validate_pending_intake(value)
+        self._require_pending_intake_ttl(normalized)
+        if normalized.get("status") != "awaiting_input":
+            raise StorageError("conversation pending intake state is not awaiting input")
+        with self._lock(conversation_id):
+            current = self.read_pending_intake(conversation_id)
+            if current is not None and replace_expired:
+                if self._pending_intake_expired(current):
+                    try:
+                        paths.pending_intake.unlink()
+                    except FileNotFoundError:
+                        current = None
+                    else:
+                        try:
+                            self.update_meta(conversation_id)
+                        except Exception:
+                            try:
+                                self._atomic_json(paths.pending_intake, current)
+                            except Exception as restore_exc:
+                                raise StorageError(
+                                    "conversation pending intake could not be restored"
+                                ) from restore_exc
+                            raise
+                        current = None
+            if current is not None:
+                return current, False
+            if paths.pending_intake.is_symlink() or (
+                paths.pending_intake.exists() and not paths.pending_intake.is_file()
+            ):
+                raise StorageError("conversation pending intake state is missing or unsafe")
+            self._atomic_json(paths.pending_intake, normalized)
+            self.update_meta(conversation_id)
+            return normalized, True
+
+    # A shorter alias is useful to callers that model the operation as a
+    # compare-and-set reservation rather than a filesystem write.
+    reserve_pending_intake = create_pending_intake_if_absent
+
+    # ``save_pending_intake`` is a descriptive alias used by a few callers.
+    save_pending_intake = write_pending_intake
+
+    def clear_pending_intake(
+        self,
+        conversation_id: str,
+        *,
+        intake_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Delete a pending sidecar and return what was removed.
+
+        Missing sidecars are treated as an idempotent no-op.  When an expected
+        id is supplied, a different pending intake is left untouched and
+        ``None`` is returned so a caller can surface a stale-browser error.
+        """
+
+        paths = self.require(conversation_id)
+        with self._lock(conversation_id):
+            current = self.read_pending_intake(conversation_id)
+            if current is None:
+                return None
+            if intake_id is not None and current.get("intake_id") != intake_id:
+                return None
+            try:
+                paths.pending_intake.unlink()
+            except FileNotFoundError:
+                return None
+            try:
+                self.update_meta(conversation_id)
+            except Exception:
+                # The sidecar is the recovery authority until the user turn
+                # is durably appended.  If metadata bookkeeping fails after
+                # the unlink, put the exact validated record back so a retry
+                # cannot lose the guided task.  This write intentionally
+                # bypasses ``update_meta``; the caller can repair the stale
+                # meta timestamp on the next successful store operation.
+                try:
+                    self._atomic_json(paths.pending_intake, current)
+                except Exception as restore_exc:
+                    raise StorageError(
+                        "conversation pending intake could not be restored"
+                    ) from restore_exc
+                raise
+            return current
+
+    # Common verb aliases keep the sidecar API discoverable without duplicate
+    # implementations.
+    delete_pending_intake = clear_pending_intake
+
+    def consume_pending_intake(
+        self,
+        conversation_id: str,
+        *,
+        intake_id: str,
+        content_sha256: str | None = None,
+        attachment_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically claim and remove a pending intake for a new run."""
+
+        paths = self.require(conversation_id)
+        if not isinstance(intake_id, str) or not INTAKE_ID_RE.fullmatch(intake_id):
+            raise InvalidIdentifier("invalid intake id")
+        expected_attachments = list(attachment_ids) if attachment_ids is not None else None
+        with self._lock(conversation_id):
+            current = self.read_pending_intake(conversation_id)
+            if current is None or current.get("intake_id") != intake_id:
+                return None
+            if self._pending_intake_expired(current):
+                try:
+                    paths.pending_intake.unlink()
+                except FileNotFoundError:
+                    pass
+                else:
+                    try:
+                        self.update_meta(conversation_id)
+                    except Exception:
+                        # Keep the exact sidecar available for a later cleanup
+                        # attempt when metadata bookkeeping fails.  Although
+                        # the record is already stale, silently dropping it
+                        # would make a TTL race look like a generic 500.
+                        try:
+                            self._atomic_json(paths.pending_intake, current)
+                        except Exception as restore_exc:
+                            raise StorageError(
+                                "conversation pending intake could not be restored"
+                            ) from restore_exc
+                        raise
+                return None
+            if content_sha256 is not None and current.get("content_sha256") != content_sha256:
+                return None
+            if expected_attachments is not None and list(current.get("attachment_ids", [])) != expected_attachments:
+                return None
+            try:
+                paths.pending_intake.unlink()
+            except FileNotFoundError:
+                return None
+            try:
+                self.update_meta(conversation_id)
+            except Exception:
+                try:
+                    self._atomic_json(paths.pending_intake, current)
+                except Exception as restore_exc:
+                    raise StorageError(
+                        "conversation pending intake could not be restored"
+                    ) from restore_exc
+                raise
+            return current
+
+    # ``pop_pending_intake`` communicates the consume semantics succinctly.
+    pop_pending_intake = consume_pending_intake
 
     def read_token_usage(self, conversation_id: str) -> dict[str, Any]:
         """Read durable provider-reported usage, defaulting old chats to zero."""
@@ -941,9 +1425,9 @@ class ConversationStore:
             model_completed = item["status"] == "completed"
             verified = model_completed
             if item["kind"] == "file":
-                verified = model_completed and item.get("extension") in output_extensions
+                verified = item.get("extension") in output_extensions
             elif item["kind"] == "reply":
-                verified = model_completed and has_reply
+                verified = has_reply
 
             if verified and item["kind"] == "file":
                 detail = (
@@ -999,14 +1483,8 @@ class ConversationStore:
                 return previous, False
             if previous["phase"] != "running":
                 raise ChecklistError("checklist is not eligible for success preparation")
-            if (
-                not previous["items"]
-                or int(previous.get("completion_revisions", 0)) < 1
-                or any(item["status"] == "in_progress" for item in previous["items"])
-            ):
-                raise ChecklistError(
-                    "checklist has no post-initial item completion or is still in progress"
-                )
+            if not previous["items"]:
+                raise ChecklistError("checklist has no items")
             value = {
                 **previous,
                 "revision": int(previous["revision"]) + 1,

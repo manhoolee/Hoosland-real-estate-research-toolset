@@ -1,6 +1,10 @@
 import type {
   AssistantProgress,
   ChatMessage,
+  ClarificationAnswer,
+  ClarificationOption,
+  ClarificationPlan,
+  ClarificationQuestion,
   ChecklistItem,
   ChecklistItemStatus,
   ChecklistPhase,
@@ -339,6 +343,217 @@ export async function getConversation(
   });
   if (!response.ok) throw await parseError(response, "无法读取对话所属项目。");
   return readConversationContext((await response.json()) as ApiConversation, conversationId);
+}
+
+const GUIDED_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const CLIENT_REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function boundedGuidedText(value: unknown, maxLength: number, required = true): string | undefined {
+  if (typeof value !== "string") return required ? undefined : "";
+  const normalized = value.trim();
+  if ((!normalized && required) || normalized.length > maxLength) return undefined;
+  return normalized;
+}
+
+function normaliseClarificationOption(value: unknown): ClarificationOption | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  const id = boundedGuidedText(item.id, 80);
+  const label = boundedGuidedText(item.label, 160);
+  const impact = boundedGuidedText(
+    typeof item.impact === "string" ? item.impact : item.description,
+    320,
+  );
+  if (!id || !GUIDED_ID_RE.test(id) || !label) return null;
+  if (item.recommended !== undefined && typeof item.recommended !== "boolean") return null;
+  return {
+    id,
+    label,
+    impact: impact || "影响本轮任务的侧重点",
+    recommended: item.recommended === true,
+  };
+}
+
+function normaliseClarificationQuestion(value: unknown): ClarificationQuestion | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  const id = boundedGuidedText(item.id, 80);
+  const field = boundedGuidedText(item.field === undefined ? id : item.field, 80);
+  const prompt = boundedGuidedText(
+    typeof item.prompt === "string" ? item.prompt : item.question,
+    500,
+  );
+  const kind = item.kind === undefined ? "single" : item.kind;
+  const options = item.options;
+  if (
+    !id || !GUIDED_ID_RE.test(id) ||
+    !field || !GUIDED_ID_RE.test(field) ||
+    !prompt || (kind !== "single" && kind !== "multi") ||
+    !Array.isArray(options) || options.length < 2 || options.length > 4
+  ) return null;
+  const normalizedOptions = options.map(normaliseClarificationOption);
+  if (normalizedOptions.some((option) => option === null)) return null;
+  const optionIds = new Set(normalizedOptions.map((option) => option!.id));
+  if (optionIds.size !== normalizedOptions.length) return null;
+  const help = item.help === undefined ? undefined : boundedGuidedText(item.help, 500, false);
+  if (item.help !== undefined && help === undefined) return null;
+  if (item.required !== undefined && typeof item.required !== "boolean") return null;
+  const allowCustom = item.allow_custom ?? item.allowCustom;
+  if (allowCustom !== undefined && typeof allowCustom !== "boolean") return null;
+  const customPlaceholderValue = item.custom_placeholder ?? item.customPlaceholder;
+  const customPlaceholder = customPlaceholderValue === undefined
+    ? undefined
+    : boundedGuidedText(customPlaceholderValue, 500, false);
+  if (customPlaceholderValue !== undefined && customPlaceholder === undefined) return null;
+  return {
+    id,
+    field,
+    kind,
+    prompt,
+    help: help || undefined,
+    required: item.required !== false,
+    allowCustom: allowCustom === true,
+    customPlaceholder: customPlaceholder || undefined,
+    options: normalizedOptions as ClarificationOption[],
+  };
+}
+
+function normaliseClarificationPlan(value: unknown): ClarificationPlan | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  const idValue = item.id ?? item.intake_id ?? item.intakeId;
+  const id = boundedGuidedText(idValue, 80);
+  const version = item.version === undefined ? 1 : item.version;
+  const rawQuestions = item.questions;
+  if (
+    !id || !/^intake_[0-9a-f]{32}$/i.test(id) ||
+    version !== 1 || !Array.isArray(rawQuestions) ||
+    rawQuestions.length < 1 || rawQuestions.length > 3
+  ) return null;
+  const normalizedQuestions = rawQuestions.map(normaliseClarificationQuestion);
+  if (normalizedQuestions.some((question) => question === null)) return null;
+  const questionIds = new Set(normalizedQuestions.map((question) => question!.id));
+  if (questionIds.size !== normalizedQuestions.length) return null;
+
+  const originalContent = boundedGuidedText(
+    item.original_content ?? item.originalContent,
+    200_000,
+  );
+  const rawAttachments = item.attachment_ids ?? item.attachmentIds ?? [];
+  if (!Array.isArray(rawAttachments) || rawAttachments.length > 20) return null;
+  const attachmentIds = rawAttachments.map((attachmentId) =>
+    boundedGuidedText(attachmentId, 128),
+  );
+  if (attachmentIds.some((attachmentId) => !attachmentId)) return null;
+  const uniqueAttachmentIds = [...new Set(attachmentIds as string[])];
+  if (uniqueAttachmentIds.length !== attachmentIds.length) return null;
+
+  const createdAt = boundedGuidedText(item.created_at ?? item.createdAt, 80) || new Date().toISOString();
+  const createdTime = Date.parse(createdAt);
+  if (!Number.isFinite(createdTime)) return null;
+  const rawExpiresAt = boundedGuidedText(item.expires_at ?? item.expiresAt, 80);
+  const expiresAt = rawExpiresAt || new Date(createdTime + 24 * 60 * 60 * 1000).toISOString();
+  if (!Number.isFinite(Date.parse(expiresAt))) return null;
+  const taskType = boundedGuidedText(item.task_type ?? item.taskType, 80) || "general";
+  const taskTypeLabel = boundedGuidedText(item.task_type_label ?? item.taskTypeLabel, 120) || "任务";
+  const title = boundedGuidedText(item.title, 160) || "先对齐关键取舍";
+  const description = boundedGuidedText(item.description, 500) || "这些选择会影响本轮分析侧重点。";
+  const clientRequestIdValue = item.client_request_id ?? item.clientRequestId;
+  if (clientRequestIdValue !== undefined && (
+    typeof clientRequestIdValue !== "string" || !CLIENT_REQUEST_ID_RE.test(clientRequestIdValue)
+  )) return null;
+  if (!originalContent) return null;
+  return {
+    id,
+    version,
+    taskType,
+    taskTypeLabel,
+    title,
+    description,
+    questions: normalizedQuestions as ClarificationQuestion[],
+    originalContent,
+    attachmentIds: uniqueAttachmentIds,
+    clientRequestId: typeof clientRequestIdValue === "string" ? clientRequestIdValue : undefined,
+    createdAt,
+    expiresAt,
+  };
+}
+
+export interface IntakePrepareResponse {
+  required: boolean;
+  taskType?: string;
+  taskTypeLabel?: string;
+  plan?: ClarificationPlan;
+}
+
+export async function prepareIntake(
+  conversationId: string,
+  content: string,
+  attachmentIds: string[],
+  clientRequestId: string,
+  signal?: AbortSignal,
+): Promise<IntakePrepareResponse> {
+  const response = await fetch(apiUrl(`/api/conversations/${conversationId}/intake`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content,
+      ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
+      client_request_id: clientRequestId,
+    }),
+    credentials: "same-origin",
+    signal,
+  });
+  if (!response.ok) throw await parseError(response, "暂时无法生成任务引导，请稍后重试。");
+  const payload = (await response.json()) as Record<string, unknown>;
+  const plan = normaliseClarificationPlan(payload.plan || payload.clarification || payload);
+  if (payload.required === true && !plan) {
+    const error = new Error("任务引导协议无效，请刷新后重试。") as Error & { code?: string };
+    error.code = "INTAKE_PROTOCOL_INVALID";
+    throw error;
+  }
+  return {
+    required: payload.required === true && Boolean(plan),
+    taskType: typeof payload.task_type === "string" ? payload.task_type : undefined,
+    taskTypeLabel: typeof payload.task_type_label === "string" ? payload.task_type_label : undefined,
+    plan: plan || undefined,
+  };
+}
+
+export async function getPendingIntake(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<ClarificationPlan | null> {
+  const response = await fetch(apiUrl(`/api/conversations/${conversationId}/intake`), {
+    credentials: "same-origin",
+    cache: "no-store",
+    signal,
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw await parseError(response, "无法读取待确认的任务引导。");
+  const payload = (await response.json()) as Record<string, unknown>;
+  if (payload.pending === false || payload.required === false) return null;
+  const plan = normaliseClarificationPlan(payload.plan || payload.clarification || payload);
+  if (!plan) {
+    const error = new Error("待确认的任务引导协议无效，请刷新后重试。") as Error & { code?: string };
+    error.code = "INTAKE_PROTOCOL_INVALID";
+    throw error;
+  }
+  return plan;
+}
+
+export async function cancelPendingIntake(
+  conversationId: string,
+  intakeId?: string,
+): Promise<void> {
+  const suffix = intakeId ? `?intake_id=${encodeURIComponent(intakeId)}` : "";
+  const response = await fetch(apiUrl(`/api/conversations/${conversationId}/intake${suffix}`), {
+    method: "DELETE",
+    credentials: "same-origin",
+  });
+  if (!response.ok && response.status !== 404) {
+    throw await parseError(response, "无法取消待确认的任务引导。");
+  }
 }
 
 function normaliseConversationSummary(
@@ -896,6 +1111,11 @@ export async function sendMessage(
   clientRequestId: string,
   callbacks: StreamCallbacks,
   signal: AbortSignal,
+  intake?: {
+    id: string;
+    action: "confirm" | "skip";
+    answers: ClarificationAnswer[];
+  },
 ): Promise<string> {
   const response = await fetch(apiUrl(`/api/conversations/${conversationId}/messages`), {
     method: "POST",
@@ -907,6 +1127,15 @@ export async function sendMessage(
       content,
       ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
       ...(retryOf ? { retry_of: retryOf } : {}),
+      ...(intake ? {
+        intake_id: intake.id,
+        action: intake.action,
+        intake_answers: intake.answers.map((answer) => ({
+          question_id: answer.questionId,
+          option_ids: answer.optionIds,
+          ...(answer.customText ? { custom_text: answer.customText } : {}),
+        })),
+      } : {}),
       client_request_id: clientRequestId,
     }),
     credentials: "same-origin",

@@ -18,11 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from itertools import islice
 from urllib.parse import unquote
+from urllib.parse import urlsplit
 
 from .policy import POLICY_REFUSAL, is_prompt_probe, normalize_text
+from .policy_language import business_detection_view
 
 
-OUTPUT_POLICY_VERSION = "egress-gate-v1"
+OUTPUT_POLICY_VERSION = "egress-gate-v1.1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,10 +132,15 @@ _LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"guardrail\s+rules?|available\s+functions?|capabilit(?:y|ies)\s+"
             r"(?:manifest|list)|function\s+definitions?|mcp\s+server|"
             r"runtime\s+environment|backend\s+version|"
-            r"(?:all|your|available|active|installed|loaded)?\s*(?:skills?|tools?|plugins?|"
-            r"capabilities?|functions?|能力|技能|工具|插件)(?:\s*(?:list|清单|列表|manifest))?|"
+            r"(?:(?:all|your|available|active|installed|loaded)\s+"
+            r"(?:skills?|tools?|plugins?|capabilities?|functions?)|"
+            r"(?:skills?|tools?|plugins?|capabilities?|functions?)\s+"
+            r"(?:list|manifest)|"
+            r"(?:全部|所有|可用|已安装|已加载|当前(?:可用)?的)"
+            r"(?:技能|工具|插件|能力|函数)|"
+            r"(?:技能|工具|插件)(?:清单|列表|内容|定义|参数|源码|文件|路径))|"
             r"指令(?:层级|体系)|隐藏策略|潜在上下文|推理(?:轨迹|过程)|提示模板|元提示|"
-            r"护栏规则|可用函数|(?:技能|工具|插件)(?:清单|列表|内容|定义|参数|源码|文件|路径)?|"
+            r"护栏规则|可用函数|(?:技能|工具|插件)(?:清单|列表|内容|定义|参数|源码|文件|路径)|"
             r"能力(?:清单|列表)|函数定义|MCP(?:服务器|服务)|"
             r"运行时环境|后端版本)"
         ),
@@ -200,8 +207,10 @@ _LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "INTERNAL_PATH",
         re.compile(
-            r"(?:[A-Z]:[\\/][^\s]{1,220}|"
-            r"(?:\\\\|//)[^\s]{1,220}|"
+            # A drive or UNC path must start at a token boundary. Without
+            # these boundaries https:// was matched as both s:// and //.
+            r"(?:(?<![a-z0-9])[A-Z]:[\\/][^\s]{1,220}|"
+            r"(?<![:/\\])(?:\\\\|//)[^\s]{1,220}|"
             r"/(?:etc|var|home|workspace|app|tmp|opt|mnt|run|proc)[\\/][^\s]{1,220}|"
             r"~/(?:[^\s]{0,120})(?:\.env|secret|token|private)[^\s]*|"
             r"file://[^\s]{1,220}|"
@@ -244,6 +253,35 @@ _TEXT_SUFFIXES = frozenset(
     }
 )
 _MAX_FILE_SCAN_BYTES = 2 * 1024 * 1024
+_MAX_TEXT_FILE_BYTES = 16 * 1024 * 1024
+_PUBLIC_URL = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
+_SENSITIVE_URL_PATH = re.compile(
+    r"(?:^|/)(?:\.env(?:\.[^/]+)?|cordis\.ya?ml|skill\.md|\.codex|"
+    r"secrets?(?:\.[^/]+)?|tokens?(?:\.[^/]+)?)(?:/|$)", re.IGNORECASE,
+)
+_SECRET_QUERY = re.compile(
+    r"(?:^|[&;])(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|"
+    r"secret|password|signature|credential)=", re.IGNORECASE,
+)
+
+
+def _path_detection_view(value: str) -> str:
+    """URL paths such as /app/report are not local filesystem paths.
+
+    Only the path detector gets this view. Other detectors still inspect the
+    complete URL, including any encoded protected text. Sensitive URLs remain
+    visible to the path detector instead of receiving blanket URL trust.
+    """
+    def replace_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            url = urlsplit(raw)
+            if url.username or url.password or _SENSITIVE_URL_PATH.search(url.path) or _SECRET_QUERY.search(url.query):
+                return "file://protected-url"
+        except ValueError:
+            return raw
+        return "public-web-source"
+    return _PUBLIC_URL.sub(replace_url, value)
 
 # A deliberately small homoglyph map is enough for the common “system/prompt”
 # and secret-key evasions.  It is kept local to the egress scanner so output
@@ -392,8 +430,14 @@ def scrub_output(
         if any(marker in variant for variant in variants for marker in ingress_only_markers):
             return OutputDecision(POLICY_REFUSAL, True, "SYSTEM_INSTRUCTION")
     for normalized in variants:
+        business_view = business_detection_view(normalized)
         for reason_code, pattern in _LEAK_PATTERNS:
-            if pattern.search(normalized):
+            detection_view = normalized
+            if reason_code == "INTERNAL_PATH":
+                detection_view = _path_detection_view(normalized)
+            elif reason_code in {"PROTECTED_EXTRACTION", "RUNTIME_PROBE", "RUNTIME_INVENTORY", "SYSTEM_INSTRUCTION"}:
+                detection_view = business_view
+            if pattern.search(detection_view):
                 return OutputDecision(POLICY_REFUSAL, True, reason_code)
         for marker in internal_markers:
             normalized_marker = normalize_text(marker)
@@ -410,11 +454,10 @@ def scan_output_file(
 ) -> str | None:
     """Return a private reason code when an output file must stay hidden.
 
-    Text-like artifacts are scanned in bounded chunks, including HTML comments
-    and hidden elements because the raw source is inspected.  Binary formats
-    are not parsed here; their names are still checked and their contents remain
-    behind the existing file sandbox.  A read/stat failure is fail-closed for
-    a newly generated output rather than exposing an unverified artifact.
+    Text-like artifacts are scanned completely in overlapping chunks up to a
+    fixed total byte limit, including comments and hidden source elements.
+    Plain text with an unknown suffix is also scanned. Actual binary formats
+    are not parsed here; this is not a binary-content security guarantee.
     """
 
     name = display_name or path.name
@@ -429,30 +472,31 @@ def scan_output_file(
             continue
         if normalized_marker in normalize_text(name) or normalized_marker in normalize_text(str(path)):
             return "OUTPUT_NAME_INTERNAL_MARKER"
-    suffix = path.suffix.lower()
-    if suffix not in _TEXT_SUFFIXES:
-        return None
     try:
         size = path.stat().st_size
         with path.open("rb") as handle:
-            if size <= _MAX_FILE_SCAN_BYTES:
-                raw = handle.read(_MAX_FILE_SCAN_BYTES + 1)
-            else:
-                head = handle.read(_MAX_FILE_SCAN_BYTES // 2)
-                handle.seek(max(0, size - _MAX_FILE_SCAN_BYTES // 2))
-                raw = head + b"\n" + handle.read(_MAX_FILE_SCAN_BYTES // 2)
+            head = handle.read(4096)
+            # Renaming plain text to .bin/.pdf must not bypass text scanning.
+            looks_text = b"\x00" not in head and all(
+                byte >= 32 or byte in (9, 10, 13) for byte in head
+            )
+            if path.suffix.lower() not in _TEXT_SUFFIXES and not looks_text:
+                return None
+            if size == 0:
+                return "EMPTY_OUTPUT"
+            if size > _MAX_TEXT_FILE_BYTES:
+                return "OUTPUT_SCAN_LIMIT"
+            handle.seek(0)
+            overlap = b""
+            while chunk := handle.read(_MAX_FILE_SCAN_BYTES - 8192):
+                text = (overlap + chunk).decode("utf-8", errors="replace")
+                decision = scrub_output(text, internal_markers=internal_markers, probe_variants=False)
+                if decision.blocked:
+                    return decision.reason_code
+                overlap = chunk[-8192:]
     except (OSError, ValueError):
         return "OUTPUT_SCAN_FAILED"
-    text = raw.decode("utf-8", errors="replace")
-    # File endpoints may inspect multi-megabyte reports.  The bounded egress
-    # views still catch URL/HTML/escape/homoglyph forms, while avoiding the
-    # recursive ingress decoder on the event loop.
-    decision = scrub_output(
-        text,
-        internal_markers=internal_markers,
-        probe_variants=False,
-    )
-    return decision.reason_code if decision.blocked else None
+    return None
 
 
 __all__ = [

@@ -27,6 +27,37 @@ from app.main import (
 
 
 class HttpApiTests(unittest.TestCase):
+    def test_report_receipts_are_listed_openable_and_downloadable(self) -> None:
+        cid = self.client.post("/api/conversations", json={}).json()["id"]
+        paths = self.app.state.store.require(cid)
+        async def run(*args, **kwargs):
+            paths.outputs.joinpath("项目报告.md").write_text("# 报告\n[来源](https://www.gov.cn/)", encoding="utf-8")
+            paths.outputs.joinpath("项目报告.html").write_text('<html><body><h1>报告</h1><a href="https://www.gov.cn/">来源</a></body></html>', encoding="utf-8")
+            return HarnessRunResult(final_response="[Markdown](outputs/项目报告.md) 和 [HTML](outputs/项目报告.html)", finish_reason="stop", session_id="fake-session")
+        self.app.state.harness.run = self._completed_checklist_run(run)
+        response = self.client.post(f"/api/conversations/{cid}/messages", json={"content": "输出项目研究报告"})
+        self.assertNotIn('"type":"error"', response.text)
+        self.assertEqual("succeeded", self.app.state.store.read_run(cid)["status"])
+        files = self.client.get(f"/api/conversations/{cid}/files").json()["items"]
+        self.assertEqual({"项目报告.md", "项目报告.html"}, {f["name"] for f in files})
+        for file in files:
+            for key in ("open_url", "download_url"):
+                result = self.client.get(file[key])
+                self.assertEqual(200, result.status_code)
+                self.assertIn("报告", result.text)
+                self.assertIn("inline" if key == "open_url" else "attachment", result.headers["content-disposition"])
+
+    def test_hidden_generated_output_cannot_commit_success(self) -> None:
+        cid = self.client.post("/api/conversations", json={}).json()["id"]
+        async def run(*args, **kwargs):
+            self.app.state.store.require(cid).outputs.joinpath("report.md").write_text("secret file: /opt/private/internal.txt")
+            return HarnessRunResult(final_response="已经完成", finish_reason="stop", session_id="fake-session")
+        self.app.state.harness.run = self._completed_checklist_run(run)
+        response = self.client.post(f"/api/conversations/{cid}/messages", json={"content": "输出 Markdown 项目报告"})
+        self.assertIn("AGENT_OUTPUT_UNAVAILABLE", response.text)
+        self.assertEqual("failed", self.app.state.store.read_run(cid)["status"])
+        self.assertEqual([], self.client.get(f"/api/conversations/{cid}/files").json()["items"])
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -393,7 +424,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(
             {
                 "ok": True,
-                "version": "0.2.6",
+                "version": "0.3.3",
                 "slot": "slot-b",
                 "build_id": "development",
             },
@@ -402,7 +433,7 @@ class HttpApiTests(unittest.TestCase):
 
         ready = self.client.get("/api/health/ready")
         self.assertEqual(503, ready.status_code)
-        self.assertEqual("0.2.6", ready.json()["version"])
+        self.assertEqual("0.3.3", ready.json()["version"])
         self.assertEqual("slot-b", ready.json()["slot"])
         self.assertEqual("development", ready.json()["build_id"])
 
@@ -1232,7 +1263,7 @@ class HttpApiTests(unittest.TestCase):
             {"version", "revision", "phase", "updated_at", "tasks", "deliverables"},
             set(terminal),
         )
-        self.assertEqual("succeeded", terminal["phase"])
+        self.assertEqual("failed", terminal["phase"])
         self.assertEqual("completed", terminal["tasks"][0]["status"])
         self.assertEqual("核验项目数据", terminal["tasks"][0]["text"])
         deliverables = {item["text"]: item for item in terminal["deliverables"]}
@@ -1252,19 +1283,16 @@ class HttpApiTests(unittest.TestCase):
             "未检测到本轮新增或更新的 .html 成果",
             deliverables["可视化报告（.html 文件）"]["detail"],
         )
-        self.assertEqual(
-            "completed",
-            deliverables["回复：结论摘要"]["status"],
-        )
+        self.assertEqual("incomplete", deliverables["回复：结论摘要"]["status"])
         terminal_index = max(
             index
             for index, event in enumerate(events)
             if event.get("type") == "checklist"
         )
-        final_index = next(
-            index for index, event in enumerate(events) if event.get("type") == "final"
-        )
-        self.assertLess(terminal_index, final_index)
+        self.assertFalse(any(event.get("type") == "final" for event in events))
+        error_index = next(index for index, event in enumerate(events) if event.get("type") == "error")
+        self.assertLess(terminal_index, error_index)
+        self.assertIn("AGENT_OUTPUT_PAIR_MISSING", response.text)
 
         refreshed_run = self.client.get(
             f"/api/conversations/{conversation_id}/run"
@@ -1280,7 +1308,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertTrue(sidecar.is_file())
         self.assertNotIn("checklist", self.app.state.store.read_run(conversation_id))
 
-    def test_missing_checklist_is_rejected_before_success_and_assistant_completion(self) -> None:
+    def test_missing_checklist_is_a_close_warning_when_delivery_is_valid(self) -> None:
         conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
 
         async def fake_run(
@@ -1308,27 +1336,15 @@ class HttpApiTests(unittest.TestCase):
             for line in response.text.splitlines()
             if line.startswith("data: ")
         ]
-        error_index = next(
-            index for index, event in enumerate(events) if event.get("type") == "error"
-        )
-        terminal_checklist_index = max(
-            index
-            for index, event in enumerate(events)
-            if event.get("type") == "checklist"
-        )
-        self.assertLess(terminal_checklist_index, error_index)
-        self.assertEqual("AGENT_CHECKLIST_MISSING", events[error_index]["code"])
-        self.assertEqual(
-            "failed",
-            events[terminal_checklist_index]["checklist"]["phase"],
-        )
-        self.assertNotIn("这段回复不能绕过清单门禁。", response.text)
+        self.assertTrue(any(event.get("type") == "final" for event in events))
+        self.assertFalse(any(event.get("type") == "error" for event in events))
+        self.assertIn("这段回复不能绕过清单门禁。", response.text)
         stored = self.app.state.store.list_messages(conversation_id)
         assistant = next(item for item in stored if item["role"] == "assistant")
-        self.assertEqual("error", assistant["status"])
-        self.assertEqual("", assistant["content"])
+        self.assertEqual("completed", assistant["status"])
+        self.assertEqual("这段回复不能绕过清单门禁。", assistant["content"])
         self.assertEqual(
-            "failed",
+            "succeeded",
             self.app.state.store.read_run(conversation_id)["status"],
         )
 
@@ -1523,12 +1539,12 @@ class HttpApiTests(unittest.TestCase):
                 ("completed", "completed"),
             ),
             "batch_completed": (
-                "AGENT_CHECKLIST_MISSING",
+                "AGENT_CHECKLIST_RECOVERY_FAILED",
                 ("in_progress", "pending"),
                 ("completed", "completed"),
             ),
             "no_post_initial_completion": (
-                "AGENT_CHECKLIST_MISSING",
+                None,
                 ("pending", "pending"),
                 ("pending", "pending"),
             ),
@@ -1598,15 +1614,23 @@ class HttpApiTests(unittest.TestCase):
                     for line in response.text.splitlines()
                     if line.startswith("data: ")
                 ]
-                error = next(event for event in events if event.get("type") == "error")
-                self.assertEqual(expected_error, error["code"])
-                self.assertFalse(any(event.get("type") == "final" for event in events))
-                terminal = [
-                    event["checklist"]
-                    for event in events
-                    if event.get("type") == "checklist"
-                ][-1]
-                self.assertEqual("failed", terminal["phase"])
+                if expected_error is None:
+                    self.assertFalse(any(event.get("type") == "error" for event in events))
+                    self.assertTrue(any(event.get("type") == "final" for event in events))
+                    self.assertEqual(
+                        "succeeded",
+                        self.app.state.store.read_run(conversation_id)["status"],
+                    )
+                else:
+                    error = next(event for event in events if event.get("type") == "error")
+                    self.assertEqual(expected_error, error["code"])
+                    self.assertFalse(any(event.get("type") == "final" for event in events))
+                    terminal = [
+                        event["checklist"]
+                        for event in events
+                        if event.get("type") == "checklist"
+                    ][-1]
+                    self.assertEqual("failed", terminal["phase"])
 
     def test_rejected_batch_completion_recovers_from_authoritative_snapshot(self) -> None:
         conversation_id = self.client.post("/api/conversations", json={}).json()["id"]
@@ -2161,7 +2185,7 @@ class HttpApiTests(unittest.TestCase):
         ]
         self.assertTrue(repair_requested)
         error = next(event for event in events if event.get("type") == "error")
-        self.assertEqual("AGENT_CHECKLIST_MISSING", error["code"])
+        self.assertEqual("AGENT_CHECKLIST_RECOVERY_FAILED", error["code"])
         self.assertFalse(any(event.get("type") == "final" for event in events))
 
         records = [
@@ -2171,13 +2195,13 @@ class HttpApiTests(unittest.TestCase):
             ).splitlines()
             if line
         ]
-        missing = next(
+        repair = next(
             record
             for record in records
             if record.get("conversation_id") == conversation_id
-            and record.get("event") == "agent.checklist.missing"
+            and record.get("event") == "agent.checklist.repair.requested"
         )
-        self.assertTrue(missing["checklist_repair_pending"])
+        self.assertEqual("BULK_COMPLETION", repair["rejection_reason"])
 
     def test_pending_checklist_repair_rejects_mismatch_and_other_tools(self) -> None:
         for violation in ("mismatched_todo", "other_tool"):
@@ -2363,31 +2387,17 @@ class HttpApiTests(unittest.TestCase):
             for line in response.text.splitlines()
             if line.startswith("data: ")
         ]
-        error_index = next(
-            index for index, event in enumerate(events) if event.get("type") == "error"
-        )
-        terminal_index = max(
-            index for index, event in enumerate(events) if event.get("type") == "checklist"
-        )
-        self.assertLess(terminal_index, error_index)
-        self.assertEqual("failed", events[terminal_index]["checklist"]["phase"])
-        self.assertFalse(
-            any(
-                event.get("type") == "checklist"
-                and event["checklist"].get("phase") == "succeeded"
-                for event in events
-            )
-        )
-        self.assertFalse(any(event.get("type") == "final" for event in events))
+        self.assertFalse(any(event.get("type") == "error" for event in events))
+        self.assertTrue(any(event.get("type") == "final" for event in events))
         run = self.client.get(f"/api/conversations/{conversation_id}/run").json()
-        self.assertEqual("failed", run["status"])
-        self.assertEqual("failed", run["checklist"]["phase"])
+        self.assertEqual("succeeded", run["status"])
+        self.assertEqual("succeeded", run["checklist"]["phase"])
         assistants = [
             item
             for item in store.list_messages(conversation_id)
             if item["role"] == "assistant"
         ]
-        self.assertEqual(["error"], [item["status"] for item in assistants])
+        self.assertEqual(["completed"], [item["status"] for item in assistants])
 
     def test_assistant_append_failure_rechecks_success_sidecar_as_failed(self) -> None:
         conversation_id = self.client.post("/api/conversations", json={}).json()["id"]

@@ -6,6 +6,55 @@ export interface ChatAttachment {
   name: string;
 }
 
+/** A bounded, server-defined option shown before a complex task runs. */
+export interface ClarificationOption {
+  id: string;
+  label: string;
+  impact: string;
+  recommended?: boolean;
+}
+
+export type ClarificationQuestionKind = "single" | "multi";
+
+export interface ClarificationQuestion {
+  id: string;
+  field: string;
+  kind: ClarificationQuestionKind;
+  prompt: string;
+  help?: string;
+  required: boolean;
+  allowCustom: boolean;
+  customPlaceholder?: string;
+  options: ClarificationOption[];
+}
+
+export interface ClarificationAnswer {
+  questionId: string;
+  optionIds: string[];
+  customText?: string;
+}
+
+export interface ClarificationPlan {
+  id: string;
+  version: number;
+  taskType: string;
+  taskTypeLabel: string;
+  title: string;
+  description: string;
+  questions: ClarificationQuestion[];
+  originalContent: string;
+  attachmentIds: string[];
+  clientRequestId?: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface PendingClarification {
+  plan: ClarificationPlan;
+  answers: ClarificationAnswer[];
+  submitting?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;

@@ -25,8 +25,11 @@ import {
   getConversationRun,
   getConversationUsage,
   getReleaseIdentity,
+  getPendingIntake,
   listFiles,
   listMessages,
+  prepareIntake,
+  cancelPendingIntake,
   presentResearchAssistantCopy,
   sendMessage,
   uploadFile,
@@ -53,6 +56,9 @@ import type {
   CapabilityState,
   CapabilityView,
   ChatMessage,
+  ClarificationAnswer,
+  ClarificationPlan,
+  PendingClarification,
   RunChecklist,
   TokenUsage,
   WorkspaceFile,
@@ -191,6 +197,14 @@ interface FailedRequest {
   content: string;
   attachmentIds: string[];
   retryOf?: string;
+  clientRequestId?: string;
+  /** Conversation captured when an optimistic turn was created. */
+  conversationId?: string;
+  intake?: {
+    id: string;
+    action: "confirm" | "skip";
+    answers: ClarificationAnswer[];
+  };
 }
 
 type ServiceState = "checking" | "connected" | "unavailable";
@@ -288,6 +302,32 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
 function publicResearchError(error: unknown): string {
   const message = error instanceof Error ? presentResearchAssistantCopy(error.message.trim()) : "";
   if (
+    [
+      "INTAKE_NOT_FOUND",
+      "INTAKE_EXPIRED",
+      "INTAKE_ID_MISMATCH",
+      "INTAKE_PAYLOAD_MISMATCH",
+      "INTAKE_RETRY_MISMATCH",
+      "INTAKE_ALREADY_PENDING",
+      "INTAKE_ALREADY_CONSUMED",
+      "INTAKE_ACTION_CONFLICT",
+      "INTAKE_ID_REQUIRED",
+      "INTAKE_PROTOCOL_INVALID",
+      "MISSING_ANSWER",
+      "INVALID_ANSWER",
+      "INVALID_ANSWERS",
+      "INVALID_ACTION",
+      "UNKNOWN_OPTION",
+      "UNKNOWN_QUESTION",
+      "EMPTY_ANSWER",
+      "TOO_MANY_OPTIONS",
+      "TOO_MANY_ANSWERS",
+      "CUSTOM_NOT_ALLOWED",
+      "CUSTOM_TOO_LONG",
+      "POLICY_REJECTED",
+    ].includes(errorCode(error) || "")
+  ) return message || "任务引导已失效，请重新确认后再开始。";
+  if (
     ["RUN_ACTIVE", "RUN_TERMINATING", "RUN_CLEANUP_PENDING", "CONFIG_UPDATE_ACTIVE"].includes(
       errorCode(error) || "",
     ) || /上一轮研究|上一条消息|后台运行|正在终止|配置正在更新/.test(message)
@@ -322,6 +362,20 @@ function requestWasPersisted(
     user.content.trim() === request.content.trim() &&
     sameAttachmentIds(user.attachmentIds, request.attachmentIds),
   );
+}
+
+function guidedRequestWasPersisted(
+  request: FailedRequest,
+  run: ConversationRunState,
+  history: ChatMessage[],
+  clientRequestId: string,
+): boolean {
+  // Guided turns must use the same server-issued request/run correlation as
+  // ordinary turns.  Matching only content, attachments, or a stale
+  // user-message id can silently accept an older identical request after a
+  // setup failure.  Keeping the optimistic error in that ambiguous case is
+  // safer: the user can retry once the authoritative run snapshot converges.
+  return requestWasPersisted(request, run, history, clientRequestId);
 }
 
 function sameRunSnapshot(
@@ -525,6 +579,8 @@ export default function App() {
   const [serviceState, setServiceState] = useState<ServiceState>("checking");
   const [releaseIdentity, setReleaseIdentity] = useState<ReleaseIdentity | null>(null);
   const [draft, setDraft] = useState("");
+  const [pendingClarification, setPendingClarification] = useState<PendingClarification | null>(null);
+  const [isPreparingIntake, setIsPreparingIntake] = useState(false);
   const [isHydrating, setIsHydrating] = useState(Boolean(initialIdRef.current));
   const [isSending, setIsSending] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
@@ -541,6 +597,8 @@ export default function App() {
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const releaseReturnFocusRef = useRef<HTMLElement | null>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
+  const preparingIntakeRef = useRef(false);
+  const clarificationSubmittingRef = useRef(false);
   const cancellationRequestsRef = useRef(new Map<AbortController, Promise<boolean>>());
   const pendingCancellationRef = useRef<{
     controller: AbortController;
@@ -609,7 +667,11 @@ export default function App() {
     nextConversationId: string,
     nextMessages: ChatMessage[] = [],
     nextFiles: WorkspaceFile[] = [],
-    options: { preserveDraft?: boolean; terminationPending?: boolean } = {},
+    options: {
+      preserveDraft?: boolean;
+      terminationPending?: boolean;
+      pendingClarification?: PendingClarification | null;
+    } = {},
   ) => {
     commitContextIds(nextProjectId, nextConversationId);
     setMessages(nextMessages);
@@ -618,6 +680,10 @@ export default function App() {
     failedRequestsRef.current = recoverFailedRequests(nextMessages);
     pendingCancellationRef.current = null;
     setTerminationPending(options.terminationPending === true);
+    setPendingClarification(options.pendingClarification ?? null);
+    setIsPreparingIntake(false);
+    preparingIntakeRef.current = false;
+    clarificationSubmittingRef.current = false;
   }, [commitContextIds]);
 
   const applyConversationTokenUsage = useCallback((id: string, next: TokenUsage) => {
@@ -813,9 +879,26 @@ export default function App() {
       history: ChatMessage[],
     ) => boolean = () => true,
   ): Promise<{ run: ConversationRunState; history: ChatMessage[] }> => {
-    const [context, initialRun] = await Promise.all([
+    const readPending = async (
+      fallback: ClarificationPlan | null,
+      allowFallback = true,
+    ): Promise<ClarificationPlan | null> => {
+      try {
+        return await getPendingIntake(id);
+      } catch (error) {
+        if (errorCode(error) === "INTAKE_PROTOCOL_INVALID") throw error;
+        if (allowFallback) return fallback;
+        // The second read is the authority.  Reusing a previously observed
+        // card after a transient failure can resurrect a sidecar another tab
+        // has already consumed, so let the caller retain its current UI and
+        // retry instead of applying stale pending state.
+        throw error;
+      }
+    };
+    const [context, initialRun, initialPending] = await Promise.all([
       getConversation(id),
       getConversationRun(id),
+      readPending(null),
     ]);
     let run = initialRun;
     let history: ChatMessage[] = [];
@@ -838,6 +921,10 @@ export default function App() {
       }
       run = latestRun;
     }
+    // The sidecar can be consumed while the history/run snapshots above are
+    // being read.  Re-read it after the stable run marker so a refresh cannot
+    // resurrect a question that was already confirmed in another tab.
+    const pending = await readPending(initialPending, false);
     if (!shouldApply(run, history)) return { run, history };
     const reconciled = reconcileMessages(history, run);
     const preserveDraft = conversationIdRef.current === context.conversationId;
@@ -849,6 +936,9 @@ export default function App() {
       {
         preserveDraft,
         terminationPending: run.status === "termination_requested",
+        pendingClarification: pending
+          ? { plan: pending, answers: [] }
+          : null,
       },
     );
     if (run.active) {
@@ -874,6 +964,8 @@ export default function App() {
           setConversationId(null);
           setMessages([]);
           setFiles([]);
+          setPendingClarification(null);
+          setIsPreparingIntake(false);
           setServiceState("connected");
           window.sessionStorage.removeItem(SESSION_PROJECT_KEY);
           window.sessionStorage.removeItem(SESSION_CONVERSATION_KEY);
@@ -901,7 +993,7 @@ export default function App() {
     const viewport = scrollRef.current;
     if (!viewport) return;
     viewport.scrollTop = viewport.scrollHeight;
-  }, [messages, isHydrating]);
+  }, [messages, isHydrating, pendingClarification]);
 
   useEffect(() => {
     if (!panelOpen) return;
@@ -942,7 +1034,7 @@ export default function App() {
   const streamResponse = useCallback(
     async (assistantId: string, request: FailedRequest) => {
       const controller = new AbortController();
-      const clientRequestId = createClientId();
+      const clientRequestId = request.clientRequestId || createClientId();
       activeRequestRef.current = controller;
       setIsSending(true);
       setNotice(null);
@@ -959,7 +1051,21 @@ export default function App() {
       let id: string | null = null;
       let receivedChecklistForThisRun = false;
       try {
-        id = await ensureConversation();
+        // Guided confirmation is tied to the conversation whose sidecar was
+        // rendered. If navigation/context switching wins the race while the
+        // request is being scheduled, abort locally instead of posting the
+        // answer into the newly active conversation.
+        if (request.conversationId) {
+          if (conversationIdRef.current !== request.conversationId) {
+            throw new DOMException("conversation changed", "AbortError");
+          }
+          id = request.conversationId;
+        } else {
+          id = await ensureConversation();
+        }
+        if (request.conversationId && conversationIdRef.current !== request.conversationId) {
+          throw new DOMException("conversation changed", "AbortError");
+        }
         const finalContent = await sendMessage(
           id,
           request.content,
@@ -994,6 +1100,7 @@ export default function App() {
             },
           },
           controller.signal,
+          request.intake,
         );
         const cancellation = cancellationRequestsRef.current.get(controller);
         const wasCancelled = cancellation ? await cancellation.catch(() => false) : false;
@@ -1028,6 +1135,23 @@ export default function App() {
           : error instanceof DOMException && error.name === "AbortError");
         const status = errorStatus(error);
         const retryOf = request.retryOf || errorReplyTo(error);
+        const intakeError = Boolean(code && (
+          code.startsWith("INTAKE_") ||
+          [
+            "MISSING_ANSWER",
+            "INVALID_ANSWER",
+            "INVALID_ANSWERS",
+            "INVALID_ACTION",
+            "UNKNOWN_QUESTION",
+            "UNKNOWN_OPTION",
+            "EMPTY_ANSWER",
+            "TOO_MANY_OPTIONS",
+            "TOO_MANY_ANSWERS",
+            "CUSTOM_NOT_ALLOWED",
+            "CUSTOM_TOO_LONG",
+            "POLICY_REJECTED",
+          ].includes(code)
+        ));
         if (retryOf) {
           failedRequestsRef.current.set(assistantId, { ...request, retryOf });
         }
@@ -1062,16 +1186,52 @@ export default function App() {
             // Fall through and retain the optimistic request if reconciliation
             // itself is temporarily unavailable.
           }
-        } else if (!stopped && !cancellation && id && status === undefined) {
+        } else if (
+          !stopped &&
+          !cancellation &&
+          id &&
+          request.intake &&
+          status === 409 &&
+          ["INTAKE_ALREADY_CONSUMED", "INTAKE_ID_MISMATCH"].includes(code || "")
+        ) {
+          // Another tab may have consumed the sidecar (or replaced it) while
+          // this optimistic stream was being posted. Reconcile first so the
+          // local placeholder does not remain beside a durable turn/card.
+          try {
+            await reconcileConversation(id);
+            setNotice(
+              code === "INTAKE_ID_MISMATCH"
+                ? "任务引导已更新，已同步最新问题。"
+                : "这次任务引导已由其他请求提交，已同步当前对话。",
+            );
+            setServiceState("connected");
+            return;
+          } catch {
+            // Fall through and retain the local error if the authoritative
+            // snapshot is temporarily unavailable.
+          }
+        } else if (
+          !stopped &&
+          !cancellation &&
+          id &&
+          (status === undefined || (request.intake && status >= 500))
+        ) {
           let accepted = false;
           try {
             await reconcileConversation(id, (run, history) => {
-              accepted = requestWasPersisted(
-                request,
-                run,
-                history,
-                clientRequestId,
-              );
+              accepted = request.intake
+                ? guidedRequestWasPersisted(
+                  request,
+                  run,
+                  history,
+                  clientRequestId,
+                )
+                : requestWasPersisted(
+                  request,
+                  run,
+                  history,
+                  clientRequestId,
+                );
               return accepted;
             });
             if (accepted) {
@@ -1081,6 +1241,49 @@ export default function App() {
           } catch {
             // Fall through to the safe local error projection when the
             // authoritative run snapshot is temporarily unavailable.
+          }
+        }
+        const shouldCheckPendingIntake = Boolean(request.intake) || intakeError;
+        if (!stopped && !cancellation && shouldCheckPendingIntake && id) {
+          // An answer can become stale after a refresh or a second browser
+          // tab submits it.  Re-read the sidecar so the user can correct the
+          // choices instead of being left with a dead optimistic turn.
+          const pending = await getPendingIntake(id).catch(() => null);
+          if (pending) {
+            if (request.intake) {
+              // The guided request has not become a durable user turn when
+              // its sidecar is still awaiting input. Remove the temporary
+              // user/assistant pair so a stale tab does not leave a visible
+              // failed duplicate next to the restored decision card.
+              setMessages((current) => {
+                const optimisticAssistant = current.find((message) => message.id === assistantId);
+                const optimisticUserId = optimisticAssistant?.replyTo;
+                return current.filter((message) => (
+                  message.id !== assistantId &&
+                  (!optimisticUserId || message.id !== optimisticUserId)
+                ));
+              });
+              failedRequestsRef.current.delete(assistantId);
+            }
+            setPendingClarification({
+              plan: pending,
+              answers: pending.id === request.intake?.id ? request.intake?.answers || [] : [],
+            });
+            setDraft(request.content);
+            setNotice(
+              code === "POLICY_REJECTED"
+                ? "自定义条件触发了安全边界，请修改补充内容后再开始。"
+                : request.intake && status === undefined
+                  ? "网络暂时中断，已保留这次任务引导；请确认后重试。"
+                  : "这组选择已过期，请重新确认后再开始。",
+            );
+          } else if (intakeError) {
+            setDraft(request.content);
+            setNotice(
+              code === "POLICY_REJECTED"
+                ? "自定义条件触发了安全边界，请修改补充内容后再开始。"
+                : "这次任务引导已失效，请重新发送原始任务。",
+            );
           }
         }
         if (!stopped && !cancellation && status !== undefined && !request.retryOf) {
@@ -1099,6 +1302,7 @@ export default function App() {
           setServiceState(status === undefined ? "unavailable" : "connected");
         }
       } finally {
+        if (request.intake) clarificationSubmittingRef.current = false;
         cancellationRequestsRef.current.delete(controller);
         if (activeRequestRef.current === controller) {
           activeRequestRef.current = null;
@@ -1114,21 +1318,20 @@ export default function App() {
     ],
   );
 
-  const handleSend = useCallback(() => {
-    const content = draft.trim();
-    if (!content || isSending || isStopping || isContextChanging || terminationPending) return;
+  const startOptimisticRun = useCallback((request: FailedRequest) => {
     const now = new Date().toISOString();
     const userId = createClientId();
     const assistantId = createClientId();
-    const attachments = readyFiles.map((file) => ({ id: file.id, name: file.name }));
-    const request = { content, attachmentIds: readyFiles.map((file) => file.id) };
-
+    const attachments = request.attachmentIds.map((id) => {
+      const file = files.find((item) => item.id === id);
+      return { id, name: file?.name || "历史附件" };
+    });
     setMessages((current) => [
       ...current,
       {
         id: userId,
         role: "user",
-        content,
+        content: request.content,
         createdAt: now,
         status: "complete",
         attachments,
@@ -1144,22 +1347,156 @@ export default function App() {
         progress: INITIAL_RESEARCH_PROGRESS,
       },
     ]);
-    setDraft("");
     void streamResponse(assistantId, request);
-  }, [draft, isContextChanging, isSending, isStopping, readyFiles, streamResponse, terminationPending]);
+  }, [files, streamResponse]);
+
+  const handleSend = useCallback(async () => {
+    const content = draft.trim();
+    if (
+      !content ||
+      isSending ||
+      preparingIntakeRef.current ||
+      isPreparingIntake ||
+      pendingClarification ||
+      isStopping ||
+      isContextChanging ||
+      terminationPending
+    ) return;
+    const attachmentIds = readyFiles.map((file) => file.id);
+    const prepareRequestId = createClientId();
+    preparingIntakeRef.current = true;
+    setIsPreparingIntake(true);
+    setNotice("正在识别任务类型，准备关键问题…");
+    let preparedConversationId: string | null = null;
+    try {
+      const id = await ensureConversation();
+      preparedConversationId = id;
+      let prepared;
+      try {
+        prepared = await prepareIntake(id, content, attachmentIds, prepareRequestId);
+      } catch (error) {
+        // Older rolling releases do not expose intake yet. Keep the original
+        // send path available while the deployment converges.
+        if (errorStatus(error) !== 404) throw error;
+        prepared = { required: false };
+      }
+      // A context switch can be initiated by browser navigation or another
+      // window while the local preflight is in flight.  Never project an old
+      // plan into the newly active conversation.
+      if (conversationIdRef.current !== id) return;
+      if (prepared.required && prepared.plan) {
+        setPendingClarification({ plan: prepared.plan, answers: [] });
+        setDraft("");
+        setNotice(null);
+        return;
+      }
+      setDraft("");
+      startOptimisticRun({
+        content,
+        attachmentIds,
+        clientRequestId: prepareRequestId,
+        conversationId: id,
+      });
+    } catch (error) {
+      // Another tab may have reserved the conversation's intake slot while
+      // this preflight was in flight.  Reconcile the authoritative card so a
+      // user never has to retype the task or receives only a generic 409.
+      if (
+        errorCode(error) === "INTAKE_ALREADY_PENDING" &&
+        preparedConversationId &&
+        conversationIdRef.current === preparedConversationId
+      ) {
+        const pending = await getPendingIntake(preparedConversationId).catch(() => null);
+        if (pending) {
+          setPendingClarification({ plan: pending, answers: [] });
+          setDraft("");
+          setNotice("当前对话已有待确认的任务引导，请先完成或取消它。");
+          return;
+        }
+      }
+      setDraft(content);
+      setNotice(error instanceof Error ? error.message : "暂时无法开始任务引导。请稍后重试。");
+      setServiceState(errorStatus(error) && errorStatus(error)! >= 500 ? "unavailable" : "connected");
+    } finally {
+      preparingIntakeRef.current = false;
+      setIsPreparingIntake(false);
+    }
+  }, [
+    draft,
+    ensureConversation,
+    isContextChanging,
+    isPreparingIntake,
+    isSending,
+    isStopping,
+    pendingClarification,
+    readyFiles,
+    startOptimisticRun,
+    terminationPending,
+  ]);
+
+  const handleClarificationSubmit = useCallback((answers: ClarificationAnswer[]) => {
+    const pending = pendingClarification;
+    if (!pending || isSending || isPreparingIntake || clarificationSubmittingRef.current) return;
+    clarificationSubmittingRef.current = true;
+    setPendingClarification({ ...pending, answers, submitting: true });
+    startOptimisticRun({
+      content: pending.plan.originalContent,
+      attachmentIds: pending.plan.attachmentIds,
+      intake: {
+        id: pending.plan.id,
+        action: "confirm",
+        answers,
+      },
+      clientRequestId: createClientId(),
+      conversationId: conversationIdRef.current || undefined,
+    });
+    setPendingClarification(null);
+  }, [isPreparingIntake, isSending, pendingClarification, startOptimisticRun]);
+
+  const handleClarificationSkip = useCallback(() => {
+    const pending = pendingClarification;
+    if (!pending || isSending || isPreparingIntake || clarificationSubmittingRef.current) return;
+    clarificationSubmittingRef.current = true;
+    setPendingClarification({ ...pending, submitting: true });
+    startOptimisticRun({
+      content: pending.plan.originalContent,
+      attachmentIds: pending.plan.attachmentIds,
+      intake: {
+        id: pending.plan.id,
+        action: "skip",
+        answers: [],
+      },
+      clientRequestId: createClientId(),
+      conversationId: conversationIdRef.current || undefined,
+    });
+    setPendingClarification(null);
+  }, [isPreparingIntake, isSending, pendingClarification, startOptimisticRun]);
 
   const handleRetry = useCallback(
     (messageId: string) => {
-      if (isSending || isStopping || terminationPending) return;
+      if (isSending || isPreparingIntake || pendingClarification || isStopping || terminationPending) return;
       const request = failedRequestsRef.current.get(messageId);
-      if (request) void streamResponse(messageId, request);
+      if (request) {
+        void streamResponse(messageId, {
+          ...request,
+          // A retry is a new transport attempt. Keep the original intake
+          // choices/content, but use a fresh correlation id so recovery cannot
+          // confuse this run with the failed request that produced the card.
+          clientRequestId: createClientId(),
+          conversationId: conversationIdRef.current || request.conversationId,
+        });
+      }
     },
-    [isSending, isStopping, streamResponse, terminationPending],
+    [isPreparingIntake, isSending, isStopping, pendingClarification, streamResponse, terminationPending],
   );
 
   const handleFilesSelected = useCallback(
     async (selectedFiles: File[]) => {
-      if (!selectedFiles.length || isContextChanging) return;
+      if (!selectedFiles.length) return;
+      if (isContextChanging || isPreparingIntake || pendingClarification) {
+        setNotice("请先完成当前任务引导，再添加或替换资料。");
+        return;
+      }
       setNotice(null);
       const pending = selectedFiles.map((file) => ({
         localId: createClientId(),
@@ -1213,7 +1550,7 @@ export default function App() {
         setServiceState("unavailable");
       }
     },
-    [ensureConversation, isContextChanging],
+    [ensureConversation, isContextChanging, isPreparingIntake, pendingClarification],
   );
 
   const stopActiveResponse = useCallback(async (showError = true): Promise<boolean> => {
@@ -1295,6 +1632,59 @@ export default function App() {
     }
   }, [isStopping, reconcileConversation]);
 
+  const discardPendingClarification = useCallback(async (): Promise<boolean> => {
+    const pending = pendingClarification;
+    const id = conversationIdRef.current;
+    if (!pending) return true;
+    if (!id) {
+      setPendingClarification(null);
+      return true;
+    }
+    try {
+      await cancelPendingIntake(id, pending.plan.id);
+      // Navigation can complete while DELETE is in flight. Never clear the
+      // newly active conversation's card from a stale cancellation response.
+      if (conversationIdRef.current !== id) return true;
+      setPendingClarification(null);
+      return true;
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "无法取消待确认的任务引导。");
+      return false;
+    }
+  }, [pendingClarification]);
+
+  const handleClarificationCancel = useCallback(() => {
+    const pending = pendingClarification;
+    const id = conversationIdRef.current;
+    if (!pending || !id || isSending || isPreparingIntake || clarificationSubmittingRef.current) return;
+    clarificationSubmittingRef.current = true;
+    setPendingClarification({ ...pending, submitting: true });
+    void (async () => {
+      try {
+        await cancelPendingIntake(id, pending.plan.id);
+        if (conversationIdRef.current !== id) return;
+        setPendingClarification(null);
+        setDraft(pending.plan.originalContent);
+        setNotice("已取消本次任务引导；你可以修改原始任务后重新发送。");
+      } catch (error) {
+        if (conversationIdRef.current === id) {
+          const current = await getPendingIntake(id).catch(() => null);
+          if (current) {
+            setPendingClarification({
+              plan: current,
+              answers: current.id === pending.plan.id ? pending.answers : [],
+            });
+          } else {
+            setPendingClarification(null);
+          }
+          setNotice(error instanceof Error ? error.message : "无法取消本次任务引导。");
+        }
+      } finally {
+        clarificationSubmittingRef.current = false;
+      }
+    })();
+  }, [isPreparingIntake, isSending, pendingClarification]);
+
   const handleSelectConversation = useCallback(async (
     _selectedProjectId: string,
     id: string,
@@ -1315,8 +1705,15 @@ export default function App() {
       setNotice("文件仍在上传，请等待上传完成后再切换项目或对话。");
       return false;
     }
+    if (isPreparingIntake) {
+      setNotice("正在生成关键问题，请稍后再切换对话。");
+      return false;
+    }
     const hasPendingWork = Boolean(
-      activeRequestRef.current || pendingCancellationRef.current || draft.trim(),
+      activeRequestRef.current ||
+      pendingCancellationRef.current ||
+      pendingClarification ||
+      draft.trim(),
     );
     if (
       hasPendingWork &&
@@ -1330,6 +1727,7 @@ export default function App() {
     ) {
       return false;
     }
+    if (!(await discardPendingClarification())) return false;
 
     setIsHydrating(true);
     setNotice(null);
@@ -1347,15 +1745,15 @@ export default function App() {
     } finally {
       setIsHydrating(false);
     }
-  }, [draft, isUploading, reconcileConversation, stopActiveResponse]);
+  }, [discardPendingClarification, draft, isPreparingIntake, isUploading, pendingClarification, reconcileConversation, stopActiveResponse]);
 
   const handleNewProject = useCallback(async () => {
-    if (isContextChanging || isHydrating || isStopping) return;
+    if (isContextChanging || isHydrating || isStopping || isPreparingIntake) return;
     if (isUploading) {
       setNotice("文件仍在上传，请等待上传完成后再新建项目。");
       return;
     }
-    const hasCurrentWork = messages.length > 0 || files.length > 0 || Boolean(draft.trim());
+    const hasCurrentWork = messages.length > 0 || files.length > 0 || Boolean(draft.trim()) || Boolean(pendingClarification);
     if (
       hasCurrentWork &&
       !window.confirm("新建项目会离开当前项目；原项目及其中的对话仍会保留在历史中。是否继续？")
@@ -1364,6 +1762,7 @@ export default function App() {
       (activeRequestRef.current || pendingCancellationRef.current) &&
       !(await stopActiveResponse())
     ) return;
+    if (!(await discardPendingClarification())) return;
 
     setIsContextChanging(true);
     setNotice(null);
@@ -1375,10 +1774,10 @@ export default function App() {
     } finally {
       setIsContextChanging(false);
     }
-  }, [activateConversation, draft, files.length, isContextChanging, isHydrating, isStopping, isUploading, messages.length, stopActiveResponse]);
+  }, [activateConversation, discardPendingClarification, draft, files.length, isContextChanging, isHydrating, isPreparingIntake, isStopping, isUploading, messages.length, pendingClarification, stopActiveResponse]);
 
   const handleNewConversation = useCallback(async () => {
-    if (isContextChanging || isHydrating || isStopping) return;
+    if (isContextChanging || isHydrating || isStopping || isPreparingIntake) return;
     const currentProjectId = projectIdRef.current;
     if (!currentProjectId) {
       setNotice("请先新建项目；第一条消息也会自动建立一个项目。");
@@ -1388,7 +1787,7 @@ export default function App() {
       setNotice("文件仍在上传，请等待上传完成后再新建对话。");
       return;
     }
-    const hasCurrentWork = messages.length > 0 || files.length > 0 || Boolean(draft.trim());
+    const hasCurrentWork = messages.length > 0 || files.length > 0 || Boolean(draft.trim()) || Boolean(pendingClarification);
     if (
       hasCurrentWork &&
       !window.confirm("将在当前项目中新建空白对话；当前对话仍会保留。是否继续？")
@@ -1397,6 +1796,7 @@ export default function App() {
       (activeRequestRef.current || pendingCancellationRef.current) &&
       !(await stopActiveResponse())
     ) return;
+    if (!(await discardPendingClarification())) return;
 
     setIsContextChanging(true);
     setNotice(null);
@@ -1408,7 +1808,7 @@ export default function App() {
     } finally {
       setIsContextChanging(false);
     }
-  }, [activateConversation, draft, files.length, isContextChanging, isHydrating, isStopping, isUploading, messages.length, stopActiveResponse]);
+  }, [activateConversation, discardPendingClarification, draft, files.length, isContextChanging, isHydrating, isPreparingIntake, isStopping, isUploading, messages.length, pendingClarification, stopActiveResponse]);
 
   const connectionLabel =
     serviceState === "connected"
@@ -1531,7 +1931,7 @@ export default function App() {
             onClick={() => void handleNewProject()}
             aria-label="新建独立项目"
             title="新建项目"
-            disabled={isContextChanging || isHydrating || isStopping || terminationPending || isUploading}
+            disabled={isContextChanging || isHydrating || isPreparingIntake || isStopping || terminationPending || isUploading}
           >
             <FolderPlus size={18} weight="regular" aria-hidden="true" />
             <span>{isContextChanging ? "正在新建" : "新建项目"}</span>
@@ -1542,7 +1942,7 @@ export default function App() {
             onClick={() => void handleNewConversation()}
             aria-label="在当前项目中新建对话"
             title={projectId ? "在当前项目中新建对话" : "请先新建项目"}
-            disabled={!projectId || isContextChanging || isHydrating || isStopping || terminationPending || isUploading}
+            disabled={!projectId || isContextChanging || isHydrating || isPreparingIntake || isStopping || terminationPending || isUploading}
           >
             <Plus size={18} weight="regular" aria-hidden="true" />
             <span>新建对话</span>
@@ -1563,11 +1963,17 @@ export default function App() {
           ) : null}
 
           <MessageList
+            conversationId={conversationId}
+            files={files}
             messages={messages}
             isHydrating={isHydrating}
             scrollRef={scrollRef}
             onPromptSelect={setDraft}
             onRetry={handleRetry}
+            pendingClarification={pendingClarification}
+            onClarificationSubmit={handleClarificationSubmit}
+            onClarificationSkip={handleClarificationSkip}
+            onClarificationCancel={handleClarificationCancel}
           />
           <Composer
             value={draft}
@@ -1577,7 +1983,12 @@ export default function App() {
             isStopping={isStopping}
             terminationPending={terminationPending}
             isUploading={isUploading}
-            disabled={isHydrating || isContextChanging}
+            disabled={
+              isHydrating ||
+              isContextChanging ||
+              isPreparingIntake ||
+              Boolean(pendingClarification)
+            }
             onChange={setDraft}
             onSend={handleSend}
             onStop={() => void stopActiveResponse()}

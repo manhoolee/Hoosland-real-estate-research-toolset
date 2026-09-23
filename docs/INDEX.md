@@ -7,8 +7,8 @@
 | 版本轴 | 当前值 |
 |---|---|
 | 产品线 | V2 |
-| Application | `0.2.6`（线上 V2 / slot-b） |
-| Build | `v0.2.6-scope-gate-20260829T101331Z` |
+| Application | `0.3.3`（线上 V2 / slot-a） |
+| Build | `v0.3.3-delivery-first-20260923` |
 | System Prompt | `real-estate-system-v0.2.4` |
 | Skill bundle | `2.3.1` |
 | Project state Schema | `2.1.0` |
@@ -24,7 +24,7 @@
 - 是否完成以真实操作记录和实际文件为准，不以模型在文本中的自述为准。
 - 文件工具的唯一正式交付根是当前会话顶层 `workspace/outputs`；临时目录或嵌套 `outputs` 不构成交付，缺失时不能进入成功终态。
 - 当前对话的可观察 Provider Token 用量按 conversation 累计，通过 SSE 更新并保存在可选 `usage.json` sidecar；reasoning 是 output 子集，不重复计入总量。
-- 每轮根 Agent 使用原生 `todo_write` 整表协议生成任务与成果要求；应用只接受成功且通过持久化门禁的 `todo/write` 事件。已有权威基线时，被拒的后续快照会在同一根会话中收到基线纠正，并在精确恢复前阻止其他实质操作与 final；首张非法且没有基线时直接失败关闭。
+- 每轮根 Agent 使用原生 `todo_write` 整表协议生成任务与成果要求；清单作为审计投影记录过程，清单收口告警不再拒绝已经通过文件可访问性和非空回复检查的交付。
 
 ## 文档地图
 
@@ -47,6 +47,7 @@
 - [版本与升级指南](VERSIONING-AND-UPGRADES.md)：独立版本轴、升级要素、兼容性、迁移和回滚要求。
 - [迭代原则](ITERATION-PRINCIPLES.md)：长期不变量、发布分级和 Definition of Done。
 - [更新记录](../CHANGELOG.md)：按版本和 Build 记录已经发布与尚未发布的变化。
+- [V0.3.3 发布说明](releases/v0.3.3/RELEASE-NOTES.md)：交付优先的清单收口与上线验证。
 - [V0.2.6 发布说明](releases/v0.2.6/RELEASE-NOTES.md)：应用版本统一、对话边界与输出防护及上线结果。
 - [V0.2.5 发布说明](releases/v0.2.5/RELEASE-NOTES.md)：todo/write 持久化拒绝、同会话权威恢复、旧 idle 竞态门禁与上线结果。
 - [V0.2.4 发布说明](releases/v0.2.4/RELEASE-NOTES.md)：任务拆解、成果要求、逐项复核、持久化与上线结果。

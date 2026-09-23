@@ -13,7 +13,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, AsyncIterator
 
-from fastapi import Body, FastAPI, HTTPException, Request, Response, UploadFile
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -25,6 +25,7 @@ from . import __version__
 from .admin_auth import AdminAuth
 from .capabilities import CapabilityGateway, McpAccessRegistry
 from .config import CAPABILITY_NAMES, Settings
+from .delivery import has_report_pair, requires_report_pair
 from .harness_adapter import (
     CONTROLLER_SKILL_ID,
     HarnessAdapterError,
@@ -40,6 +41,19 @@ from .harness_adapter import (
     notification_to_token_usage_sample,
     output_relative_path_id,
     research_progress_event,
+)
+from .intake import (
+    INTAKE_ID_RE,
+    IntakeError,
+    answers_match_saved,
+    build_intake,
+    content_digest,
+    intake_expired,
+    merge_prompt,
+    normalize_action,
+    normalize_saved_answers,
+    public_intake,
+    validate_answers,
 )
 from .mcp_protocol import McpProtocol
 from .operation_log import OperationLog
@@ -84,9 +98,43 @@ class ProjectCreate(BaseModel):
 
 class MessageCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    content: str = Field(min_length=1, max_length=200_000)
+    # ``content`` is optional only for the idempotent guided-intake cancel
+    # action.  Normal messages and confirm/skip submissions still reject a
+    # blank body in the route below, preserving the direct-run contract.
+    content: str | None = Field(default=None, max_length=200_000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
     retry_of: str | None = Field(default=None, pattern=r"^msg_[0-9a-f]{32}$")
+    client_request_id: str | None = Field(
+        default=None,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        ),
+    )
+    # Guided-intake fields are optional to preserve the existing direct-run
+    # contract.  A request carrying any of them is validated against the
+    # conversation's pending_intake.json sidecar before a Harness run starts.
+    intake_id: str | None = Field(default=None, pattern=r"^intake_[0-9a-f]{32}$")
+    intake_answers: dict[str, Any] | list[Any] | None = None
+    action: str | None = Field(
+        default=None,
+        pattern=r"(?i)^(?:confirm|submit|continue|run|start|skip|cancel|delete)$",
+    )
+    # Current web clients call this field ``intake_action``; ``action`` is
+    # retained as the concise API spelling for external callers.
+    intake_action: str | None = Field(
+        default=None,
+        pattern=r"(?i)^(?:confirm|submit|continue|run|start|skip|cancel|delete)$",
+    )
+
+
+class IntakeCreate(BaseModel):
+    """Create a pending guided-intake record for a user task."""
+
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=200_000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    intake_id: str | None = Field(default=None, pattern=r"^intake_[0-9a-f]{32}$")
     client_request_id: str | None = Field(
         default=None,
         pattern=(
@@ -128,6 +176,61 @@ def _json_error(status: int, code: str, message: str, **details: Any) -> JSONRes
     if details:
         body["error"]["details"] = details
     return JSONResponse(body, status_code=status)
+
+
+def _intake_response(
+    record: dict[str, Any],
+    *,
+    conversation_id: str | None = None,
+    required: bool = True,
+) -> dict[str, Any]:
+    """Build both the compact API projection and the current web ``plan``.
+
+    Keeping the aliases in one response means rolling clients can consume the
+    new endpoint while older integrations continue to read ``intake_id`` and
+    snake_case fields directly.
+    """
+
+    projection = public_intake(record)
+    plan = dict(projection)
+    plan["id"] = record.get("intake_id")
+    is_pending = record.get("status") == "awaiting_input"
+    effective_required = bool(required and is_pending)
+    result: dict[str, Any] = {
+        "required": effective_required,
+        "pending": effective_required,
+        **projection,
+        "plan": plan,
+    }
+    if conversation_id is not None:
+        result["conversation_id"] = conversation_id
+    return result
+
+
+def _intake_id_seen_in_history(
+    store: ConversationStore,
+    conversation_id: str,
+    intake_id: str,
+) -> bool:
+    """Return whether a guided sidecar has already become a user turn.
+
+    The sidecar is consumed before the user row is appended.  A short race or
+    a second browser tab can therefore arrive after consumption and before a
+    fresh GET has any pending state to read.  Looking only at the small,
+    content-free metadata projection lets the API distinguish that case from
+    an arbitrary/expired intake id without retaining a separate tombstone.
+    """
+
+    try:
+        messages = store.list_messages(conversation_id)
+    except Exception:
+        return False
+    return any(
+        item.get("role") == "user"
+        and isinstance(item.get("metadata"), dict)
+        and item["metadata"].get("intake_id") == intake_id
+        for item in messages
+    )
 
 
 def _sse(event: dict[str, Any]) -> bytes:
@@ -211,7 +314,7 @@ def _operation_route(path: str) -> str:
         return "/api/projects/{project_id}/conversations"
     conversation = re.fullmatch(
         r"/api/conversations/[A-Za-z0-9_-]{1,128}"
-        r"(?P<suffix>/messages|/run|/usage|/cancel|/files(?:/[A-Za-z0-9_-]{1,128}(?:/open)?)?)?",
+        r"(?P<suffix>/messages|/run|/usage|/cancel|/intake|/files(?:/[A-Za-z0-9_-]{1,128}(?:/open)?)?)?",
         path,
     )
     if conversation is not None:
@@ -361,6 +464,10 @@ def _public_run_error_message(code: str) -> str:
         return "研究服务当前不可用，请联系管理员检查配置。"
     if code == "AGENT_BUSY":
         return "上一轮研究仍在进行，请稍后再试。"
+    if code == "AGENT_OUTPUT_PAIR_MISSING":
+        return "本轮研究暂未完成：报告尚未交付完整的 Markdown 和 HTML 文件，请重试补齐。"
+    if code == "AGENT_OUTPUT_UNAVAILABLE":
+        return "本轮研究暂未完成：成果文件未通过可访问性检查，请重试。"
     return "本轮研究暂未完成，请重试；详细原因已记录在后台。"
 
 
@@ -896,9 +1003,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.operation_log = operation_log
     app.state.active_runs: dict[str, ActiveRun] = {}
     app.state.active_guard = asyncio.Lock()
+    # Serializes the short turn/intake reservation window.  Both endpoints
+    # acquire this before touching the pending sidecar or claiming a run slot,
+    # so a preflight cannot leave a card behind after a concurrent run wins.
+    app.state.turn_reservation_guard = asyncio.Lock()
     app.state.config_update_in_progress = False
     app.state.background_tasks: set[asyncio.Task[None]] = set()
     reported_output_blocks: set[tuple[str, str, str]] = set()
+
+    async def guided_submission_in_flight(conversation_id: str) -> bool:
+        """Detect the tiny consume→append window of another guided turn.
+
+        A pending sidecar is intentionally removed before the user message is
+        appended.  A second HTTP worker can therefore observe neither the
+        sidecar nor the history row for a few milliseconds.  The active-run
+        projection is the durable-in-process marker for that window; checking
+        it under the same reservation/active lock order avoids reporting the
+        request as an ordinary expired intake.
+        """
+
+        async with app.state.turn_reservation_guard:
+            async with app.state.active_guard:
+                active = app.state.active_runs.get(conversation_id)
+                if active is not None and (
+                    active.task is None or not active.task.done()
+                ):
+                    return True
+                durable = store.read_run(conversation_id)
+                return durable.get("status") == "running"
 
     def output_internal_markers() -> tuple[str, ...]:
         main = runtime_config.main_agent()
@@ -1454,6 +1586,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status = 500
         return _json_error(status, exc.code, str(exc))
 
+    @app.exception_handler(IntakeError)
+    async def intake_error_handler(_request: Request, exc: IntakeError) -> JSONResponse:
+        # Semantic answer errors are client-correctable; stale/conflicting
+        # records use the explicit 409 responses in the route handlers.
+        status = {
+            "INTAKE_EXPIRED": 410,
+            "INTAKE_ALREADY_CONSUMED": 409,
+        }.get(exc.code, 422)
+        return _json_error(status, exc.code, str(exc), **exc.details)
+
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
         return _json_error(422, "VALIDATION_ERROR", "request validation failed", issues=exc.errors())
@@ -1774,6 +1916,267 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "updated_at": metadata["updated_at"],
         }
 
+    @app.get("/api/conversations/{conversation_id}/intake")
+    async def get_conversation_intake(conversation_id: str) -> dict[str, Any]:
+        """Return the pending guided questions without touching run state."""
+
+        store.require(conversation_id)
+        # Read and expire under the same conversation lock used by reserve /
+        # consume.  This avoids a refresh briefly reporting ``pending=false``
+        # while another tab is replacing an expired card.
+        record = store.read_live_pending_intake(conversation_id)
+        if record is None:
+            return {
+                "pending": False,
+                "required": False,
+                "status": "idle",
+                "conversation_id": conversation_id,
+            }
+        return _intake_response(record, conversation_id=conversation_id)
+
+    @app.post("/api/conversations/{conversation_id}/intake", status_code=201)
+    async def create_conversation_intake(
+        request: Request,
+        conversation_id: str,
+        response: Response,
+        payload: IntakeCreate,
+    ) -> dict[str, Any]:
+        """Classify a task and persist its allow-listed questions.
+
+        Calling this endpoint never creates a message or invokes the Harness.
+        Repeating the same content/attachments is idempotent; replacing an
+        unanswered task requires an explicit DELETE first.
+        """
+
+        intake_preflight_started_at = perf_counter()
+        store.require(conversation_id)
+        # Do not create a second pending card while this conversation is
+        # already running.  Otherwise a different tab could prepare a task
+        # that can only fail with RUN_ACTIVE after the current run finishes.
+        async with app.state.active_guard:
+            active = app.state.active_runs.get(conversation_id)
+            if active is not None and (active.task is None or not active.task.done()):
+                return _json_error(
+                    409,
+                    "RUN_TERMINATING" if active.cancel_event.is_set() else "RUN_ACTIVE",
+                    "上一轮研究正在终止，请稍后再准备新任务。"
+                    if active.cancel_event.is_set()
+                    else "上一轮研究仍在运行，请等待完成或先停止后再准备新任务。",
+                )
+            # A process restart can leave a durable running marker without an
+            # in-memory ``ActiveRun``.  Reconcile it before reserving a new
+            # card so the intake endpoint follows the same recovery contract
+            # as the normal message route.
+            durable = store.read_run(conversation_id)
+            # A legacy projection is read-only until an actual run is
+            # accepted.  In particular, an empty old conversation must not be
+            # materialized into run/checklist state merely by showing the
+            # guided card.  A legacy interrupted/terminal turn is reconciled
+            # later by the confirm/direct message path.
+            if durable.get("status") == "running":
+                durable = reconcile_inactive_run(conversation_id, durable)
+                if durable.get("status") == "running":
+                    return _json_error(
+                        409,
+                        "RUN_ACTIVE",
+                        "上一轮研究仍在运行，请等待完成或先停止后再准备新任务。",
+                    )
+        content = payload.content.strip()
+        if not content:
+            raise HTTPException(status_code=422, detail="content must not be blank")
+        attachment_ids = list(dict.fromkeys(payload.attachment_ids))
+        # Apply the same deterministic scope/probe gate used by /messages
+        # before any pending-intake bytes are written.  Intake is local and
+        # token-free, but a rejected request must not become durable state that
+        # can later be replayed around the policy boundary.
+        try:
+            existing_messages = store.list_messages(conversation_id)
+            decision = evaluate_request(
+                content,
+                has_attachments=bool(attachment_ids),
+                has_context=bool(_completed_conversation_history(existing_messages)),
+            )
+        except Exception:
+            operation_log.record(
+                "agent.policy.error",
+                source="api",
+                request_id=request.state.request_id,
+                conversation_id=conversation_id,
+                policy_version="unknown",
+                content_characters=len(content),
+                attachment_count=len(attachment_ids),
+                intake=True,
+            )
+            return _json_error(422, "POLICY_REJECTED", POLICY_REFUSAL)
+        if not decision.allowed:
+            operation_log.record(
+                "agent.policy.rejected",
+                source="api",
+                request_id=request.state.request_id,
+                conversation_id=conversation_id,
+                action=decision.action,
+                intent=decision.intent,
+                reason_code=decision.reason_code,
+                policy_version=decision.policy_version,
+                content_characters=len(content),
+                attachment_count=len(attachment_ids),
+                intake=True,
+            )
+            return _json_error(422, "POLICY_REJECTED", POLICY_REFUSAL)
+        # Resolve files before writing the sidecar so a stale browser cannot
+        # create questions for an attachment that this conversation cannot use.
+        store.input_files(conversation_id, attachment_ids)
+        digest = content_digest(content)
+        candidate = build_intake(
+            content,
+            attachment_ids=attachment_ids,
+            intake_id=payload.intake_id,
+            client_request_id=payload.client_request_id,
+        )
+        # Reserve the sidecar under both the conversation lock and the short
+        # turn-reservation lock.  The latter is shared with /messages so a
+        # direct run cannot claim this conversation between our active check
+        # and the sidecar CAS.
+        async with app.state.turn_reservation_guard:
+            async with app.state.active_guard:
+                active = app.state.active_runs.get(conversation_id)
+                if active is not None and active.task is not None and active.task.done():
+                    if (
+                        active.cancel_event.is_set() or active.rotate_session_on_exit
+                    ) and not active.session_rotated:
+                        return _json_error(
+                            503,
+                            "RUN_CLEANUP_PENDING",
+                            "上一轮研究的运行会话尚未完成清理，请稍后重试。",
+                        )
+                    app.state.active_runs.pop(conversation_id, None)
+                    active = None
+                if active is not None:
+                    return _json_error(
+                        409,
+                        "RUN_TERMINATING" if active.cancel_event.is_set() else "RUN_ACTIVE",
+                        "上一轮研究正在终止，请稍后重试。"
+                        if active.cancel_event.is_set()
+                        else "上一轮研究仍在运行，请等待完成或先停止后再准备新任务。",
+                    )
+                durable = store.read_run(conversation_id)
+                if durable.get("status") == "running":
+                    durable = reconcile_inactive_run(conversation_id, durable)
+                    if durable.get("status") == "running":
+                        return _json_error(
+                            409,
+                            "RUN_ACTIVE",
+                            "上一轮研究仍在运行，请等待完成或先停止后再准备新任务。",
+                        )
+            record, created = store.create_pending_intake_if_absent(
+                conversation_id,
+                candidate,
+                replace_expired=True,
+            )
+        if not created:
+            if (
+                record.get("content_sha256") == digest
+                and list(record.get("attachment_ids", [])) == attachment_ids
+            ):
+                response.status_code = 200
+                return _intake_response(record, conversation_id=conversation_id)
+            return _json_error(
+                409,
+                "INTAKE_ALREADY_PENDING",
+                "当前对话已有未完成的引导问题，请先完成或取消它。",
+                intake_id=record.get("intake_id"),
+            )
+        metadata = store.read_meta(conversation_id)
+        operation_log.record(
+            "agent.intake.created",
+            source="api",
+            request_id=request.state.request_id,
+            project_id=metadata.get("project_id"),
+            conversation_id=conversation_id,
+            intake_id=record["intake_id"],
+            task_type=record["task_type"],
+            question_count=len(record.get("questions", [])),
+            attachment_count=len(attachment_ids),
+            latency_ms=round((perf_counter() - intake_preflight_started_at) * 1000, 3),
+        )
+        return _intake_response(record, conversation_id=conversation_id)
+
+    @app.delete("/api/conversations/{conversation_id}/intake")
+    async def delete_conversation_intake(
+        request: Request,
+        conversation_id: str,
+        intake_id: str | None = Query(
+            default=None,
+            pattern=r"^intake_[0-9a-f]{32}$",
+        ),
+    ) -> dict[str, Any]:
+        """Cancel the pending question card; this is intentionally idempotent."""
+
+        metadata = store.read_meta(conversation_id)
+        async with app.state.turn_reservation_guard:
+            async with app.state.active_guard:
+                current = store.read_live_pending_intake(conversation_id)
+                if current is not None and intake_id is not None and current.get("intake_id") != intake_id:
+                    return _json_error(
+                        409,
+                        "INTAKE_ID_MISMATCH",
+                        "引导问题已更新，请刷新后再操作。",
+                        intake_id=current.get("intake_id"),
+                    )
+                active = app.state.active_runs.get(conversation_id)
+                active_in_flight = active is not None and (
+                    active.task is None or not active.task.done()
+                )
+                durable_in_flight = store.read_run(conversation_id).get("status") == "running"
+                if current is not None and (active_in_flight or durable_in_flight):
+                    return _json_error(
+                        409,
+                        "RUN_TERMINATING"
+                        if active is not None and active.cancel_event.is_set()
+                        else "RUN_ACTIVE",
+                        "确认请求正在提交，请稍后再取消。"
+                        if active is None or not active.cancel_event.is_set()
+                        else "上一轮研究正在终止，请稍后再取消引导。",
+                    )
+                if current is None and intake_id is not None and (
+                    active_in_flight or durable_in_flight
+                ):
+                    return _json_error(
+                        409,
+                        "INTAKE_ALREADY_CONSUMED",
+                        "引导问题正在由其他请求提交，请稍后刷新后重试。",
+                    )
+                removed = store.clear_pending_intake(
+                    conversation_id,
+                    intake_id=intake_id,
+                )
+                if intake_id is not None and removed is None:
+                    # A concurrent confirm can consume the exact sidecar after
+                    # the read above.  Treat that as an idempotent idle result;
+                    # a different live card would have been rejected above.
+                    current_after = store.read_live_pending_intake(conversation_id)
+                    if current_after is not None:
+                        return _json_error(
+                            409,
+                            "INTAKE_ID_MISMATCH",
+                            "引导问题已更新，请刷新后再操作。",
+                            intake_id=current_after.get("intake_id"),
+                        )
+        operation_log.record(
+            "agent.intake.cancelled",
+            source="api",
+            request_id=request.state.request_id,
+            project_id=metadata.get("project_id"),
+            conversation_id=conversation_id,
+            intake_id=(removed or {}).get("intake_id") if removed else intake_id,
+            outcome="cancelled" if removed else "idle",
+        )
+        return {
+            "cancelled": removed is not None,
+            "status": "cancelled" if removed else "idle",
+            "intake_id": (removed or {}).get("intake_id") if removed else intake_id,
+        }
+
     @app.get("/api/conversations/{conversation_id}/messages")
     async def list_messages(conversation_id: str) -> dict[str, Any]:
         durable_run = store.read_run(conversation_id)
@@ -1871,11 +2274,121 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload: MessageCreate,
     ) -> Response:
         conversation_paths = store.require(conversation_id)
-        content = payload.content.strip()
+        content = (payload.content or "").strip()
+        requested_intake_action = payload.action or payload.intake_action
+        if (
+            payload.action is not None
+            and payload.intake_action is not None
+            and normalize_action(payload.action) != normalize_action(payload.intake_action)
+        ):
+            return _json_error(
+                422,
+                "INTAKE_ACTION_CONFLICT",
+                "action 与 intake_action 不一致。",
+            )
+        normalized_requested_action = normalize_action(requested_intake_action)
+
+        # Cancellation is a sidecar operation, not a model turn. Accepting a
+        # A JSON ``POST /messages`` cancel may omit ``content``; this makes the
+        # alias as useful as the canonical DELETE endpoint while still
+        # requiring the server-issued intake id. When content is supplied we
+        # verify it below so a stale client cannot cancel a different task.
+        if normalized_requested_action in {"cancel", "delete"} and payload.retry_of:
+            return _json_error(
+                409,
+                "INTAKE_RETRY_MISMATCH",
+                "不能通过重试请求取消引导任务。",
+            )
+        if not content and normalized_requested_action in {"cancel", "delete"}:
+            if payload.intake_id is None:
+                return _json_error(
+                    422,
+                    "INTAKE_ID_REQUIRED",
+                    "取消引导时必须同时提供 intake_id。",
+                )
+            async with app.state.turn_reservation_guard:
+                async with app.state.active_guard:
+                    pending_for_cancel = store.read_live_pending_intake(conversation_id)
+                    active = app.state.active_runs.get(conversation_id)
+                    active_in_flight = active is not None and (
+                        active.task is None or not active.task.done()
+                    )
+                    durable_in_flight = store.read_run(conversation_id).get("status") == "running"
+                    if pending_for_cancel is None:
+                        if active_in_flight or durable_in_flight:
+                            return _json_error(
+                                409,
+                                "INTAKE_ALREADY_CONSUMED",
+                                "引导问题正在由其他请求提交，请稍后刷新后重试。",
+                            )
+                        if _intake_id_seen_in_history(
+                            store,
+                            conversation_id,
+                            payload.intake_id,
+                        ):
+                            return _json_error(
+                                409,
+                                "INTAKE_ALREADY_CONSUMED",
+                                "引导问题已被其他请求提交，请刷新后重试。",
+                            )
+                        # Match DELETE /intake's idempotent no-op semantics
+                        # once there is no competing submission in flight.
+                        return {
+                            "cancelled": False,
+                            "status": "idle",
+                            "intake_id": payload.intake_id,
+                        }
+                    if pending_for_cancel.get("intake_id") != payload.intake_id:
+                        return _json_error(
+                            409,
+                            "INTAKE_ID_MISMATCH",
+                            "引导问题已更新，请刷新后再操作。",
+                            intake_id=pending_for_cancel.get("intake_id"),
+                        )
+                    if active_in_flight or durable_in_flight:
+                        return _json_error(
+                            409,
+                            "RUN_TERMINATING"
+                            if active is not None and active.cancel_event.is_set()
+                            else "RUN_ACTIVE",
+                            "确认请求正在提交，请稍后再取消。"
+                            if active is None or not active.cancel_event.is_set()
+                            else "上一轮研究正在终止，请稍后再取消引导。",
+                        )
+                    removed = store.clear_pending_intake(
+                        conversation_id,
+                        intake_id=payload.intake_id,
+                    )
+            conversation_metadata = store.read_meta(conversation_id)
+            operation_log.record(
+                "agent.intake.cancelled",
+                source="api",
+                request_id=request.state.request_id,
+                project_id=conversation_metadata.get("project_id"),
+                conversation_id=conversation_id,
+                intake_id=payload.intake_id,
+                outcome="cancelled" if removed is not None else "idle",
+            )
+            return {
+                "cancelled": removed is not None,
+                "status": "cancelled" if removed else "idle",
+                "intake_id": payload.intake_id,
+            }
         if not content:
             raise HTTPException(status_code=422, detail="content must not be blank")
 
-        attachment_ids = list(payload.attachment_ids)
+        attachment_ids = list(dict.fromkeys(payload.attachment_ids))
+        # ``content`` remains the exact user-visible request.  A separate
+        # ``prompt_content`` carries the optional confirmed preferences to the
+        # Harness so message history never stores an instruction-rewritten
+        # version of what the user typed.
+        prompt_content = content
+        intake_record: dict[str, Any] | None = None
+        intake_answers: list[dict[str, Any]] = []
+        intake_metadata: dict[str, Any] = {}
+        intake_to_consume: str | None = None
+        consumed_intake_record: dict[str, Any] | None = None
+        intake_submission_started_at = perf_counter()
         retry_user_message: dict[str, Any] | None = None
         policy_messages: list[dict[str, Any]] | None = None
         if payload.retry_of:
@@ -1897,7 +2410,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 original_attachment_ids, list
             ):
                 return _json_error(409, "RETRY_TURN_INVALID", "原任务记录不完整，无法安全重试。")
-            if content != original_content.strip() or attachment_ids != original_attachment_ids:
+            normalized_original_attachment_ids = list(dict.fromkeys(original_attachment_ids))
+            if content != original_content.strip() or attachment_ids != normalized_original_attachment_ids:
                 return _json_error(
                     409,
                     "RETRY_PAYLOAD_MISMATCH",
@@ -1911,7 +2425,232 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }:
                 return _json_error(409, "TURN_ALREADY_COMPLETED", "这轮研究已经完成，无需重试。")
             content = original_content.strip()
-            attachment_ids = list(original_attachment_ids)
+            attachment_ids = list(dict.fromkeys(original_attachment_ids))
+
+            # A retry normally omits intake fields.  Reconstruct the confirmed
+            # context from the original user metadata so the retried prompt is
+            # semantically identical to the first run.
+            saved_metadata = retry_user_message.get("metadata")
+            if isinstance(saved_metadata, dict) and saved_metadata.get("intake_id"):
+                saved_intake_id = saved_metadata.get("intake_id")
+                saved_task_type = saved_metadata.get("intake_task_type")
+                saved_answers = saved_metadata.get("intake_answers", [])
+                if (
+                    isinstance(saved_intake_id, str)
+                    and INTAKE_ID_RE.fullmatch(saved_intake_id)
+                    and isinstance(saved_task_type, str)
+                ):
+                    intake_answers = normalize_saved_answers(saved_answers)
+                    intake_metadata = {
+                        "intake_id": saved_intake_id,
+                        "intake_task_type": saved_task_type,
+                        "intake_task_type_label": saved_metadata.get(
+                            "intake_task_type_label"
+                        ),
+                        "intake_answers": intake_answers,
+                        "intake_action": normalize_action(
+                            saved_metadata.get("intake_action", "confirm")
+                            if isinstance(saved_metadata.get("intake_action", "confirm"), str)
+                            else "confirm"
+                        ),
+                        "intake_version": saved_metadata.get("intake_version", 1),
+                        "intake_questions": saved_metadata.get("intake_questions", []),
+                    }
+                    prompt_content = merge_prompt(
+                        content,
+                        answers=intake_answers,
+                        task_type=saved_task_type,
+                        action=str(intake_metadata["intake_action"]),
+                    )
+
+        # New turns carrying guided-intake fields must reference the exact
+        # pending sidecar created by POST /intake.  This prevents a client from
+        # inventing option ids or applying answers to a different request.
+        if payload.intake_id is not None and retry_user_message is None:
+            intake_record = store.read_pending_intake(conversation_id)
+            if intake_record is None:
+                if _intake_id_seen_in_history(
+                    store,
+                    conversation_id,
+                    payload.intake_id,
+                ):
+                    return _json_error(
+                        409,
+                        "INTAKE_ALREADY_CONSUMED",
+                        "引导问题已被其他请求提交，请刷新后重试。",
+                    )
+                if await guided_submission_in_flight(conversation_id):
+                    return _json_error(
+                        409,
+                        "INTAKE_ALREADY_CONSUMED",
+                        "引导问题正在由其他请求提交，请稍后刷新后重试。",
+                    )
+                return _json_error(
+                    404,
+                    "INTAKE_NOT_FOUND",
+                    "引导问题已过期或不存在，请重新发起任务。",
+                )
+            if intake_expired(intake_record):
+                store.clear_pending_intake(
+                    conversation_id,
+                    intake_id=payload.intake_id,
+                )
+                return _json_error(
+                    410,
+                    "INTAKE_EXPIRED",
+                    "引导问题已过期，请重新发起任务。",
+                )
+            if intake_record.get("intake_id") != payload.intake_id:
+                return _json_error(
+                    409,
+                    "INTAKE_ID_MISMATCH",
+                    "引导问题已更新，请刷新后重新选择。",
+                    intake_id=intake_record.get("intake_id"),
+                )
+            if (
+                intake_record.get("content_sha256") != content_digest(content)
+                or list(intake_record.get("attachment_ids", [])) != attachment_ids
+            ):
+                return _json_error(
+                    409,
+                    "INTAKE_PAYLOAD_MISMATCH",
+                    "当前请求或附件与引导问题不一致，请刷新后重试。",
+                )
+            action = normalize_action(requested_intake_action)
+            if action in {"cancel", "delete"}:
+                async with app.state.turn_reservation_guard:
+                    async with app.state.active_guard:
+                        current_for_cancel = store.read_live_pending_intake(conversation_id)
+                        if current_for_cancel is None:
+                            return _json_error(
+                                409,
+                                "INTAKE_ALREADY_CONSUMED",
+                                "引导问题已被其他请求提交，请刷新后重试。",
+                            )
+                        if current_for_cancel.get("intake_id") != payload.intake_id:
+                            return _json_error(
+                                409,
+                                "INTAKE_ID_MISMATCH",
+                                "引导问题已更新，请刷新后再操作。",
+                                intake_id=current_for_cancel.get("intake_id"),
+                            )
+                        active = app.state.active_runs.get(conversation_id)
+                        if active is not None and (
+                            active.task is None or not active.task.done()
+                        ):
+                            return _json_error(
+                                409,
+                                "RUN_TERMINATING" if active.cancel_event.is_set() else "RUN_ACTIVE",
+                                "确认请求正在提交，请稍后再取消。"
+                                if not active.cancel_event.is_set()
+                                else "上一轮研究正在终止，请稍后再取消引导。",
+                            )
+                        removed = store.clear_pending_intake(
+                            conversation_id,
+                            intake_id=payload.intake_id,
+                        )
+                conversation_metadata = store.read_meta(conversation_id)
+                operation_log.record(
+                    "agent.intake.cancelled",
+                    source="api",
+                    request_id=request.state.request_id,
+                    project_id=conversation_metadata.get("project_id"),
+                    conversation_id=conversation_id,
+                    intake_id=payload.intake_id,
+                    outcome="cancelled" if removed is not None else "idle",
+                )
+                return {
+                    "cancelled": removed is not None,
+                    "status": "cancelled" if removed else "idle",
+                    "intake_id": payload.intake_id,
+                }
+            intake_answers = validate_answers(
+                intake_record,
+                payload.intake_answers,
+                action=action,
+            )
+            intake_metadata = {
+                "intake_id": intake_record["intake_id"],
+                "intake_task_type": intake_record["task_type"],
+                "intake_task_type_label": intake_record.get("task_type_label"),
+                "intake_answers": intake_answers,
+                "intake_action": action,
+                "intake_version": intake_record.get("version", 1),
+                "intake_questions": intake_record.get("questions", []),
+            }
+            prompt_content = merge_prompt(
+                content,
+                intake_record,
+                intake_answers,
+                action=action,
+            )
+            intake_to_consume = payload.intake_id
+        elif payload.intake_answers is not None and payload.intake_id is None:
+            return _json_error(
+                422,
+                "INTAKE_ID_REQUIRED",
+                "提交引导答案时必须同时提供 intake_id。",
+            )
+        elif requested_intake_action is not None and payload.intake_id is None and retry_user_message is None:
+            return _json_error(
+                422,
+                "INTAKE_ID_REQUIRED",
+                "提交引导操作时必须同时提供 intake_id。",
+            )
+        elif payload.intake_id is not None and retry_user_message is not None:
+            # A retry may carry the same metadata explicitly, but it cannot
+            # switch the choices that belong to the original turn.
+            saved_metadata = retry_user_message.get("metadata")
+            saved_id = saved_metadata.get("intake_id") if isinstance(saved_metadata, dict) else None
+            if saved_id != payload.intake_id or not intake_metadata:
+                return _json_error(
+                    409,
+                    "INTAKE_RETRY_MISMATCH",
+                    "重试时不能更换原任务的引导选择。",
+                )
+            if payload.intake_answers is not None:
+                saved_answers = (
+                    saved_metadata.get("intake_answers", [])
+                    if isinstance(saved_metadata, dict)
+                    else []
+                )
+                # Compare transport-normalized IDs/text against the original
+                # server-owned metadata.  Rebuilding synthetic questions from
+                # answers loses multi-select options and made retries depend
+                # on whatever labels happened to be persisted.
+                if not answers_match_saved(payload.intake_answers, saved_answers):
+                    return _json_error(
+                        409,
+                        "INTAKE_RETRY_MISMATCH",
+                        "重试时不能更换原任务的引导选择。",
+                    )
+            if requested_intake_action is not None:
+                requested_action = normalize_action(requested_intake_action)
+                saved_action = normalize_action(
+                    str(intake_metadata.get("intake_action", "confirm"))
+                )
+                if requested_action != saved_action:
+                    return _json_error(
+                        409,
+                        "INTAKE_RETRY_MISMATCH",
+                        "重试操作与原任务不一致。",
+                    )
+
+        # A pending card is a conversation-level lock.  Older clients (or a
+        # second browser tab) may still try the legacy direct message route;
+        # never let that path start a run while another task is awaiting a
+        # decision.  Expiry is resolved under the store lock so an abandoned
+        # card does not block the next task forever.
+        live_pending = store.read_live_pending_intake(conversation_id)
+        if live_pending is not None and (
+            retry_user_message is not None or payload.intake_id is None
+        ):
+            return _json_error(
+                409,
+                "INTAKE_ALREADY_PENDING",
+                "当前对话已有未完成的引导问题，请先完成或取消它。",
+                intake_id=live_pending.get("intake_id"),
+            )
 
         # Run the cheap, deterministic scope/probe gate before reading files,
         # creating a run, persisting the turn, or invoking the Harness.  A
@@ -1954,6 +2693,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             return _policy_stream_response()
 
+        # Custom answers are still untrusted user text.  Re-run the local
+        # scope/probe gate on the effective prompt so a safe-looking original
+        # request cannot smuggle a runtime-secrets or prompt-extraction probe
+        # through the free-form answer box.  The pending sidecar remains in
+        # place when this check rejects, allowing the user to edit and retry.
+        if intake_metadata:
+            try:
+                effective_decision = evaluate_request(
+                    prompt_content,
+                    has_attachments=bool(attachment_ids),
+                    has_context=bool(_completed_conversation_history(policy_messages)),
+                )
+            except Exception:
+                operation_log.record(
+                    "agent.policy.error",
+                    source="api",
+                    request_id=request.state.request_id,
+                    conversation_id=conversation_id,
+                    policy_version="unknown",
+                    content_characters=len(content),
+                    attachment_count=len(attachment_ids),
+                    intake=True,
+                )
+                return _json_error(422, "POLICY_REJECTED", POLICY_REFUSAL)
+            if not effective_decision.allowed:
+                operation_log.record(
+                    "agent.policy.rejected",
+                    source="api",
+                    request_id=request.state.request_id,
+                    conversation_id=conversation_id,
+                    action=effective_decision.action,
+                    intent=effective_decision.intent,
+                    reason_code=effective_decision.reason_code,
+                    policy_version=effective_decision.policy_version,
+                    content_characters=len(content),
+                    attachment_count=len(attachment_ids),
+                    retried=payload.retry_of is not None,
+                    intake=True,
+                )
+                return _json_error(422, "POLICY_REJECTED", POLICY_REFUSAL)
+
         attachments = store.input_files(conversation_id, attachment_ids)
 
         active = ActiveRun(
@@ -1961,33 +2741,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cancel_event=asyncio.Event(),
             client_request_id=payload.client_request_id,
         )
-        async with app.state.active_guard:
-            if app.state.config_update_in_progress:
-                return _json_error(409, "CONFIG_UPDATE_ACTIVE", "研究助手配置正在更新，请稍后发送")
-            previous = app.state.active_runs.get(conversation_id)
-            if previous is not None and previous.task is not None and previous.task.done():
-                if (
-                    previous.cancel_event.is_set() or previous.rotate_session_on_exit
-                ) and not previous.session_rotated:
+        # Serialize the final pending-card check with /intake's reservation.
+        # A first check above is useful for fast rejection, but this check is
+        # the authority when both requests arrive at the same time.
+        async with app.state.turn_reservation_guard:
+            live_pending_at_claim = store.read_live_pending_intake(conversation_id)
+            if live_pending_at_claim is not None:
+                if retry_user_message is not None or payload.intake_id is None:
                     return _json_error(
-                        503,
-                        "RUN_CLEANUP_PENDING",
-                        "上一轮研究的运行会话尚未完成清理，请稍后重试",
+                        409,
+                        "INTAKE_ALREADY_PENDING",
+                        "当前对话已有未完成的引导问题，请先完成或取消它。",
+                        intake_id=live_pending_at_claim.get("intake_id"),
                     )
-                app.state.active_runs.pop(conversation_id, None)
-                previous = None
-            if previous is not None:
-                if previous.cancel_event.is_set():
-                    return _json_error(409, "RUN_TERMINATING", "上一轮研究正在终止，请稍后重试")
+                if live_pending_at_claim.get("intake_id") != payload.intake_id:
+                    return _json_error(
+                        409,
+                        "INTAKE_ID_MISMATCH",
+                        "引导问题已更新，请刷新后重新选择。",
+                        intake_id=live_pending_at_claim.get("intake_id"),
+                    )
+            elif payload.intake_id is not None and retry_user_message is None:
+                # A concurrent DELETE/confirm may have consumed the sidecar
+                # after the initial validation. Do not claim a run slot only
+                # to fail later in ``consume_pending_intake``.
                 return _json_error(
                     409,
-                    "RUN_ACTIVE",
-                    "上一轮研究仍在后台运行；刷新不会中断任务，请等待完成或先停止。",
+                    "INTAKE_ALREADY_CONSUMED",
+                    "引导问题已被其他请求提交，请刷新后重试。",
                 )
-            durable = store.read_run(conversation_id)
-            if durable.get("status") == "running" or durable.get("legacy") is True:
-                reconcile_inactive_run(conversation_id, durable)
-            app.state.active_runs[conversation_id] = active
+            async with app.state.active_guard:
+                if app.state.config_update_in_progress:
+                    return _json_error(409, "CONFIG_UPDATE_ACTIVE", "研究助手配置正在更新，请稍后发送")
+                previous = app.state.active_runs.get(conversation_id)
+                if previous is not None and previous.task is not None and previous.task.done():
+                    if (
+                        previous.cancel_event.is_set() or previous.rotate_session_on_exit
+                    ) and not previous.session_rotated:
+                        return _json_error(
+                            503,
+                            "RUN_CLEANUP_PENDING",
+                            "上一轮研究的运行会话尚未完成清理，请稍后重试",
+                        )
+                    app.state.active_runs.pop(conversation_id, None)
+                    previous = None
+                if previous is not None:
+                    if previous.cancel_event.is_set():
+                        return _json_error(409, "RUN_TERMINATING", "上一轮研究正在终止，请稍后重试")
+                    return _json_error(
+                        409,
+                        "RUN_ACTIVE",
+                        "上一轮研究仍在后台运行；刷新不会中断任务，请等待完成或先停止。",
+                    )
+                durable = store.read_run(conversation_id)
+                if durable.get("status") == "running" or durable.get("legacy") is True:
+                    reconcile_inactive_run(conversation_id, durable)
+                app.state.active_runs[conversation_id] = active
 
         try:
             metadata = store.read_meta(conversation_id)
@@ -2012,6 +2821,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 store.list_messages(conversation_id)
             )
             seed_history = bool(conversation_history)
+            if intake_to_consume is not None:
+                consumed_intake = store.consume_pending_intake(
+                    conversation_id,
+                    intake_id=intake_to_consume,
+                    content_sha256=content_digest(content),
+                    attachment_ids=attachment_ids,
+                )
+                if consumed_intake is None:
+                    if intake_record is not None and intake_expired(intake_record):
+                        raise IntakeError(
+                            "INTAKE_EXPIRED",
+                            "引导问题已过期，请重新发起任务。",
+                        )
+                    raise IntakeError(
+                        "INTAKE_ALREADY_CONSUMED",
+                        "引导问题已被其他请求提交，请刷新后重试。",
+                    )
+                consumed_intake_record = consumed_intake
             user_message = retry_user_message or store.append_message(
                 conversation_id,
                 role="user",
@@ -2022,6 +2849,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "history_seed_applied": seed_history,
                     "policy_intent": decision.intent,
                     "policy_version": decision.policy_version,
+                    # Correlate a newly appended guided turn with the active
+                    # reservation.  This marker is internal (metadata is
+                    # stripped by _public_message) and prevents recovery from
+                    # mistaking an older identical intake id for this run.
+                    "run_id": active.run_id,
+                    **(
+                        {"client_request_id": payload.client_request_id}
+                        if payload.client_request_id
+                        else {}
+                    ),
+                    **intake_metadata,
                 },
             )
             active.user_message_id = str(user_message["id"])
@@ -2034,7 +2872,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             begin_token_usage_run_safely(conversation_id, active.run_id)
             prompt = build_harness_prompt(
-                content,
+                prompt_content,
                 attachments,
                 conversation_history=conversation_history,
                 workspace_path=conversation_paths.workspace,
@@ -2063,8 +2901,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 retried=payload.retry_of is not None,
                 policy_intent=decision.intent,
                 policy_version=decision.policy_version,
+                intake_id=intake_metadata.get("intake_id"),
+                intake_task_type=intake_metadata.get("intake_task_type"),
+                intake_answer_count=len(intake_metadata.get("intake_answers", [])),
             )
+            if intake_to_consume is not None and intake_metadata:
+                intake_action = str(intake_metadata.get("intake_action") or "confirm")
+                intake_submission_latency_ms = round(
+                    (perf_counter() - intake_submission_started_at) * 1000,
+                    3,
+                )
+                operation_log.record(
+                    "agent.intake.confirmed" if intake_action == "confirm" else "agent.intake.skipped",
+                    source="api",
+                    request_id=request.state.request_id,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    run_id=active.run_id,
+                    intake_id=intake_metadata.get("intake_id"),
+                    task_type=intake_metadata.get("intake_task_type"),
+                    question_count=len(intake_metadata.get("intake_questions", [])),
+                    answer_count=len(intake_metadata.get("intake_answers", [])),
+                    custom_answer_count=sum(
+                        1
+                        for answer in intake_metadata.get("intake_answers", [])
+                        if isinstance(answer, dict) and answer.get("custom_text")
+                    ),
+                    latency_ms=intake_submission_latency_ms,
+                    submission_latency_ms=intake_submission_latency_ms,
+                )
         except Exception:
+            # If setup failed before a user message became durable, put the
+            # card back so a refresh can continue the guided flow.  Once the
+            # original user message exists its structured metadata is the
+            # authoritative retry source, so restoring the sidecar would only
+            # create a second competing card.
+            if consumed_intake_record is not None and not active.user_message_id:
+                # ``append_message`` fsyncs the JSONL row before updating
+                # conversation metadata.  If that bookkeeping step fails, the
+                # call can raise after the user row is already durable and
+                # before the return value assigns ``user_message_id``. Scan
+                # the log once so this partial-success case follows the same
+                # retry path instead of restoring a consumed sidecar and
+                # allowing a duplicate guided turn.
+                try:
+                    for candidate_message in reversed(store.list_messages(conversation_id)):
+                        candidate_metadata = candidate_message.get("metadata")
+                        if (
+                            candidate_message.get("role") == "user"
+                            and isinstance(candidate_message.get("id"), str)
+                            and isinstance(candidate_message.get("content"), str)
+                            and candidate_message.get("content", "").strip() == content
+                            and list(candidate_message.get("attachment_ids", [])) == attachment_ids
+                            and isinstance(candidate_metadata, dict)
+                            and candidate_metadata.get("run_id") == active.run_id
+                            and candidate_metadata.get("intake_id") == consumed_intake_record.get("intake_id")
+                        ):
+                            active.user_message_id = str(candidate_message["id"])
+                            break
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to inspect durable guided user row after setup failure conversation=%s",
+                        conversation_id,
+                    )
+            if consumed_intake_record is not None and not active.user_message_id:
+                try:
+                    store.write_pending_intake(conversation_id, consumed_intake_record)
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to restore pending intake after setup failure conversation=%s",
+                        conversation_id,
+                    )
             if active.user_message_id:
                 try:
                     if store.read_checklist(conversation_id, active.run_id) is not None:
@@ -2649,6 +3556,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "AGENT_OUTPUT_NOT_PERSISTED",
                         "研究助手尝试生成成果，但文件没有完整写入当前会话的正式成果目录",
                     )
+                # Check the exact same file projection used by list/open/download,
+                # before committing success or announcing completed delivery.
+                changed_names = {
+                    name for name, metadata in output_current.items()
+                    if metadata[0] > 0 and output_baseline.get(name) != metadata
+                }
+                checked_file_items = await asyncio.to_thread(
+                    safe_file_items, conversation_id, request_id=request.state.request_id,
+                ) if changed_names else None
+                if not await is_current():
+                    raise asyncio.CancelledError
+                available_outputs = {
+                    str(item["name"]) for item in (checked_file_items or [])
+                    if item.get("kind") == "output" and item.get("size", 0) > 0
+                }
+                if changed_names - available_outputs:
+                    raise HarnessAdapterError(
+                        "AGENT_OUTPUT_UNAVAILABLE", "本轮成果未通过文件访问检查",
+                    )
+                if requires_report_pair(prompt_content, changed_names) and not has_report_pair(
+                    changed_names & available_outputs, conversation_paths.outputs,
+                ):
+                    raise HarnessAdapterError(
+                        "AGENT_OUTPUT_PAIR_MISSING", "本轮报告缺少同名且有效的 Markdown / HTML 成果",
+                    )
                 if seed_history:
                     store.update_meta(
                         conversation_id,
@@ -2675,27 +3607,103 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         reason_code=output_decision.reason_code,
                         response_characters=len(result.final_response),
                     )
-                checklist_before_success = store.read_checklist(
-                    conversation_id,
-                    active.run_id,
+                # A final checklist notification can be delivered just before
+                # the model result completes. Re-read briefly so that the
+                # durable snapshot, rather than a transient callback boundary,
+                # decides whether the run is eligible for success.
+                checklist_before_success = None
+                for checklist_read_attempt in range(3):
+                    try:
+                        checklist_before_success = store.read_checklist(
+                            conversation_id,
+                            active.run_id,
+                        )
+                    except Exception as checklist_exc:
+                        checklist_before_success = None
+                        operation_log.record(
+                            "agent.checklist.close_warning",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            error_type=type(checklist_exc).__name__,
+                        )
+                        LOGGER.exception(
+                            "Checklist read failed; preserving verified delivery conversation=%s run=%s",
+                            conversation_id,
+                            active.run_id,
+                        )
+                        break
+                    if (
+                        checklist_before_success is None
+                        or checklist_before_success.get("phase")
+                        in {"committing", "succeeded"}
+                        or (
+                            checklist_before_success.get("phase") == "running"
+                            and checklist_before_success.get("items")
+                            and int(
+                                checklist_before_success.get(
+                                    "completion_revisions", 0
+                                )
+                            ) >= 1
+                            and not any(
+                                item.get("status") == "in_progress"
+                                for item in checklist_before_success.get(
+                                    "items", []
+                                )
+                                if isinstance(item, dict)
+                            )
+                        )
+                    ):
+                        break
+                    if checklist_read_attempt < 2:
+                        await asyncio.sleep(0.15)
+                checklist_items = (
+                    checklist_before_success.get("items", [])
+                    if isinstance(checklist_before_success, dict)
+                    else []
                 )
-                if (
-                    checklist_before_success is None
-                    or checklist_before_success.get("phase") != "running"
-                    or not checklist_before_success.get("items")
-                    or checklist_order_violation
-                    or checklist_repair_pending
-                    or int(
-                        checklist_before_success.get("completion_revisions", 0)
-                    ) < 1
-                    or any(
-                        item.get("status") == "in_progress"
-                        for item in checklist_before_success.get("items", [])
-                        if isinstance(item, dict)
+                checklist_status_counts: dict[str, int] = {}
+                for checklist_item in checklist_items:
+                    if isinstance(checklist_item, dict):
+                        status = str(checklist_item.get("status", "unknown"))
+                        checklist_status_counts[status] = (
+                            checklist_status_counts.get(status, 0) + 1
+                        )
+                checklist_phase = (
+                    checklist_before_success.get("phase")
+                    if isinstance(checklist_before_success, dict)
+                    else None
+                )
+                # Recovery and protocol-order violations are execution
+                # integrity failures, rather than close-time audit warnings.
+                # Keep these hard gates so a run cannot continue after the
+                # server requested an authoritative checklist repair or the
+                # harness performed substantive work before its first list.
+                if checklist_repair_pending:
+                    raise HarnessAdapterError(
+                        "AGENT_CHECKLIST_RECOVERY_FAILED",
+                        "研究助手在任务清单恢复前启动了其他操作",
                     )
-                ):
+                if checklist_order_violation:
+                    raise HarnessAdapterError(
+                        "AGENT_CHECKLIST_MISSING",
+                        "研究助手必须先提交任务与成果清单，再开始实质操作",
+                    )
+                # The checklist is an audit projection, not a second success
+                # condition. File accessibility and the non-empty final reply
+                # below are the authoritative delivery checks; incomplete or
+                # temporarily out-of-order checklist items remain visible in
+                # the reviewed record without discarding a valid delivery.
+                checklist_gate_failed = (
+                    checklist_before_success is None
+                    or checklist_phase not in {"running", "committing", "succeeded"}
+                    or not checklist_items
+                )
+                if checklist_gate_failed:
                     operation_log.record(
-                        "agent.checklist.missing",
+                        "agent.checklist.close_warning",
                         source="backend",
                         request_id=request.state.request_id,
                         project_id=project_id,
@@ -2705,24 +3713,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         checklist_order_violation=checklist_order_violation,
                         checklist_repair_pending=checklist_repair_pending,
                         pre_checklist_operation_count=pre_checklist_operation_count,
+                        checklist_phase=checklist_phase,
+                        checklist_revision=(
+                            checklist_before_success.get("revision")
+                            if isinstance(checklist_before_success, dict)
+                            else None
+                        ),
+                        checklist_completion_revisions=(
+                            checklist_before_success.get("completion_revisions")
+                            if isinstance(checklist_before_success, dict)
+                            else None
+                        ),
+                        checklist_status_counts=checklist_status_counts,
                     )
-                    raise HarnessAdapterError(
-                        "AGENT_CHECKLIST_MISSING",
-                        "研究助手没有提交可终态复核的任务与成果清单",
-                    )
-                store.prepare_checklist_success(
-                    conversation_id,
-                    run_id=active.run_id,
-                    output_extensions=_new_or_updated_output_extensions(
-                        output_baseline,
-                        output_current,
-                    ),
-                    final_response=final_response,
-                )
-                checklist_record, _checklist_changed = store.commit_checklist_success(
-                    conversation_id,
-                    run_id=active.run_id,
-                )
+                checklist_record: dict[str, Any] | None = None
+                if not checklist_gate_failed:
+                    try:
+                        store.prepare_checklist_success(
+                            conversation_id,
+                            run_id=active.run_id,
+                            output_extensions=_new_or_updated_output_extensions(
+                                output_baseline,
+                                output_current,
+                            ),
+                            final_response=final_response,
+                        )
+                        checklist_record, _checklist_changed = (
+                            store.commit_checklist_success(
+                                conversation_id,
+                                run_id=active.run_id,
+                            )
+                        )
+                    except Exception as checklist_exc:
+                        operation_log.record(
+                            "agent.checklist.close_warning",
+                            source="backend",
+                            request_id=request.state.request_id,
+                            project_id=project_id,
+                            conversation_id=conversation_id,
+                            run_id=active.run_id,
+                            checklist_phase=checklist_phase,
+                            error_type=type(checklist_exc).__name__,
+                            checklist_status_counts=checklist_status_counts,
+                        )
+                        LOGGER.exception(
+                            "Checklist close failed; preserving verified delivery conversation=%s run=%s",
+                            conversation_id,
+                            active.run_id,
+                        )
                 assistant_message = store.append_message(
                     conversation_id,
                     role="assistant",
@@ -2752,9 +3790,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 outputs = [
                     item
-                    for item in safe_file_items(
-                        conversation_id,
-                        request_id=request.state.request_id,
+                    for item in (
+                        checked_file_items if checked_file_items is not None else safe_file_items(
+                            conversation_id, request_id=request.state.request_id,
+                        )
                     )
                     if item.get("kind") == "output"
                 ]
@@ -2786,7 +3825,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # Only publish terminal success after every fallible durable
                 # and audit step has completed. The recovery branch can then
                 # emit this pair exactly once if a post-assistant step fails.
-                await queue.put(_checklist_event(checklist_record))
+                if checklist_record is not None:
+                    await queue.put(_checklist_event(checklist_record))
                 await queue.put(
                     {
                         "type": "final",
@@ -2914,10 +3954,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 )
                             )
                         if (
-                            checklist_record is None
-                            or checklist_record.get("phase") != "succeeded"
+                            checklist_record is not None
+                            and checklist_record.get("phase") != "succeeded"
                         ):
-                            raise RuntimeError("success checklist commit is pending")
+                            operation_log.record(
+                                "agent.checklist.close_warning",
+                                source="backend",
+                                request_id=request.state.request_id,
+                                project_id=project_id,
+                                conversation_id=conversation_id,
+                                run_id=active.run_id,
+                                checklist_phase=checklist_record.get("phase"),
+                            )
                         write_run_state(
                             conversation_id,
                             status="succeeded",
@@ -2925,7 +3973,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             assistant_message_id=str(assistant_message["id"]),
                             required=True,
                         )
-                        await queue.put(_checklist_event(checklist_record))
+                        if checklist_record is not None:
+                            await queue.put(_checklist_event(checklist_record))
                         await queue.put(
                             {
                                 "type": "final",
@@ -3208,8 +4257,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/conversations/{conversation_id}/files")
     async def list_files(request: Request, conversation_id: str) -> dict[str, Any]:
         return {
-            "items": safe_file_items(
-                conversation_id,
+            "items": await asyncio.to_thread(
+                safe_file_items, conversation_id,
                 request_id=request.state.request_id,
             )
         }
@@ -3289,8 +4338,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         path, item = store.resolve_file(conversation_id, file_id)
         project_id = str(store.read_meta(conversation_id)["project_id"])
         if item.get("kind") == "output":
-            reason = scan_output_file(
-                path,
+            reason = await asyncio.to_thread(
+                scan_output_file, path,
                 display_name=str(item.get("name") or path.name),
                 internal_markers=output_internal_markers(),
             )
@@ -3338,8 +4387,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ".pdf": "application/pdf",
         }
         if item.get("kind") == "output":
-            reason = scan_output_file(
-                path,
+            reason = await asyncio.to_thread(
+                scan_output_file, path,
                 display_name=str(item.get("name") or path.name),
                 internal_markers=output_internal_markers(),
             )

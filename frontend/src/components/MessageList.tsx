@@ -14,21 +14,31 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { RefObject } from "react";
-import { presentResearchAssistantCopy } from "../api";
+import { fileDownloadUrl, fileOpenUrl, presentResearchAssistantCopy } from "../api";
+import { GuidedQuestionCard } from "./GuidedQuestionCard";
 import type {
   ChatMessage,
+  ClarificationAnswer,
   ChecklistItem,
   ChecklistItemStatus,
   ChecklistPhase,
+  PendingClarification,
   RunChecklist,
+  WorkspaceFile,
 } from "../types";
 
 interface MessageListProps {
+  conversationId: string | null;
+  files: WorkspaceFile[];
   messages: ChatMessage[];
   isHydrating: boolean;
   scrollRef: RefObject<HTMLDivElement | null>;
   onPromptSelect: (prompt: string) => void;
   onRetry: (messageId: string) => void;
+  pendingClarification: PendingClarification | null;
+  onClarificationSubmit: (answers: ClarificationAnswer[]) => void;
+  onClarificationSkip: () => void;
+  onClarificationCancel: () => void;
 }
 
 const starterPrompts = [
@@ -277,12 +287,27 @@ function EmptyConversation({ onPromptSelect }: Pick<MessageListProps, "onPromptS
 }
 
 export function MessageList({
+  conversationId,
+  files,
   messages,
   isHydrating,
   scrollRef,
   onPromptSelect,
   onRetry,
+  pendingClarification,
+  onClarificationSubmit,
+  onClarificationSkip,
+  onClarificationCancel,
 }: MessageListProps) {
+  const outputs = files.filter((file) => file.kind === "output" && file.status === "ready");
+  const referencedFile = (value: string) => {
+    let path = value;
+    try { path = decodeURIComponent(value); } catch { /* Keep literal filenames. */ }
+    return outputs.find((file) => path === `outputs/${file.name}` || path === file.name);
+  };
+  const openUrl = (file: WorkspaceFile) => /\.(md|html|pdf)$/i.test(file.name)
+    ? fileOpenUrl(conversationId!, file) : fileDownloadUrl(conversationId!, file);
+  const lastAssistantId = [...messages].reverse().find((message) => message.role === "assistant" && message.status === "complete")?.id;
   return (
     <div className="message-viewport" ref={scrollRef}>
       <div className="message-column" aria-busy={isHydrating}>
@@ -291,107 +316,163 @@ export function MessageList({
             <MessageSkeleton label="正在读取对话" />
             <MessageSkeleton />
           </div>
-        ) : messages.length === 0 ? (
+        ) : messages.length === 0 && !pendingClarification ? (
           <EmptyConversation onPromptSelect={onPromptSelect} />
         ) : (
-          messages.map((message) => (
-            <article className={`message-row ${message.role}`} key={message.id}>
-              <div className="message-avatar" aria-hidden="true">
-                {message.role === "assistant" ? (
-                  <Buildings size={18} weight="regular" />
-                ) : (
-                  <User size={18} weight="regular" />
-                )}
-              </div>
-              <div className="message-body">
-                <div className="message-meta">
-                  <span>{message.role === "assistant" ? "研究助手" : "你"}</span>
-                  <time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time>
+          <>
+            {messages.map((message) => (
+              <article className={`message-row ${message.role}`} key={message.id}>
+                <div className="message-avatar" aria-hidden="true">
+                  {message.role === "assistant" ? (
+                    <Buildings size={18} weight="regular" />
+                  ) : (
+                    <User size={18} weight="regular" />
+                  )}
                 </div>
-
-                {message.attachments?.length ? (
-                  <div className="message-attachments" aria-label="本条消息引用的资料">
-                    {message.attachments.map((attachment) => (
-                      <span key={attachment.id}>
-                        <FileText size={15} weight="regular" aria-hidden="true" />
-                        {attachment.name}
-                      </span>
-                    ))}
+                <div className="message-body">
+                  <div className="message-meta">
+                    <span>{message.role === "assistant" ? "研究助手" : "你"}</span>
+                    <time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time>
                   </div>
-                ) : null}
 
-                {message.role === "assistant" ? (
-                  <>
-                    <span
-                      className="sr-only"
-                      role="status"
-                      aria-live="polite"
-                      aria-atomic="true"
-                    >
-                      {message.checklist
-                        ? `清单第 ${message.checklist.revision} 次更新：${
-                          checklistPhaseLabel(message.checklist)
-                        }，${checklistSummary(message.checklist)}`
-                        : ""}
-                    </span>
-                    <AssistantProgress message={message} />
-                    {message.checklist ? (
-                      <AssistantChecklist checklist={message.checklist} messageId={message.id} />
-                    ) : null}
-                  </>
-                ) : null}
-
-                <div className="message-content">
-                  {message.content ? (
-                    message.role === "assistant" ? (
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={{
-                          a: ({ children, ...props }) => (
-                            <a {...props} target="_blank" rel="noreferrer">
-                              {children}
-                            </a>
-                          ),
-                        }}
-                      >
-                        {presentResearchAssistantCopy(message.content)}
-                      </ReactMarkdown>
-                    ) : (
-                      <p>{message.content}</p>
-                    )
-                  ) : null}
-
-                  {message.status === "error" ? (
-                    <div className="message-error" role="alert">
-                      <WarningCircle size={19} weight="regular" aria-hidden="true" />
-                      <div>
-                        <strong>研究暂未完成</strong>
-                        <p>{message.errorMessage || "请检查服务连接后重试。"}</p>
-                      </div>
-                      {message.retryable !== false ? (
-                        <button type="button" onClick={() => onRetry(message.id)}>
-                          <ArrowClockwise size={16} weight="regular" aria-hidden="true" />
-                          重试
-                        </button>
-                      ) : null}
+                  {message.attachments?.length ? (
+                    <div className="message-attachments" aria-label="本条消息引用的资料">
+                      {message.attachments.map((attachment) => (
+                        <span key={attachment.id}>
+                          <FileText size={15} weight="regular" aria-hidden="true" />
+                          {attachment.name}
+                        </span>
+                      ))}
                     </div>
                   ) : null}
 
-                  {message.status === "stopped" ? (
-                    <div className="message-stopped">
-                      <span>生成已停止</span>
-                      {message.retryable !== false ? (
-                        <button type="button" onClick={() => onRetry(message.id)}>
-                          <ArrowClockwise size={15} weight="regular" aria-hidden="true" />
-                          重新生成
-                        </button>
+                  {message.role === "assistant" ? (
+                    <>
+                      <span
+                        className="sr-only"
+                        role="status"
+                        aria-live="polite"
+                        aria-atomic="true"
+                      >
+                        {message.checklist
+                          ? `清单第 ${message.checklist.revision} 次更新：${
+                            checklistPhaseLabel(message.checklist)
+                          }，${checklistSummary(message.checklist)}`
+                          : ""}
+                      </span>
+                      <AssistantProgress message={message} />
+                      {message.checklist ? (
+                        <AssistantChecklist checklist={message.checklist} messageId={message.id} />
                       ) : null}
+                    </>
+                  ) : null}
+
+                  <div className="message-content">
+                    {message.content ? (
+                      message.role === "assistant" ? (
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            a: ({ children, href, ...props }) => (
+                              <a {...props} href={conversationId && referencedFile(href || "")
+                                ? openUrl(referencedFile(href || "")!) : href} target="_blank" rel="noreferrer">
+                                {children}
+                              </a>
+                            ),
+                            code: ({ children, ...props }) => {
+                              const file = referencedFile(String(children));
+                              return file && conversationId
+                                ? <a href={openUrl(file)} target="_blank" rel="noreferrer">{file.name}</a>
+                                : <code {...props}>{children}</code>;
+                            },
+                          }}
+                        >
+                          {presentResearchAssistantCopy(message.content)}
+                        </ReactMarkdown>
+                      ) : (
+                        <p>{message.content}</p>
+                      )
+                    ) : null}
+
+                    {message.status === "error" ? (
+                      <div className="message-error" role="alert">
+                        <WarningCircle size={19} weight="regular" aria-hidden="true" />
+                        <div>
+                          <strong>研究暂未完成</strong>
+                          <p>{message.errorMessage || "请检查服务连接后重试。"}</p>
+                        </div>
+                        {message.retryable !== false ? (
+                          <button type="button" onClick={() => onRetry(message.id)}>
+                            <ArrowClockwise size={16} weight="regular" aria-hidden="true" />
+                            重试
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    {message.status === "stopped" ? (
+                      <div className="message-stopped">
+                        <span>生成已停止</span>
+                        {message.retryable !== false ? (
+                          <button type="button" onClick={() => onRetry(message.id)}>
+                            <ArrowClockwise size={15} weight="regular" aria-hidden="true" />
+                            重新生成
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  {conversationId && message.role === "assistant" && message.status === "complete" ? (
+                    <div className="message-output-files" aria-label="可打开的成果文件">
+                      {outputs.filter((file) => message.id === lastAssistantId || message.content.includes(`outputs/${file.name}`)).map((file) => (
+                        <div className="message-output-file" key={file.id}>
+                          <FileText size={18} aria-hidden="true" />
+                          <span>{file.name}</span>
+                          {/\.(md|html|pdf)$/i.test(file.name) ? <a href={fileOpenUrl(conversationId, file)} target="_blank" rel="noreferrer" aria-label={`打开 ${file.name}`}>打开</a> : null}
+                          <a href={fileDownloadUrl(conversationId, file)} download={file.name} aria-label={`下载 ${file.name}`}>下载</a>
+                        </div>
+                      ))}
                     </div>
                   ) : null}
                 </div>
-              </div>
-            </article>
-          ))
+              </article>
+            ))}
+            {pendingClarification ? (
+              <>
+                <article className="message-row user guided-pending-request" key={`pending-user-${pendingClarification.plan.id}`}>
+                  <div className="message-avatar" aria-hidden="true">
+                    <User size={18} weight="regular" />
+                  </div>
+                  <div className="message-body">
+                    <div className="message-meta">
+                      <span>你</span>
+                      <span className="guided-pending-label">待确认</span>
+                    </div>
+                    <div className="message-content"><p>{pendingClarification.plan.originalContent}</p></div>
+                  </div>
+                </article>
+                <article className="message-row assistant guided-pending-question" key={`pending-question-${pendingClarification.plan.id}`}>
+                  <div className="message-avatar" aria-hidden="true">
+                    <Buildings size={18} weight="regular" />
+                  </div>
+                  <div className="message-body">
+                    <div className="message-meta">
+                      <span>研究助手</span>
+                      <span className="guided-pending-label">先确认，再开始</span>
+                    </div>
+                    <GuidedQuestionCard
+                      plan={pendingClarification.plan}
+                      initialAnswers={pendingClarification.answers}
+                      disabled={pendingClarification.submitting}
+                      onSubmit={onClarificationSubmit}
+                      onSkip={onClarificationSkip}
+                      onCancel={onClarificationCancel}
+                    />
+                  </div>
+                </article>
+              </>
+            ) : null}
+          </>
         )}
       </div>
     </div>

@@ -559,6 +559,7 @@ def build_harness_prompt(
     default_formats = " + ".join(format_name.upper() for format_name in DEFAULT_OUTPUT_FORMATS)
     sections.append(
         "[交付策略]\n"
+        "- 报告交付结束前检查同名 .md 和 .html 均已写入，HTML 必须具有完整 html/body 结构；只写路径、缺少配对文件或文件无法通过访问检查都会被拒绝完成。最终回复用 [文件名](outputs/文件名) 引用真实成果。\n"
         f"- 默认格式：{default_formats}\n"
         "- 当本轮主成果是地产研究、项目分析、策划方案或管理报告，且用户未明确指定最终格式或明确不要文件时，必须在 outputs/ 同时生成内容对应、非空、可打开的 Markdown（.md）与独立 HTML（.html）。\n"
         "- 用户明确指定单一格式、其他格式或不要文件时，以用户要求为准；纯澄清、简短问答和不形成文件成果的局部解释不强制生成文件。微信资料转换/归档、社交平台素材、数据表或模型等已有专项输出契约的任务按对应子 Skill 执行，除非同时形成上述主报告。\n"

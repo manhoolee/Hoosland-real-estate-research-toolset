@@ -1,10 +1,9 @@
-Hoosland scope-gate release
-build_id=v0.2.6-scope-gate-20260829T101331Z
-base_commit=c0824d3399d34bdcd4c4bf18fb558772cfd969f3
-source_tree=base-commit-plus-worktree-overlay
-policy_version=scope-gate-v1.1
-egress_policy_version=egress-gate-v1
-app_version=0.2.6
-slot=slot-b
-validation=159 backend unit tests; frontend check/build passed
-
+Hoosland delivery-first release
+build_id=v0.3.3-delivery-first-20260923
+base_commit=7f6fe651f3ad52775baf49b5cfa0fee08a8fb429
+source_tree=online-v0.3.2-plus-delivery-first
+policy_version=scope-gate-v1.2
+egress_policy_version=egress-gate-v1.1
+app_version=0.3.3
+slot=slot-a
+validation=backend storage regression passed; Python compile passed; production delivery retry succeeded

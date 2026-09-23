@@ -1,8 +1,52 @@
 # 更新记录
 
+## 0.3.3 — 2026-09-23
+
+- 将清单收口调整为审计状态，不再以清单完成进度、暂存状态或提交失败拒绝已通过文件可访问性检查的成果；记录收口告警并继续持久化非空交付回复。
+- 文件与回复清单项根据服务端实际成果和最终回复复核；未完成任务仍保留为未完成状态。
+- 保留文件持久化、文件可访问性、必需报告格式配对和安全输出检查。
+- 同步线上 v0.3.2 源码与测试；后端存储及交付优先回归测试通过。
+
+## 0.3.2 — 2026-09-16
+
+- 修正购房政策、销售模型、项目供应商、营销工具及明确业务规则的防刺探误伤；业务对象识别只作用于对象片段，不放行同轮夹带的刺探。
+- 修正公开网址中的 `/app/`、`/home/` 等普通路径误伤，继续拦截秘密文件、带凭据网址和秘密查询参数。
+- 对不超过 16 MiB 的文本成果分块全文检查，超限文件不以局部检查冒充通过；改扩展名的纯文本仍接受检查。
+- 文件检查转入后台线程；真实 PDF/Office 等二进制正文检测仍未覆盖。
+
+
+## 0.3.1 — 2026-09-16
+
+- 修复公开 HTTP(S) 来源 URL 被识别为 Windows / UNC 内部路径，导致 MD / HTML 从文件列表和下载接口消失。
+- 聊天区展示真实成果的打开、下载入口，解析已登记成果的路径引用，兼容历史对话和移动端。
+- 成功提交前检查本轮成果可访问性；默认报告检查同名 MD / HTML 配对及 HTML 结构，缺失时明确失败，单格式和不要文件的要求保留。
+
+
 本项目分别记录应用、System Prompt、Skill 套件和数据 Schema 版本；它们不会为了展示一致而同步跳号。
 
-## Unreleased
+## App 0.3.0（V0.3）Build `v0.3.0-guided-intake-20260830T125845Z` / Guided intake sidecar 1 / slot-a — 2026-08-30
+
+### 发布身份与槽位边界
+
+- Application、后端健康接口、前端展示和构建元数据统一升至 `0.3.0`（对外简称 `V0.3`）；
+- 本版本登记到奇数迭代对应的 `slot-a`，前端构建固定使用 `/tools/real-estate` 和 `slot-a` 存储命名空间；
+- `slot-b` 的 `0.2.6` 与 Build `v0.2.6-scope-gate-20260829T101331Z` 作为在线基线保留，不执行重启、迁移或写入；
+- System Prompt `real-estate-system-v0.2.4`、Skill bundle `2.3.1`、Project state Schema `2.1.0`、usage/checklist sidecar Schema `1` 均保持不变；新增 Guided intake sidecar Schema `1`，无数据迁移。
+
+### 任务类型引导式提问 MVP
+
+- 新增本地、无 Token 的任务预检：根据任务类型展示最多 3 道透明决策题，每题提供 2–4 个有影响说明的选项，支持自定义补充、跳过直接执行和刷新恢复；
+- 新增 `pending_intake.json` sidecar 与 `GET/POST/DELETE /api/conversations/{conversation_id}/intake`，确认前不污染消息、run、checklist 或 usage；sidecar 采用原子写入、正文/附件绑定、24 小时 TTL 和幂等清理；
+- 确认后由服务端校验问题、选项、附件和答案，把结构化偏好作为用户数据块追加到原始请求；原始用户消息保持不变，失败重试可重建同一语义；
+- 前端新增可访问的内嵌决策卡，覆盖键盘/触控、移动布局、推荐项说明和 `prefers-reduced-motion`；
+- 新增引导纯函数、sidecar 和 HTTP 回归用例；本地后端回归由 159 项增加到 175 项，前端类型检查与生产构建通过（仍有既有主包体积提示）；
+- 详细分类、灰度、指标、验收和回滚方案见 [`docs/GUIDED-INTAKE-ITERATION-PLAN.md`](docs/GUIDED-INTAKE-ITERATION-PLAN.md)。A 槽切换前仍需完成目标主机只读拓扑确认、隔离候选和真实 Provider E2E；未满足前不宣称稳定。
+
+### 验证与发布状态
+
+- 本地后端回归 175 项、Python 编译、前端 TypeScript 检查与生产构建均通过；
+- Build 制品需在目标主机以不可变 release 方式安装，并只切换 A 的服务、环境和 Skill 绑定；
+- 任何 A 探针失败只回滚 A，不得影响 B；切换完成后进入 `online / observing`，观察期通过后再标记 stable demo。
 
 ### 文档与架构
 
@@ -10,6 +54,10 @@
 - 新增 Sprint 0–8 实施计划，规定先独立验证提纯质量，再建立查询服务，最后以只读 MCP Adapter 灰度接入 DeepSeek Harness 和专业 Skill。
 - 明确 X2Knowledge、Docling、MarkItDown 等只属于可替换的文档解析适配器，其 RAG 问答预处理不能作为正式 `KnowledgeUnit`。
 - 本次仅更新规划和文档，没有实现知识提纯运行时、数据迁移或用户可见功能。
+
+## Unreleased
+
+暂无。
 
 ## App 0.2.6 Build `v0.2.6-scope-gate-20260829T101331Z` / Scope gate v1.1 / Egress gate v1 — 2026-08-29
 

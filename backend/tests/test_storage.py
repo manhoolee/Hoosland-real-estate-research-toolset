@@ -375,6 +375,46 @@ class ConversationStoreTests(unittest.TestCase):
             corrected["items"][1]["detail"],
         )
 
+    def test_success_close_uses_delivery_evidence_when_checklist_is_incomplete(self) -> None:
+        conversation_id = "conversation_checklist_delivery_wins"
+        run_id = "f" * 32
+        self.store.create_or_reuse(conversation_id)
+        self.store.start_checklist(conversation_id, run_id)
+        contents = [
+            "任务｜生成研究报告",
+            "成果文件(.html)｜研究报告",
+            "成果回复｜交付说明",
+        ]
+        self.store.apply_checklist_snapshot(
+            conversation_id,
+            run_id=run_id,
+            event_seq=1,
+            todos=[
+                {"content": contents[0], "status": "in_progress"},
+                {"content": contents[1], "status": "pending"},
+                {"content": contents[2], "status": "pending"},
+            ],
+        )
+
+        prepared, changed = self.store.prepare_checklist_success(
+            conversation_id,
+            run_id=run_id,
+            output_extensions=[".html"],
+            final_response="已完成，HTML 文件已交付。",
+        )
+        self.assertTrue(changed)
+        self.assertEqual("committing", prepared["phase"])
+        self.assertEqual("incomplete", prepared["items"][0]["status"])
+        self.assertEqual("completed", prepared["items"][1]["status"])
+        self.assertEqual("completed", prepared["items"][2]["status"])
+
+        committed, changed = self.store.commit_checklist_success(
+            conversation_id,
+            run_id=run_id,
+        )
+        self.assertTrue(changed)
+        self.assertEqual("succeeded", committed["phase"])
+
     def test_token_usage_replaces_same_attempt_and_accumulates_retries(self) -> None:
         conversation_id = "conversation_usage_001"
         first_run = "a" * 32

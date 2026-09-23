@@ -13,6 +13,24 @@ from app.policy import POLICY_REFUSAL
 
 
 class PolicyHttpTests(unittest.TestCase):
+    def test_file_endpoints_share_business_and_secret_boundaries(self) -> None:
+        cid = self.client.post("/api/conversations", json={}).json()["id"]
+        outputs = self.app.state.store.require(cid).outputs
+        business = "请列出项目供应商名称。项目销售模型参数如下。"
+        (outputs / "report.md").write_text(business + "\n[来源](https://example.com/app/report)", encoding="utf-8")
+        (outputs / "report.html").write_text(f'<html><body>{business}<a href="https://example.com/home/report">来源</a></body></html>', encoding="utf-8")
+        (outputs / "private.bin").write_text("API_KEY=synthetic-private-value", encoding="utf-8")
+        registered = self.app.state.store.list_files(cid)
+        public = self.client.get(f"/api/conversations/{cid}/files").json()["items"]
+        self.assertEqual({"report.md", "report.html"}, {item["name"] for item in public})
+        for item in registered:
+            expected = 404 if item["name"] == "private.bin" else 200
+            url = f'/api/conversations/{cid}/files/{item["id"]}'
+            for suffix in ("", "/open"):
+                response = self.client.get(url + suffix)
+                self.assertEqual(expected, response.status_code)
+                self.assertNotIn("synthetic-private-value", response.text)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)

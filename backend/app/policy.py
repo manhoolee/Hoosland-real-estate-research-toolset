@@ -23,9 +23,10 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import unquote
+from .policy_language import business_detection_view
 
 
-POLICY_VERSION = "scope-gate-v1.1"
+POLICY_VERSION = "scope-gate-v1.2"
 
 # Keep this response short and stable.  In particular, do not mention which
 # detector fired, the model/provider name, or any internal policy threshold.
@@ -288,8 +289,8 @@ _PROBE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"(?:leak|disclose|reveal|export|show|print|share|透露|泄露|显示|输出|导出|"
         r"do\s+not\s+follow|don't\s+follow|not\s+follow|不要遵循|别遵循).{0,96}"
-        r"(?:prompt|system\s+info|rules?|policies?|instructions?|guardrails?|"
-        r"private\s+key|api\s+key|提示词|系统信息|规则|政策|指令|护栏|私钥|密钥)",
+        r"(?:prompt|system\s+info|instructions?|guardrails?|"
+        r"private\s+key|api\s+key|提示词|系统信息|指令|护栏|私钥|密钥)",
         re.IGNORECASE,
     ),
     # Assistant-owned runtime questions are protected even when the wording
@@ -298,7 +299,7 @@ _PROBE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"(?:your|you\s+(?:use|follow|run|are)|this\s+assistant(?:'s)?|"
         r"the\s+assistant(?:'s)?|current|underlying|active|deployed|configured|loaded|"
-        r"你的|本助手(?:的)?|当前(?:使用|运行|部署)?的?|正在使用的|运行中的|部署的)\s*"
+        r"你的|本助手(?:的)?|当前(?:使用|运行|部署)的?|正在使用的|运行中的|部署的)\s*"
         r"(?:rules?|policies?|instructions?|guardrails?|functions?|capabilities?|"
         r"configuration|system\s+info|model|llm|provider|vendor|runtime|harness|"
         r"version|skills?|tools?|plugins?|rules|规则|政策|指令|护栏|函数|能力|配置|"
@@ -314,7 +315,8 @@ _PROBE_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"本助手|你|当前))?"
     ),
     re.compile(
-        r"(?:上面|之前|前面|刚才).{0,20}(?:原样|完整|逐字|复述|重复).{0,20}"
+        r"(?:上面|之前|前面|刚才)(?:的)?(?:所有|全部)?(?:内容|消息|文本|指令|提示)?"
+        r"[\s,，:：]*(?:原样|完整|逐字|复述|重复).{0,20}"
         r"(?:输出|打印|发送|告诉|贴出)?"
     ),
 )
@@ -485,9 +487,9 @@ _HIGH_RISK_COMBINATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"(?:ignore|bypass|disregard|override|forget|jailbreak|skip|remove|"
         r"prompt[\s_-]*injection|忽略|绕过|无视|覆盖|跳过|删除).{0,80}"
-        r"(?:previous|prior|above|below|system|developer|hidden|internal|"
-        r"safety|instructions?|rules?|policy|prompt|guardrails?|之前|上面|"
-        r"先前|系统|开发者|隐藏|内部|安全|规则|提示|指令)",
+        r"(?:system|developer|hidden|internal|"
+        r"safety|instructions?|rules?|policy|prompt|guardrails?|"
+        r"系统|开发者|隐藏|内部|安全|规则|提示|指令)",
         re.IGNORECASE,
     ),
     # Sensitive filesystem/secret paths are never a project research input,
@@ -509,6 +511,7 @@ _DOMAIN_TERMS = frozenset(
     {
         "地产",
         "房地产",
+        "物业",
         "楼盘",
         "住宅",
         "商业",
@@ -668,6 +671,7 @@ _ACTION_TERMS = frozenset(
         "recommend",
         "suggest",
         "identify",
+        "list",
         "update",
         "draft",
         "export",
@@ -1235,7 +1239,7 @@ def is_high_risk_combination(value: str) -> bool:
     """
 
     return any(
-        pattern.search(candidate)
+        pattern.search(business_detection_view(candidate))
         for candidate in _iter_probe_variants(value)
         for pattern in _HIGH_RISK_COMBINATION_PATTERNS
     )
@@ -1245,6 +1249,7 @@ def is_prompt_probe(normalized: str) -> bool:
     """Return true when a turn asks for protected runtime/prompt metadata."""
 
     for candidate in _iter_probe_variants(normalized):
+        candidate = business_detection_view(candidate)
         if any(pattern.search(candidate) for pattern in _PROBE_PATTERNS):
             return True
         if any(pattern.search(candidate) for pattern in _HIGH_RISK_COMBINATION_PATTERNS):
